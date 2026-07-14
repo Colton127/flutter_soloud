@@ -828,26 +828,26 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       >();
 
   @override
-  void pauseSwitch(SoundHandle handle) {
-    return _pauseSwitch(handle.id);
+  PlayerErrors pauseSwitch(SoundHandle handle) {
+    return PlayerErrors.values[_pauseSwitch(handle.id)];
   }
 
   late final _pauseSwitchPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt)>>(
+      _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.UnsignedInt)>>(
         'pauseSwitch',
       );
-  late final _pauseSwitch = _pauseSwitchPtr.asFunction<void Function(int)>();
+  late final _pauseSwitch = _pauseSwitchPtr.asFunction<int Function(int)>();
 
   @override
-  void setPause(SoundHandle handle, int pause) {
-    return _setPause(handle.id, pause);
+  PlayerErrors setPause(SoundHandle handle, int pause) {
+    return PlayerErrors.values[_setPause(handle.id, pause)];
   }
 
   late final _setPausePtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt, ffi.Int)>>(
+      _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.UnsignedInt, ffi.Int)>>(
         'setPause',
       );
-  late final _setPause = _setPausePtr.asFunction<void Function(int, int)>();
+  late final _setPause = _setPausePtr.asFunction<int Function(int, int)>();
 
   @override
   bool getPause(SoundHandle handle) {

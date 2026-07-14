@@ -312,36 +312,39 @@ namespace SoLoud
     // [AVAudioSession setActive:YES]) before calling this.
     result soloud_miniaudio_resume(SoLoud::Soloud *aSoloud)
     {
-        if (aSoloud == nullptr)
+        if (aSoloud == nullptr || !gDeviceInitialized)
             return UNKNOWN_ERROR;
 
-        // Check if device is stopped and start it if needed
-        if (ma_device_get_state(&gDevice) == ma_device_state_stopped)
-        {
+        const ma_device_state state = ma_device_get_state(&gDevice);
+        if (state == ma_device_state_started)
+            return SO_NO_ERROR;
+        if (state != ma_device_state_stopped)
+            return UNKNOWN_ERROR;
+
 #if defined(MA_APPLE_MOBILE)
-            // On iOS, after any audio interruption the AVAudioSession MUST be
-            // explicitly re-activated before restarting the Audio Unit.
-            //
-            // Without this call, iOS does not restore remote command routing
-            // (Lock Screen controls, AirPods) to this app after the device
-            // restarts. This is because:
-            //   1. miniaudio registers its own AVAudioSessionInterruptionNotification
-            //      observer alongside audio_session (the Flutter package), so both
-            //      handle interruptions concurrently.
-            //   2. miniaudio can restart AudioOutputUnit before audio_session has
-            //      had a chance to call setActive:YES, leaving the unit running
-            //      against an inactive session — breaking remote command routing.
-            //   3. Apple's audio interruption recovery guidelines explicitly require
-            //      setActive:YES before restarting the Audio Unit.
-            @autoreleasepool {
-                [[AVAudioSession sharedInstance] setActive:YES error:nil];
-            }
-#endif
-            ma_result result = ma_device_start(&gDevice);
-            if (result != MA_SUCCESS)
+        // After an interruption, reactivate AVAudioSession before restarting
+        // the Audio Unit. Propagate activation failure instead of continuing
+        // with an output device that cannot produce audio.
+        @autoreleasepool {
+            NSError *activationError = nil;
+            if (![[AVAudioSession sharedInstance] setActive:YES
+                                                    error:&activationError])
+            {
+                soloud_platform_log(
+                    "soloud_miniaudio_resume: AVAudioSession activation failed with error %ld\n",
+                    (long)activationError.code);
                 return UNKNOWN_ERROR;
+            }
         }
-        return 0;
+#endif
+
+        const ma_result result = ma_device_start(&gDevice);
+        if (result != MA_SUCCESS)
+            return UNKNOWN_ERROR;
+
+        return ma_device_get_state(&gDevice) == ma_device_state_started
+            ? SO_NO_ERROR
+            : UNKNOWN_ERROR;
     }
 
     result miniaudio_init(SoLoud::Soloud *aSoloud, unsigned int aFlags, unsigned int aSamplerate, unsigned int aBuffer, unsigned int aChannels, void *pPlaybackInfos_id)

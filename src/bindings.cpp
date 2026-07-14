@@ -681,22 +681,25 @@ FFI_PLUGIN_EXPORT enum PlayerErrors speechText(char *textToSpeech,
 /// Switch pause state for an already loaded sound identified by [handle]
 ///
 /// [handle] the sound handle
-FFI_PLUGIN_EXPORT void pauseSwitch(unsigned int handle) {
-  if (player.get() == nullptr || !player.get()->isInited() ||
-      !player.get()->isValidHandle(handle))
-    return;
-  player.get()->pauseSwitch(handle);
+FFI_PLUGIN_EXPORT enum PlayerErrors pauseSwitch(unsigned int handle) {
+  if (player.get() == nullptr || !player.get()->isInited())
+    return backendNotInited;
+  if (!player.get()->isValidHandle(handle))
+    return soundHandleNotFound;
+  return player.get()->pauseSwitch(handle);
 }
 
 /// Pause or unpause already loaded sound identified by [handle]
 ///
 /// [handle] the sound handle
 /// [pause] the sound handle
-FFI_PLUGIN_EXPORT void setPause(unsigned int handle, bool pause) {
-  if (player.get() == nullptr || !player.get()->isInited() ||
-      !player.get()->isValidHandle(handle))
-    return;
-  player.get()->setPause(handle, pause);
+/// Returns [PlayerErrors.noError] on success.
+FFI_PLUGIN_EXPORT enum PlayerErrors setPause(unsigned int handle, bool pause) {
+  if (player.get() == nullptr || !player.get()->isInited())
+    return backendNotInited;
+  if (!player.get()->isValidHandle(handle))
+    return soundHandleNotFound;
+  return player.get()->setPause(handle, pause);
 }
 
 /// Gets the pause state

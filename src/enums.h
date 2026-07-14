@@ -74,6 +74,10 @@ typedef enum PlayerErrors {
   xiphLibsNotFound = 30,
   /// Bus ID not found.
   busIdNotFound = 31,
+  /// The output audio device could not be started or resumed.
+  audioDeviceFailedToStart = 32,
+  /// SoLoud failed to create a playable voice handle.
+  failedToStartPlayback = 33,
 } PlayerErrors_t;
 
 /// Possible read sample errors

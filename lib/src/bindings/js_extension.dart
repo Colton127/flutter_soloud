@@ -167,10 +167,10 @@ external void wasmSetWaveform(int soundHash, int newWaveform);
 external int wasmSpeechText(int textToSpeechPtr, int handlePtr);
 
 @JS('Module_soloud._pauseSwitch')
-external void wasmPauseSwitch(int handle);
+external int wasmPauseSwitch(int handle);
 
 @JS('Module_soloud._setPause')
-external void wasmSetPause(int handle, int pause);
+external int wasmSetPause(int handle, int pause);
 
 @JS('Module_soloud._getPause')
 external int wasmGetPause(int handle);
