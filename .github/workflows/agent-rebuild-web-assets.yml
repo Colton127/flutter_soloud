@@ -1,0 +1,133 @@
+name: Preserve paused playback semantics
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  revise-and-publish:
+    if: github.head_ref == 'agent/propagate-audio-start-failures'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: emsdk-cache
+
+      - name: Restore Xiph build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            xiph/opus
+            xiph/ogg
+            xiph/vorbis
+            xiph/flac
+          key: ${{ runner.os }}-flutter-soloud-xiph-emsdk-latest-v1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool libtool-bin pkg-config \
+            clang cmake ninja-build libgtk-3-dev libasound2-dev
+
+      - name: Revise, validate, and amend implementation commit
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.head_ref }}
+          IMPLEMENTATION_SHA: 52c8b1d61e9a33f2a3598832423fc49f873c3b09
+        run: |
+          set -euo pipefail
+          git reset --hard "$IMPLEMENTATION_SHA"
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          player = Path('src/player.cpp')
+          text = player.read_text()
+          old = '''    // A paused voice does not require an active output device until unpaused.
+    if (!paused)
+    {
+        const PlayerErrors result = ensureAudioDeviceStarted();
+        if (result != noError)
+            return result;
+    }
+'''
+          new = '''    // Preserve the existing behavior: prepare the output device before
+    // creating any voice, including a voice initially created as paused.
+    const PlayerErrors result = ensureAudioDeviceStarted();
+    if (result != noError)
+        return result;
+'''
+          count = text.count(old)
+          if count != 2:
+              raise RuntimeError(f'Expected 2 conditional resume blocks, found {count}')
+          player.write_text(text.replace(old, new))
+
+          soloud = Path('lib/src/soloud.dart')
+          text = soloud.read_text()
+          old_doc = '''  /// could not be started. This check is deferred for a voice created with
+  /// [paused] set to `true` until that voice is unpaused.
+'''
+          count = text.count(old_doc)
+          if count != 2:
+              raise RuntimeError(f'Expected 2 deferred-check docs, found {count}')
+          soloud.write_text(text.replace(old_doc, '  /// could not be started.\n'))
+          PY
+
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('web/compile_wasm.sh')
+          text = path.read_text()
+          old = 'CFLAGS="-O2 -fPIC -L$OGG_DIR/src/.libs -I$OGG_DIR/include" \\\n'
+          new = (
+              'CFLAGS="-O2 -fPIC" \\\n'
+              '            CPPFLAGS="-I$OGG_DIR/include" \\\n'
+              '            LIBS="$OGG_DIR/src/.libs/libogg.a" \\\n'
+              '            OGG_CFLAGS="-I$OGG_DIR/include" \\\n'
+              '            OGG_LIBS="$OGG_DIR/src/.libs/libogg.a" \\\n'
+          )
+          count = text.count(old)
+          if count != 2:
+              raise RuntimeError(f'Expected 2 Ogg flag blocks, found {count}')
+          path.write_text(text.replace(old, new))
+          PY
+
+          (
+            cd web
+            bash compile_wasm.sh
+          )
+          git checkout -- web/compile_wasm.sh
+
+          dart format lib/src/soloud.dart
+          flutter pub get
+          flutter analyze
+          flutter test
+          git diff --check
+
+          (
+            cd example
+            flutter build linux --debug
+            flutter build web
+          )
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/player.cpp lib/src/soloud.dart \
+            web/libflutter_soloud_plugin.js web/libflutter_soloud_plugin.wasm
+          git commit --amend --no-edit
+          git push --force-with-lease origin "HEAD:${TARGET_BRANCH}"
