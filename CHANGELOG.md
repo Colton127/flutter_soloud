@@ -1,5 +1,6 @@
 #### 4.0.13 (XX Xxx 2026)
 - fix: Waveform audio sources do not match engine sample rate #501. Thanks to @Colton127
+- fix: propagate output-device resume and voice-creation failures through play and unpause APIs.
 
 #### 4.0.12 (30 Jun 2026)
 - add `lowLatency` init option to allow recordable Android output #492. Thanks to @MjnMixael

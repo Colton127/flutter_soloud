@@ -195,13 +195,19 @@ public:
 
   /// @brief Switch pause state for an already loaded sound identified by
   /// [handle].
-  /// @param handle the sound handle
-  void pauseSwitch(unsigned int handle);
+  /// @param handle the sound handle.
+  /// @return Returns [PlayerErrors::noError] on success, or
+  /// [PlayerErrors::audioDeviceFailedToStart] if unpausing could not restart
+  /// the output device.
+  PlayerErrors pauseSwitch(unsigned int handle);
 
   /// @brief Pause or unpause already loaded sound identified by [handle].
   /// @param handle the sound handle.
   /// @param pause whether this sound should be paused or not.
-  void setPause(unsigned int handle, bool pause);
+  /// @return Returns [PlayerErrors::noError] on success, or
+  /// [PlayerErrors::audioDeviceFailedToStart] if unpausing could not restart
+  /// the output device.
+  PlayerErrors setPause(unsigned int handle, bool pause);
 
   /// @brief Schedule a deferred pause of the audio device. If no voices
   /// remain active after a short delay, the engine is paused. Requests are
@@ -658,6 +664,10 @@ private:
   std::atomic<bool> mPauseRequested{false};
   std::atomic<bool> mStopPauseThread{false};
   bool mPauseThreadRunning = false;
+
+  /// @brief Ensure the output audio device is running before playback.
+  /// @return Returns [PlayerErrors::noError] on success.
+  PlayerErrors ensureAudioDeviceStarted();
 
   void pauseEngineScheduler();
   void startPauseEngineScheduler();

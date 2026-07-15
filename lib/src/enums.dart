@@ -105,7 +105,13 @@ enum PlayerErrors {
   xiphLibsNotFound(30),
 
   /// Bus id not found.
-  busIdNotFound(31);
+  busIdNotFound(31),
+
+  /// The output audio device could not be started or resumed.
+  audioDeviceFailedToStart(32),
+
+  /// SoLoud failed to create a playable voice handle.
+  failedToStartPlayback(33);
 
   const PlayerErrors(this.value);
 
@@ -202,6 +208,10 @@ enum PlayerErrors {
             'https://docs.page/alnitak/flutter_soloud_docs/get_started/no_xiph_libs';
       case PlayerErrors.busIdNotFound:
         return 'Bus id not found!';
+      case PlayerErrors.audioDeviceFailedToStart:
+        return 'The output audio device could not be started or resumed.';
+      case PlayerErrors.failedToStartPlayback:
+        return 'SoLoud failed to create a playable voice handle.';
     }
   }
 

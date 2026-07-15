@@ -405,3 +405,25 @@ class SoLoudBusIdNotFoundCppException extends SoLoudCppException {
   @override
   String get description => 'Bus id not found! (on the C++ side).';
 }
+
+/// The output audio device could not be started or resumed.
+class SoLoudAudioDeviceFailedToStartCppException extends SoLoudCppException {
+  /// Creates a new [SoLoudAudioDeviceFailedToStartCppException].
+  const SoLoudAudioDeviceFailedToStartCppException([super.message]);
+
+  @override
+  String get description =>
+      'The output audio device could not be started or resumed '
+      '(on the C++ side).';
+}
+
+/// SoLoud could not create a playable voice handle.
+class SoLoudFailedToStartPlaybackCppException extends SoLoudCppException {
+  /// Creates a new [SoLoudFailedToStartPlaybackCppException].
+  const SoLoudFailedToStartPlaybackCppException([super.message]);
+
+  @override
+  String get description =>
+      'SoLoud failed to create a playable voice handle '
+      '(on the C++ side).';
+}

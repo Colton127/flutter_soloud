@@ -1,4 +1,5 @@
 import 'package:flutter_soloud/src/enums.dart';
+import 'package:flutter_soloud/src/exceptions/exceptions.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -15,5 +16,16 @@ void main() {
             'invalid.',
       );
     }
+  });
+
+  test('audio start errors map to precise exception types', () {
+    expect(
+      SoLoudCppException.fromPlayerError(PlayerErrors.audioDeviceFailedToStart),
+      isA<SoLoudAudioDeviceFailedToStartCppException>(),
+    );
+    expect(
+      SoLoudCppException.fromPlayerError(PlayerErrors.failedToStartPlayback),
+      isA<SoLoudFailedToStartPlaybackCppException>(),
+    );
   });
 }

@@ -1395,6 +1395,12 @@ interface class SoLoud {
   /// Returns the new sound as [AudioSource].
   ///
   /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
+  ///
+  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the output device
+  /// could not be started.
+  ///
+  /// Throws [SoLoudFailedToStartPlaybackCppException] if SoLoud could not
+  /// create a playable voice handle.
   AudioSource speechText(String textToSpeech) {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
@@ -1453,6 +1459,12 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudSoundHashNotFoundDartException] if the given [sound]
   /// is not found.
+  ///
+  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the output device
+  /// could not be started.
+  ///
+  /// Throws [SoLoudFailedToStartPlaybackCppException] if SoLoud could not
+  /// create a playable voice handle.
   SoundHandle play(
     AudioSource sound, {
     int busId = 0,
@@ -1565,21 +1577,40 @@ interface class SoLoud {
   /// Pause or unpause a currently playing sound identified by [handle].
   ///
   /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
+  ///
+  /// Throws [SoLoudSoundHandleNotFoundCppException] if [handle] is invalid.
+  ///
+  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the operation
+  /// unpauses the voice and the output device could not be started.
   void pauseSwitch(SoundHandle handle) {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
-    _controller.soLoudFFI.pauseSwitch(handle);
+    final error = _controller.soLoudFFI.pauseSwitch(handle);
+    _logPlayerError(error, from: 'pauseSwitch()');
+    if (error != PlayerErrors.noError) {
+      throw SoLoudCppException.fromPlayerError(error);
+    }
   }
 
   /// Pause or unpause a currently playing sound identified by [handle].
   ///
   /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
+  ///
+  /// Throws [SoLoudSoundHandleNotFoundCppException] if [handle] is invalid.
+  ///
+  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if [pause] is `false`
+  /// and the output device could not be started. The voice remains paused when
+  /// this exception is thrown.
   void setPause(SoundHandle handle, bool pause) {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
-    _controller.soLoudFFI.setPause(handle, pause ? 1 : 0);
+    final error = _controller.soLoudFFI.setPause(handle, pause ? 1 : 0);
+    _logPlayerError(error, from: 'setPause()');
+    if (error != PlayerErrors.noError) {
+      throw SoLoudCppException.fromPlayerError(error);
+    }
   }
 
   /// Gets the pause state of a currently playing sound identified by [handle].
@@ -2748,6 +2779,12 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudBufferStreamCanBePlayedOnlyOnceCppException] if we try to
   /// play a BufferStream using `release` buffer type more than once.
+  ///
+  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the output device
+  /// could not be started.
+  ///
+  /// Throws [SoLoudFailedToStartPlaybackCppException] if SoLoud could not
+  /// create a playable voice handle.
   SoundHandle play3d(
     AudioSource sound,
     double posX,
