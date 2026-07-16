@@ -210,6 +210,13 @@ public:
   /// audio session (e.g. Control Center on iOS).
   void pauseEngine();
 
+  /// @brief Ensure the audio device is started, off the UI thread. Posts an
+  /// immediate resume request to the background scheduler so the blocking
+  /// native ma_device_start() does not freeze the caller (the UI thread on
+  /// the FFI path). Cancels any pending deferred pause. Idempotent: a no-op
+  /// at the backend if the device is already started.
+  void resumeEngine();
+
   /// @brief Android only: opt in/out of stopping the audio device when the
   /// engine goes idle (no active voices), releasing the audioserver AudioMix
   /// partial wakelock. Takes effect immediately based on the current state:
@@ -678,14 +685,18 @@ private:
   std::map<unsigned int, BusData> busMap;
   unsigned int busIdCounter = 0;
 
-  // Background scheduler for deferred engine pause. Started lazily on
-  // init() and stopped on dispose() so that the global Player object can
-  // be recreated by bindings.cpp without leaving a stray background thread.
+  // Background scheduler for deferred engine pause and asynchronous engine
+  // resume. Started lazily on init() and stopped on dispose() so that the
+  // global Player object can be recreated by bindings.cpp without leaving a
+  // stray background thread. The same thread handles both the deferred device
+  // stop (pause) and the immediate device start (resume) so neither native
+  // ma_device_stop()/ma_device_start() call ever blocks the UI thread.
   static constexpr unsigned int kPauseEngineDelayMs = 500;
   std::thread mPauseThread;
   std::mutex mPauseMutex;
   std::condition_variable mPauseCv;
   std::atomic<bool> mPauseRequested{false};
+  std::atomic<bool> mResumeRequested{false};
   std::atomic<bool> mStopPauseThread{false};
   bool mPauseThreadRunning = false;
 

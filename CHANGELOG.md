@@ -5,6 +5,7 @@
 - add `getAudioDeviceState()` returning an `AudioDeviceState` enum to query the current state of the audio output device (uninitialized, stopped, started, starting, stopping)
 - fix: `init()` no longer blocks the UI thread — the blocking native engine/device initialization now runs off the UI thread, preventing ANRs on startup #481
 - add `deinitAsync()`, a non-blocking alternative to `deinit()` that runs the native teardown off the UI thread (the synchronous `deinit()` is unchanged)
+- fix: the automatic audio device start/stop (triggered when a sound is played or all sounds are paused, e.g. on iOS or Android with `setAndroidPauseDeviceWhenIdle`) no longer blocks the UI thread — the blocking native device start now runs on the background scheduler thread that already handles the deferred device stop
 
 #### 4.0.12 (30 Jun 2026)
 - add `lowLatency` init option to allow recordable Android output #492. Thanks to @MjnMixael
