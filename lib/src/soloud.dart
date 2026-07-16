@@ -429,7 +429,10 @@ interface class SoLoud {
       androidAAudioAttributes == AndroidAAudioAttributes.mediaMusic,
     );
 
-    final error = _controller.soLoudFFI.initEngine(
+    // The blocking native engine/device initialization runs off the UI thread
+    // (via a worker isolate inside the binding) so it no longer freezes the app
+    // during startup — the ANR reported in #481.
+    final error = await _controller.soLoudFFI.initEngine(
       device?.id ?? -1,
       sampleRate,
       bufferSize,
@@ -486,6 +489,69 @@ interface class SoLoud {
     }
   }
 
+  /// Stops the audio output device without deinitializing the engine.
+  ///
+  /// Only the underlying audio device is stopped. Loaded [AudioSource]s, active
+  /// voices, filters and the [isInitialized] state are all left untouched, so
+  /// playback resumes exactly where it left off once [startAudioDevice] is
+  /// called. The device is stopped even while sounds are actively playing.
+  ///
+  /// This is idempotent: calling it while the device is already stopped does
+  /// nothing.
+  ///
+  /// The blocking native device operation runs off the UI thread, so this does
+  /// not freeze the app; await the returned future to know when it completed.
+  ///
+  /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
+  Future<void> stopAudioDevice() async {
+    if (!isInitialized) {
+      throw const SoLoudNotInitializedException();
+    }
+
+    final error = await _controller.soLoudFFI.stopAudioDevice();
+    _logPlayerError(error, from: 'stopAudioDevice() result');
+    if (error != PlayerErrors.noError) {
+      throw SoLoudCppException.fromPlayerError(error);
+    }
+  }
+
+  /// Restarts the audio output device previously stopped by [stopAudioDevice],
+  /// so existing voices and loaded [AudioSource]s keep operating.
+  ///
+  /// This is idempotent: calling it while the device is already started does
+  /// nothing.
+  ///
+  /// The blocking native device operation runs off the UI thread, so this does
+  /// not freeze the app; await the returned future to know when the device is
+  /// running again.
+  ///
+  /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
+  Future<void> startAudioDevice() async {
+    if (!isInitialized) {
+      throw const SoLoudNotInitializedException();
+    }
+
+    final error = await _controller.soLoudFFI.startAudioDevice();
+    _logPlayerError(error, from: 'startAudioDevice() result');
+    if (error != PlayerErrors.noError) {
+      throw SoLoudCppException.fromPlayerError(error);
+    }
+  }
+
+  /// Gets the current state of the audio output device.
+  ///
+  /// Use this to check whether the device is currently
+  /// [AudioDeviceState.started] (actively delivering audio),
+  /// [AudioDeviceState.stopped] (for example after [stopAudioDevice]), or in a
+  /// transitional state. Returns [AudioDeviceState.uninitialized] if the engine
+  /// has not been initialized.
+  ///
+  /// This is a cheap, synchronous read and is safe to call at any time,
+  /// including before the engine is initialized.
+  AudioDeviceState getAudioDeviceState() {
+    return _controller.soLoudFFI.getAudioDeviceState();
+  }
+
   /// Lists all OS available playback devices.
   /// Could be called safely even if the engin has not been initialized yet.
   List<PlaybackDevice> listPlaybackDevices() {
@@ -497,12 +563,42 @@ interface class SoLoud {
   /// This method is meant to be called when exiting the app. For example
   /// within the `dispose()` of the uppermost widget in the tree
   /// or inside "AppLifecycleListener.onExitRequested".
+  ///
+  /// This is synchronous: the native teardown (which uninitializes the audio
+  /// device) runs on the calling thread. Use [deinitAsync] to run that teardown
+  /// off the UI thread when you can await it.
   void deinit() {
     _log.finest('deinit() called');
+    _predeinit();
+    _controller.soLoudFFI.deinit();
+    _postdeinit();
+  }
+
+  /// Like [deinit], but runs the blocking native teardown (audio device
+  /// uninitialization) off the UI thread so it does not freeze the app.
+  ///
+  /// Prefer this over [deinit] wherever you can await the result. [deinit] is
+  /// still provided for synchronous contexts such as
+  /// "AppLifecycleListener.onExitRequested".
+  Future<void> deinitAsync() async {
+    _log.finest('deinitAsync() called');
+    _predeinit();
+    await _controller.soLoudFFI.deinitAsync();
+    _postdeinit();
+  }
+
+  /// Shared teardown steps that must run on the calling (UI) isolate before the
+  /// native teardown: closing the isolate-bound native callables and disposing
+  /// loaded sounds. See [deinit] and [deinitAsync].
+  void _predeinit() {
     _nativeCallbacksInitialized = false;
     _controller.soLoudFFI.disposeNativeCallables();
     _controller.soLoudFFI.disposeAllSound();
-    _controller.soLoudFFI.deinit();
+  }
+
+  /// Shared teardown steps that run after the native teardown. See [deinit] and
+  /// [deinitAsync].
+  void _postdeinit() {
     _activeSounds.clear();
   }
 

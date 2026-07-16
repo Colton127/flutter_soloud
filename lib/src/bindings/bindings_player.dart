@@ -79,8 +79,12 @@ abstract class FlutterSoLoud {
   /// [channels] mono, stereo, quad, 5.1, 7.1.
   ///
   /// Returns [PlayerErrors.noError] if success.
+  ///
+  /// The blocking native engine/device initialization runs off the UI thread so
+  /// it does not freeze the app (#481); the future completes once the engine is
+  /// initialized.
   @mustBeOverridden
-  PlayerErrors initEngine(
+  Future<PlayerErrors> initEngine(
     int deviceId,
     int sampleRate,
     int bufferSize,
@@ -103,6 +107,30 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   void setAndroidPauseDeviceWhenIdle(bool enable);
 
+  /// Stop the audio output device without deinitializing the engine. Only the
+  /// miniaudio device is stopped; loaded sounds, active voices and the
+  /// initialized state are preserved so playback can resume later with
+  /// [startAudioDevice]. Idempotent: a no-op if the device is already stopped.
+  ///
+  /// The blocking native device call runs off the UI thread so it does not
+  /// freeze the app; the returned future completes once the device is stopped.
+  @mustBeOverridden
+  Future<PlayerErrors> stopAudioDevice();
+
+  /// Restart the audio output device previously stopped by [stopAudioDevice],
+  /// so existing voices and loaded sounds keep operating. Idempotent: a no-op
+  /// if the device is already started.
+  ///
+  /// The blocking native device call runs off the UI thread so it does not
+  /// freeze the app; the returned future completes once the device is running.
+  @mustBeOverridden
+  Future<PlayerErrors> startAudioDevice();
+
+  /// Get the current state of the audio output device. Returns
+  /// [AudioDeviceState.uninitialized] if the engine is not initialized.
+  @mustBeOverridden
+  AudioDeviceState getAudioDeviceState();
+
   /// Change the playback device.
   ///
   /// [deviceId] the device ID. -1 for default OS output device.
@@ -115,6 +143,11 @@ abstract class FlutterSoLoud {
   /// Must be called when the player is no more needed or when closing the app.
   @mustBeOverridden
   void deinit();
+
+  /// Like [deinit], but runs the blocking native teardown off the UI thread so
+  /// it does not freeze the app; the future completes once teardown is done.
+  @mustBeOverridden
+  Future<void> deinitAsync();
 
   /// Gets the state of player
   ///

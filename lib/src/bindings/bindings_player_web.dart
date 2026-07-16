@@ -116,13 +116,14 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   bool areXiphLibsAvailable() => wasmAreXiphLibsAvailable() == 1;
 
   @override
-  PlayerErrors initEngine(
+  Future<PlayerErrors> initEngine(
     int deviceId,
     int sampleRate,
     int bufferSize,
     Channels channels,
     bool lowLatency,
-  ) {
+  ) async {
+    // Web is single-threaded (no isolates), so call the wasm function directly.
     // [lowLatency] only affects the native miniaudio backends (it selects the
     // AAudio/CoreAudio performance profile); the Web Audio backend ignores it.
     final ret = wasmInitEngine(
@@ -143,6 +144,27 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   @override
   void setAndroidPauseDeviceWhenIdle(bool enable) {
     // No-op on web: no wakelock concept, device lifecycle differs.
+  }
+
+  @override
+  Future<PlayerErrors> stopAudioDevice() async {
+    // Web is single-threaded (no isolates) and the device change is instant,
+    // so call the wasm function directly.
+    final ret = wasmStopAudioDevice();
+    return PlayerErrors.values[ret];
+  }
+
+  @override
+  Future<PlayerErrors> startAudioDevice() async {
+    // Web is single-threaded (no isolates) and the device change is instant,
+    // so call the wasm function directly.
+    final ret = wasmStartAudioDevice();
+    return PlayerErrors.values[ret];
+  }
+
+  @override
+  AudioDeviceState getAudioDeviceState() {
+    return AudioDeviceState.fromValue(wasmGetAudioDeviceState());
   }
 
   @override
@@ -190,6 +212,10 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   void deinit() => wasmDeinit();
+
+  @override
+  // Web is single-threaded (no isolates), so call the wasm function directly.
+  Future<void> deinitAsync() async => wasmDeinit();
 
   @override
   bool isInited() => wasmIsInited() == 1;
