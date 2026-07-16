@@ -133,8 +133,8 @@ PlayerErrors loadOggXiphBufferStream(Player *player,
 }
 
 Player::Player() : mInited(false), mFilters(&soloud, nullptr, nullptr),
-                   mPauseRequested(false), mStopPauseThread(false),
-                   mPauseThreadRunning(false)
+                   mPauseRequested(false), mResumeRequested(false),
+                   mStopPauseThread(false), mPauseThreadRunning(false)
 {
 }
 
@@ -769,8 +769,9 @@ void Player::setPause(unsigned int handle, bool pause)
     {
         // When unpausing, ensure the audio device is started.
         // This handles cases where the OS stopped the device without notifying us
-        // (e.g., Control Center pause on iOS).
-        soloud.resume();
+        // (e.g., Control Center pause on iOS). Done off the UI thread so the
+        // blocking native ma_device_start() does not freeze the app.
+        resumeEngine();
     }
     
     soloud.setPause(handle, pause);
@@ -821,6 +822,41 @@ void Player::pauseEngine()
 #endif
 }
 
+// Restart the audio device off the UI thread. The native ma_device_start()
+// blocks for tens of milliseconds (seconds on some Android devices) while the
+// OS restarts the device, so running it inline on the FFI (UI) thread freezes
+// the app. Post the request to the same scheduler thread that handles the
+// deferred pause; it calls soloud.resume() there instead. A pending resume
+// also cancels a pending deferred pause so a play() arriving during the pause
+// coalescing window keeps the device running.
+void Player::resumeEngine()
+{
+    if (!mInited)
+        return;
+#ifdef __EMSCRIPTEN__
+    // Web: the wasm build is single-threaded (no pthreads), so there is no
+    // scheduler thread. The AudioContext resume is effectively instant, so
+    // start the device inline.
+    soloud.resume();
+#else
+    bool schedulerRunning;
+    {
+        std::lock_guard<std::mutex> lock(mPauseMutex);
+        schedulerRunning = mPauseThreadRunning;
+        if (schedulerRunning)
+            mResumeRequested = true;
+    }
+    if (!schedulerRunning)
+    {
+        // No scheduler running (should not happen while inited): fall back to
+        // a synchronous resume rather than silently dropping it.
+        soloud.resume();
+        return;
+    }
+    mPauseCv.notify_one();
+#endif
+}
+
 void Player::setAndroidPauseDeviceWhenIdle(bool enable)
 {
 #if defined(__ANDROID__)
@@ -844,9 +880,10 @@ void Player::setAndroidPauseDeviceWhenIdle(bool enable)
     else
     {
         // Reverting to the historical always-on behavior: if a previous
-        // idle-pause already stopped the device, start it back up right away.
-        // resume() is a no-op when the device is already running.
-        soloud.resume();
+        // idle-pause already stopped the device, start it back up. Done off
+        // the UI thread so the blocking native ma_device_start() does not
+        // freeze the app. A no-op at the backend when already running.
+        resumeEngine();
     }
 #else
     (void)enable;
@@ -891,6 +928,7 @@ void Player::startPauseEngineScheduler()
         return;
     mStopPauseThread = false;
     mPauseRequested = false;
+    mResumeRequested = false;
     mPauseThread = std::thread(&Player::pauseEngineScheduler, this);
     mPauseThreadRunning = true;
 #endif
@@ -921,21 +959,45 @@ void Player::pauseEngineScheduler()
     while (!mStopPauseThread)
     {
         std::unique_lock<std::mutex> lock(mPauseMutex);
-        mPauseCv.wait(lock, [this] { return mPauseRequested || mStopPauseThread; });
+        mPauseCv.wait(lock, [this] {
+            return mPauseRequested || mResumeRequested || mStopPauseThread;
+        });
         if (mStopPauseThread)
             break;
 
-        // A request arrived. Reset it and wait for the delay, but wake early
-        // if another request arrives (coalescing rapid calls).
+        // Resume takes priority over a pending pause: a play()/unpause that
+        // arrives while a device stop is queued means the device must stay
+        // running. Start the device immediately (off the UI thread) and drop
+        // any pending pause.
+        if (mResumeRequested)
+        {
+            mResumeRequested = false;
+            mPauseRequested = false;
+            lock.unlock();
+            if (mInited)
+                soloud.resume();
+            continue;
+        }
+
+        // A pause request arrived. Reset it and wait for the delay, but wake
+        // early if another request arrives (coalescing rapid calls).
         mPauseRequested = false;
         mPauseCv.wait_for(lock, std::chrono::milliseconds(kPauseEngineDelayMs),
-                          [this] { return mPauseRequested || mStopPauseThread; });
+                          [this] {
+                              return mPauseRequested || mResumeRequested ||
+                                     mStopPauseThread;
+                          });
 
         if (mStopPauseThread)
             break;
 
-        // If another request arrived during the wait, loop back and restart
-        // the delay so the pause happens only after the burst of requests ends.
+        // A resume that arrived during the delay cancels this pause; handle it
+        // on the next loop iteration.
+        if (mResumeRequested)
+            continue;
+
+        // If another pause request arrived during the wait, loop back and
+        // restart the delay so the pause happens only after the burst ends.
         if (mPauseRequested)
             continue;
 
@@ -1020,7 +1082,10 @@ PlayerErrors Player::play(
     }
 
     // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    soloud.resume();
+    // Done off the UI thread so the blocking native ma_device_start() does not
+    // freeze the app; soloud.play() below only registers the voice, which the
+    // device picks up as soon as it has finished starting.
+    resumeEngine();
 
     handle = 0;
     SoLoud::handle newHandle = 0;
@@ -1239,7 +1304,10 @@ PlayerErrors Player::textToSpeech(const std::string &textToSpeech, unsigned int 
         return backendNotInited;
 
     // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    soloud.resume();
+    // Done off the UI thread so the blocking native ma_device_start() does not
+    // freeze the app; soloud.play() below only registers the voice, which the
+    // device picks up as soon as it has finished starting.
+    resumeEngine();
 
     SoLoud::result result = speech.setText(textToSpeech.c_str());
     
@@ -1631,7 +1699,10 @@ PlayerErrors Player::play3d(
     }
 
     // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    soloud.resume();
+    // Done off the UI thread so the blocking native ma_device_start() does not
+    // freeze the app; soloud.play() below only registers the voice, which the
+    // device picks up as soon as it has finished starting.
+    resumeEngine();
 
     handle = 0;
     SoLoud::handle newHandle = 0;
