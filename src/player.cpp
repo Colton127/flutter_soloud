@@ -809,7 +809,7 @@ void Player::pauseEngine()
     // scheduler thread cannot run. Pause the device immediately instead. The
     // browser's AudioContext does not have the OS audio-session settling issue
     // that motivates the delay on native platforms.
-    if (mInited && soloud.getActiveVoiceCount() == 0)
+    if (mInited && soloud.getActiveVoiceCount() == 0 && !mDeviceKeepAlive.load())
         soloud.pause();
 #else
     {
@@ -888,6 +888,29 @@ void Player::setAndroidPauseDeviceWhenIdle(bool enable)
 #else
     (void)enable;
 #endif
+}
+
+void Player::setAudioDeviceKeepAlive(bool keepAlive)
+{
+    mDeviceKeepAlive.store(keepAlive);
+
+    if (!mInited)
+        return;
+
+    if (keepAlive)
+    {
+        // Start the device now (off the UI thread) and cancel any pending
+        // deferred idle-pause, so the device keeps running even with no
+        // active voices.
+        resumeEngine();
+    }
+    else if (soloud.getActiveVoiceCount() == 0)
+    {
+        // Back to the normal idle policy: nothing is playing, so schedule the
+        // usual deferred idle-pause (which honors the platform policy, e.g.
+        // setAndroidPauseDeviceWhenIdle on Android).
+        pauseEngine();
+    }
 }
 
 PlayerErrors Player::stopAudioDevice()
@@ -1002,7 +1025,8 @@ void Player::pauseEngineScheduler()
             continue;
 
         lock.unlock();
-        if (mInited && soloud.getActiveVoiceCount() == 0)
+        if (mInited && soloud.getActiveVoiceCount() == 0 &&
+            !mDeviceKeepAlive.load())
         {
             soloud.pause();
         }
@@ -1258,6 +1282,12 @@ void Player::disposeAllSound()
         sounds.clear();
     }
     // Sounds (and their filters) are destroyed here when soundsToDestroy goes out of scope
+
+    // The unconditional soloud.pause() above may have stopped the device. If
+    // the app asked for the device to stay alive while idle, restart it (off
+    // the UI thread) now that the sounds have been destroyed.
+    if (mDeviceKeepAlive.load())
+        resumeEngine();
 }
 
 void Player::clearDartCallbackRegistrations()

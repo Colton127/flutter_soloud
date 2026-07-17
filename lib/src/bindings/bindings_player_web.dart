@@ -147,6 +147,13 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
+  void setAudioDeviceKeepAlive(bool keepAlive) {
+    // No-op on web: the device is always kept running there (the idle-pause
+    // is disabled on web to avoid stale-buffer glitches), so it is already
+    // effectively kept alive.
+  }
+
+  @override
   Future<PlayerErrors> stopAudioDevice() async {
     // Web is single-threaded (no isolates) and the device change is instant,
     // so call the wasm function directly.
