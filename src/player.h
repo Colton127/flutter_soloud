@@ -227,6 +227,19 @@ public:
   /// @param enable whether the device should be stopped while idle.
   void setAndroidPauseDeviceWhenIdle(bool enable);
 
+  /// @brief Keep the audio output device running even while the engine is
+  /// idle (no active voices). While enabled, the deferred idle-pause is
+  /// suppressed on every platform, so the device keeps rendering (silence
+  /// when nothing plays) and the app keeps its OS audio session alive — a
+  /// device-level replacement for playing a silent looping sound. Enabling
+  /// also starts the device immediately (off the UI thread) if it was
+  /// stopped. Disabling restores the normal idle policy and, if nothing is
+  /// playing, schedules the usual deferred idle-pause so the device stops
+  /// (honoring setAndroidPauseDeviceWhenIdle on Android). OS-initiated
+  /// interruptions (e.g. a phone call) still stop the device regardless.
+  /// @param keepAlive whether the device must be kept running while idle.
+  void setAudioDeviceKeepAlive(bool keepAlive);
+
   /// @brief Stop the audio output device without deinitializing the engine.
   /// Only the miniaudio device is stopped; loaded sounds, active voices and
   /// the initialized state are all preserved so playback can be resumed later
@@ -699,6 +712,10 @@ private:
   std::atomic<bool> mResumeRequested{false};
   std::atomic<bool> mStopPauseThread{false};
   bool mPauseThreadRunning = false;
+  /// While true, the deferred idle-pause never stops the device (see
+  /// setAudioDeviceKeepAlive). Read by the scheduler thread, written from the
+  /// FFI thread.
+  std::atomic<bool> mDeviceKeepAlive{false};
 
   void pauseEngineScheduler();
   void startPauseEngineScheduler();

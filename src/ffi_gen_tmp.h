@@ -115,6 +115,15 @@ FFI_PLUGIN_EXPORT unsigned int busGetActiveVoiceCount(unsigned int busId);
 /// other backends.
 FFI_PLUGIN_EXPORT void setAndroidPauseDeviceWhenIdle(unsigned int enable);
 
+/// Keep the audio output device running even while the engine is idle (no
+/// active voices), on every platform. While enabled the deferred idle-pause is
+/// suppressed, so the device keeps rendering (silence when nothing plays) and
+/// the app keeps its OS audio session alive. [keepAlive] != 0 also starts the
+/// device immediately if it was stopped; 0 (default) restores the normal idle
+/// policy and, when nothing is playing, schedules the usual deferred
+/// idle-pause. Can be called any time.
+FFI_PLUGIN_EXPORT void setAudioDeviceKeepAlive(unsigned int keepAlive);
+
 /// Stop the audio output device without deinitializing the engine. Only the
 /// miniaudio device is stopped; loaded sounds, active voices and the
 /// initialized state are preserved so playback can be resumed later with

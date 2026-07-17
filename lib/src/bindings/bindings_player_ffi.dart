@@ -385,6 +385,20 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       .asFunction<void Function(int)>();
 
   @override
+  void setAudioDeviceKeepAlive(bool keepAlive) {
+    // Cheap native call (atomic store; any device start is posted to the
+    // background scheduler thread), so call it directly on the UI isolate.
+    _setAudioDeviceKeepAlive(keepAlive ? 1 : 0);
+  }
+
+  late final _setAudioDeviceKeepAlivePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt)>>(
+        'setAudioDeviceKeepAlive',
+      );
+  late final _setAudioDeviceKeepAlive = _setAudioDeviceKeepAlivePtr
+      .asFunction<void Function(int)>();
+
+  @override
   Future<PlayerErrors> stopAudioDevice() async {
     // Run the blocking native ma_device_stop() off the UI isolate. Only the
     // raw function pointer address (a sendable int) is captured; the pointer

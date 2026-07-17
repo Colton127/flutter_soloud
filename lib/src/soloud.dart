@@ -2348,6 +2348,39 @@ interface class SoLoud {
     _controller.soLoudFFI.setAndroidPauseDeviceWhenIdle(enable);
   }
 
+  /// Keeps the audio output device running even while the engine is idle
+  /// (no active voices), on every platform.
+  ///
+  /// Normally SoLoud stops the device shortly (~500 ms) after the last voice
+  /// stops or pauses (on iOS/macOS/desktop always; on Android when
+  /// [setAndroidPauseDeviceWhenIdle] is enabled). While [keepAlive] is `true`
+  /// that idle-stop is suppressed: the device keeps rendering — silence when
+  /// nothing plays — so the OS keeps the app's audio session alive. This is a
+  /// device-level replacement for playing a silent looping sound to keep an
+  /// audio app running in the background (e.g. across gaps between
+  /// periodically scheduled sounds, or while a delayed-start timer is
+  /// pending).
+  ///
+  /// Enabling also starts the device immediately (off the UI thread) if it
+  /// was stopped. Disabling restores the normal idle policy and, if nothing
+  /// is playing at that moment, schedules the usual deferred idle-stop; if
+  /// voices are still playing, the device simply stops the next time the
+  /// engine goes idle.
+  ///
+  /// Note that while the device runs it holds the OS resources of an active
+  /// audio output (on Android the audioserver `AudioMix` partial wakelock, on
+  /// iOS an active audio session), so only keep it alive while the user is
+  /// actually playing something or expects playback to start. OS-initiated
+  /// interruptions (e.g. a phone call) still stop the device regardless; it
+  /// restarts when the interruption ends or on the next play.
+  ///
+  /// Defaults to `false`. Can be called any time, before or after [init]
+  /// (the flag persists across [deinit]/[init] cycles). No effect on Web,
+  /// where the device is always kept running.
+  void setAudioDeviceKeepAlive(bool keepAlive) {
+    _controller.soLoudFFI.setAudioDeviceKeepAlive(keepAlive);
+  }
+
   /// Smooth FFT data.
   /// When new data is read and the values are decreasing, the new value
   /// will be decreased with an amplitude between the old and the new value.

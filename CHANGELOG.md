@@ -3,6 +3,7 @@
 - add `setAndroidPauseDeviceWhenIdle` (opt-in, default off) to stop the audio device when idle on Android, releasing the audioserver `AudioMix` partial wakelock #250
 - add `stopAudioDevice()` / `startAudioDevice()` to stop and restart the audio output device without deinitializing the engine (loaded sounds and voices are preserved); the blocking native device operation runs off the UI thread so it does not freeze the app
 - add `getAudioDeviceState()` returning an `AudioDeviceState` enum to query the current state of the audio output device (uninitialized, stopped, started, starting, stopping)
+- add `setAudioDeviceKeepAlive()` to keep the audio output device running while the engine is idle on every platform (a device-level replacement for playing a silent looping sound to keep a backgrounded audio app alive); disabling restores the normal idle-stop policy
 - fix: `init()` no longer blocks the UI thread — the blocking native engine/device initialization now runs off the UI thread, preventing ANRs on startup #481
 - add `deinitAsync()`, a non-blocking alternative to `deinit()` that runs the native teardown off the UI thread (the synchronous `deinit()` is unchanged)
 - fix: the automatic audio device start/stop (triggered when a sound is played or all sounds are paused, e.g. on iOS or Android with `setAndroidPauseDeviceWhenIdle`) no longer blocks the UI thread — the blocking native device start now runs on the background scheduler thread that already handles the deferred device stop
