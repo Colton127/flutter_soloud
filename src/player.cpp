@@ -808,7 +808,7 @@ void Player::pauseEngine()
     // scheduler thread cannot run. Pause the device immediately instead. The
     // browser's AudioContext does not have the OS audio-session settling issue
     // that motivates the delay on native platforms.
-    if (mInited && soloud.getActiveVoiceCount() == 0 && !mDeviceKeepAlive.load())
+    if (mInited && soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
         soloud.pause();
 #else
     {
@@ -856,24 +856,24 @@ void Player::resumeEngine()
 #endif
 }
 
-void Player::setAudioDeviceKeepAlive(bool keepAlive)
+void Player::setAudioDeviceIdleTimeout(int timeoutMs)
 {
-    mDeviceKeepAlive.store(keepAlive);
+    mIdleTimeoutMs.store(timeoutMs);
 
     if (!mInited)
         return;
 
-    if (keepAlive)
+    if (timeoutMs < 0)
     {
-        // Start the device now (off the UI thread) and cancel any pending
-        // deferred idle-pause, so the device keeps running even with no
-        // active voices.
+        // Idle timeout disabled: start the device now (off the UI thread) and
+        // cancel any pending deferred idle-pause, so the device keeps running
+        // even with no active voices.
         resumeEngine();
     }
     else if (soloud.getActiveVoiceCount() == 0)
     {
-        // Back to the normal idle policy: nothing is playing, so schedule the
-        // usual deferred idle-pause.
+        // A finite timeout while idle: (re)start the idle countdown so the
+        // device is paused after the (possibly new) delay.
         pauseEngine();
     }
 }
@@ -967,10 +967,17 @@ void Player::pauseEngineScheduler()
             continue;
         }
 
-        // A pause request arrived. Reset it and wait for the delay, but wake
-        // early if another request arrives (coalescing rapid calls).
+        // A pause request arrived. Reset it and wait for the idle timeout, but
+        // wake early if another request arrives (coalescing rapid calls).
         mPauseRequested = false;
-        mPauseCv.wait_for(lock, std::chrono::milliseconds(kPauseEngineDelayMs),
+        const int timeoutMs = mIdleTimeoutMs.load();
+        if (timeoutMs < 0)
+        {
+            // Idle timeout disabled: never pause while idle. Drop this request
+            // and wait for the next event.
+            continue;
+        }
+        mPauseCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
                           [this] {
                               return mPauseRequested || mResumeRequested ||
                                      mStopPauseThread;
@@ -991,7 +998,7 @@ void Player::pauseEngineScheduler()
 
         lock.unlock();
         if (mInited && soloud.getActiveVoiceCount() == 0 &&
-            !mDeviceKeepAlive.load())
+            mIdleTimeoutMs.load() >= 0)
         {
             soloud.pause();
         }
@@ -1249,9 +1256,9 @@ void Player::disposeAllSound()
     // Sounds (and their filters) are destroyed here when soundsToDestroy goes out of scope
 
     // The unconditional soloud.pause() above may have stopped the device. If
-    // the app asked for the device to stay alive while idle, restart it (off
-    // the UI thread) now that the sounds have been destroyed.
-    if (mDeviceKeepAlive.load())
+    // the app disabled the idle-pause (device must stay alive while idle),
+    // restart it (off the UI thread) now that the sounds have been destroyed.
+    if (mIdleTimeoutMs.load() < 0)
         resumeEngine();
 }
 

@@ -2319,36 +2319,48 @@ interface class SoLoud {
     _controller.soLoudFFI.setMaxActiveVoiceCount(maxVoiceCount);
   }
 
-  /// Keeps the audio output device running even while the engine is idle
-  /// (no active voices), on every platform.
+  /// Sets how long the audio output device keeps running after the engine
+  /// goes idle (no active voices) before it is paused, on every platform.
   ///
-  /// Normally SoLoud stops the device shortly (~500 ms) after the last voice
-  /// stops or pauses (on iOS/macOS/desktop/Android). While [keepAlive] is
-  /// `true` that idle-stop is suppressed: the device keeps rendering — silence
-  /// when nothing plays — so the OS keeps the app's audio session alive. This
-  /// is a device-level replacement for playing a silent looping sound to keep an
-  /// audio app running in the background (e.g. across gaps between
-  /// periodically scheduled sounds, or while a delayed-start timer is
-  /// pending).
+  /// After the last voice stops or pauses (on iOS/macOS/desktop/Android),
+  /// SoLoud keeps the device running for [timeout] and then stops it, letting
+  /// the OS release the app's audio session. The delay also coalesces bursts
+  /// of stop/play so the device is not paused and restarted repeatedly.
   ///
-  /// Enabling also starts the device immediately (off the UI thread) if it
-  /// was stopped. Disabling restores the normal idle policy and, if nothing
-  /// is playing at that moment, schedules the usual deferred idle-stop; if
-  /// voices are still playing, the device simply stops the next time the
-  /// engine goes idle.
+  /// Passing `null` disables the idle-stop entirely: the device keeps
+  /// rendering — silence when nothing plays — so the OS keeps the app's audio
+  /// session alive. This is a device-level replacement for playing a silent
+  /// looping sound to keep an audio app running in the background (e.g. across
+  /// gaps between periodically scheduled sounds, or while a delayed-start
+  /// timer is pending).
+  ///
+  /// Changes take effect immediately:
+  ///
+  ///  * If [timeout] is `null` and the device is stopped, it is started now
+  ///    (off the UI thread).
+  ///  * If [timeout] is non-null and the engine is currently idle, the idle
+  ///    countdown is (re)started with the new delay.
   ///
   /// Note that while the device runs it holds the OS resources of an active
   /// audio output (on Android the audioserver `AudioMix` partial wakelock, on
-  /// iOS an active audio session), so only keep it alive while the user is
-  /// actually playing something or expects playback to start. OS-initiated
-  /// interruptions (e.g. a phone call) still stop the device regardless; it
-  /// restarts when the interruption ends or on the next play.
+  /// iOS an active audio session), so only disable the idle-stop while the
+  /// user is actually playing something or expects playback to start.
+  /// OS-initiated interruptions (e.g. a phone call) still stop the device
+  /// regardless; it restarts when the interruption ends or on the next play.
   ///
-  /// Defaults to `false`. Can be called any time, before or after [init]
-  /// (the flag persists across [deinit]/[init] cycles). No effect on Web,
-  /// where the device is always kept running.
-  void setAudioDeviceKeepAlive(bool keepAlive) {
-    _controller.soLoudFFI.setAudioDeviceKeepAlive(keepAlive);
+  /// Defaults to 500 ms. Can be called any time, before or after [init] (the
+  /// value persists across [deinit]/[init] cycles). No effect on Web, where
+  /// the device is always kept running.
+  void setAudioDeviceIdleTimeout(Duration? timeout) {
+    // A negative value is the "never pause" sentinel on the native side, so
+    // map null to -1 and clamp any non-null timeout to a non-negative value.
+    final int timeoutMs;
+    if (timeout == null) {
+      timeoutMs = -1;
+    } else {
+      timeoutMs = timeout.inMilliseconds < 0 ? 0 : timeout.inMilliseconds;
+    }
+    _controller.soLoudFFI.setAudioDeviceIdleTimeout(timeoutMs);
   }
 
   /// Smooth FFT data.

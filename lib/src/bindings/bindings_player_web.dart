@@ -142,10 +142,10 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  void setAudioDeviceKeepAlive(bool keepAlive) {
+  void setAudioDeviceIdleTimeout(int timeoutMs) {
     // No-op on web: the device is always kept running there (the idle-pause
-    // is disabled on web to avoid stale-buffer glitches), so it is already
-    // effectively kept alive.
+    // is disabled on web to avoid stale-buffer glitches), so the idle timeout
+    // has no effect.
   }
 
   @override

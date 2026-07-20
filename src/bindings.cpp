@@ -257,15 +257,16 @@ FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed) {
   SoLoud::miniaudio_setAndroidAAudioAttributes(managed != 0);
 }
 
-/// Keep the audio output device running even while the engine is idle (no
-/// active voices), on every platform. While enabled the deferred idle-pause is
-/// suppressed, so the device keeps rendering (silence when nothing plays) and
-/// the app keeps its OS audio session alive. [keepAlive] != 0 also starts the
-/// device immediately if it was stopped; 0 (default) restores the normal idle
-/// policy and, when nothing is playing, schedules the usual deferred
-/// idle-pause. Can be called any time.
-FFI_PLUGIN_EXPORT void setAudioDeviceKeepAlive(unsigned int keepAlive) {
-  player.get()->setAudioDeviceKeepAlive(keepAlive != 0);
+/// Set how long the audio output device keeps running after the engine goes
+/// idle (no active voices) before it is paused, on every platform. [timeoutMs]
+/// is the idle-stop delay in milliseconds (default 500). A negative
+/// [timeoutMs] disables the idle-pause, so the device keeps rendering (silence
+/// when nothing plays) and the app keeps its OS audio session alive; it also
+/// starts the device immediately if it was stopped. A non-negative [timeoutMs]
+/// while idle (re)starts the idle countdown. Can be called any time, including
+/// before initEngine().
+FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs) {
+  player.get()->setAudioDeviceIdleTimeout(timeoutMs);
 }
 
 /// Stop the audio output device without deinitializing the engine. Only the

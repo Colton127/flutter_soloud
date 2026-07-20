@@ -373,17 +373,17 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       .asFunction<void Function(int)>();
 
   @override
-  void setAudioDeviceKeepAlive(bool keepAlive) {
+  void setAudioDeviceIdleTimeout(int timeoutMs) {
     // Cheap native call (atomic store; any device start is posted to the
     // background scheduler thread), so call it directly on the UI isolate.
-    _setAudioDeviceKeepAlive(keepAlive ? 1 : 0);
+    _setAudioDeviceIdleTimeout(timeoutMs);
   }
 
-  late final _setAudioDeviceKeepAlivePtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt)>>(
-        'setAudioDeviceKeepAlive',
+  late final _setAudioDeviceIdleTimeoutPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int)>>(
+        'setAudioDeviceIdleTimeout',
       );
-  late final _setAudioDeviceKeepAlive = _setAudioDeviceKeepAlivePtr
+  late final _setAudioDeviceIdleTimeout = _setAudioDeviceIdleTimeoutPtr
       .asFunction<void Function(int)>();
 
   @override
