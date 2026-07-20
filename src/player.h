@@ -217,16 +217,6 @@ public:
   /// at the backend if the device is already started.
   void resumeEngine();
 
-  /// @brief Android only: opt in/out of stopping the audio device when the
-  /// engine goes idle (no active voices), releasing the audioserver AudioMix
-  /// partial wakelock. Takes effect immediately based on the current state:
-  /// when enabling while already idle, a deferred device stop is scheduled
-  /// (honoring the same ~500 ms coalescing delay as any other pause); when
-  /// disabling, a device previously stopped by an idle-pause is restarted at
-  /// once. No effect on non-Android backends.
-  /// @param enable whether the device should be stopped while idle.
-  void setAndroidPauseDeviceWhenIdle(bool enable);
-
   /// @brief Keep the audio output device running even while the engine is
   /// idle (no active voices). While enabled, the deferred idle-pause is
   /// suppressed on every platform, so the device keeps rendering (silence
@@ -234,9 +224,9 @@ public:
   /// device-level replacement for playing a silent looping sound. Enabling
   /// also starts the device immediately (off the UI thread) if it was
   /// stopped. Disabling restores the normal idle policy and, if nothing is
-  /// playing, schedules the usual deferred idle-pause so the device stops
-  /// (honoring setAndroidPauseDeviceWhenIdle on Android). OS-initiated
-  /// interruptions (e.g. a phone call) still stop the device regardless.
+  /// playing, schedules the usual deferred idle-pause so the device stops.
+  /// OS-initiated interruptions (e.g. a phone call) still stop the device
+  /// regardless.
   /// @param keepAlive whether the device must be kept running while idle.
   void setAudioDeviceKeepAlive(bool keepAlive);
 

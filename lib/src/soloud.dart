@@ -2319,44 +2319,14 @@ interface class SoLoud {
     _controller.soLoudFFI.setMaxActiveVoiceCount(maxVoiceCount);
   }
 
-  /// Controls whether the audio device is stopped on Android when no voices
-  /// are active (after SoLoud's internal ~500 ms idle-pause delay).
-  ///
-  /// Stopping the device does NOT invalidate any [AudioSource]s, sound
-  /// handles, or filters — engine state is preserved and the device restarts
-  /// automatically on the next play/resume, at the cost of a device-restart
-  /// latency of roughly tens of milliseconds.
-  ///
-  /// While the device is running — even rendering silence — Android's
-  /// audioserver holds an `AudioMix` partial wakelock attributed to your app.
-  /// Enabling this releases that wakelock while idle, which otherwise counts
-  /// toward Google Play's excessive-partial-wake-locks metric.
-  ///
-  /// Defaults to `false`: the historical Android behavior, which avoids rare
-  /// stale-buffer glitches on very rapid stop→play cycles. Recommended `true`
-  /// for apps where playback commonly sits paused in the background.
-  ///
-  /// Takes effect immediately: enabling this while nothing is playing schedules
-  /// the device to stop (after SoLoud's ~500 ms idle-pause delay) rather than
-  /// waiting for the next pause/stop; disabling it restarts a device that a
-  /// previous idle-pause had stopped. The ~500 ms delay before the device stops
-  /// on pause is always applied.
-  ///
-  /// No effect on iOS/macOS/desktop (already stop the device when idle) or
-  /// Web (no-op). Can be called any time, before or after [init].
-  void setAndroidPauseDeviceWhenIdle(bool enable) {
-    _controller.soLoudFFI.setAndroidPauseDeviceWhenIdle(enable);
-  }
-
   /// Keeps the audio output device running even while the engine is idle
   /// (no active voices), on every platform.
   ///
   /// Normally SoLoud stops the device shortly (~500 ms) after the last voice
-  /// stops or pauses (on iOS/macOS/desktop always; on Android when
-  /// [setAndroidPauseDeviceWhenIdle] is enabled). While [keepAlive] is `true`
-  /// that idle-stop is suppressed: the device keeps rendering — silence when
-  /// nothing plays — so the OS keeps the app's audio session alive. This is a
-  /// device-level replacement for playing a silent looping sound to keep an
+  /// stops or pauses (on iOS/macOS/desktop/Android). While [keepAlive] is
+  /// `true` that idle-stop is suppressed: the device keeps rendering — silence
+  /// when nothing plays — so the OS keeps the app's audio session alive. This
+  /// is a device-level replacement for playing a silent looping sound to keep an
   /// audio app running in the background (e.g. across gaps between
   /// periodically scheduled sounds, or while a delayed-start timer is
   /// pending).

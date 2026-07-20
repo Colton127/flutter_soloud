@@ -197,7 +197,6 @@ void Player::setStateChangedCallback(void (*stateChangedCallback)(unsigned int))
 // Defined in the miniaudio backend (soloud_miniaudio.cpp). Forward-declared
 // here so we don't need to pull in the backend-internal header.
 namespace SoLoud { void miniaudio_setLowLatency(bool aLowLatency); }
-namespace SoLoud { void miniaudio_setAndroidPauseDeviceWhenIdle(bool aEnable); }
 namespace SoLoud { SoLoud::result miniaudio_stopAudioDevice(); }
 namespace SoLoud { SoLoud::result miniaudio_startAudioDevice(); }
 namespace SoLoud { unsigned int miniaudio_getAudioDeviceState(); }
@@ -857,39 +856,6 @@ void Player::resumeEngine()
 #endif
 }
 
-void Player::setAndroidPauseDeviceWhenIdle(bool enable)
-{
-#if defined(__ANDROID__)
-    // Update the backend flag first so any subsequent pause honors the choice.
-    SoLoud::miniaudio_setAndroidPauseDeviceWhenIdle(enable);
-
-    // Apply the change to the running device immediately, based on the current
-    // state, instead of waiting for the next pause/stop event.
-    if (!mInited)
-        return;
-
-    if (enable)
-    {
-        // If nothing is actively playing, the device may be sitting started
-        // but idle (holding the AudioMix wakelock). Schedule the deferred stop
-        // now; this reuses pauseEngine()'s ~500 ms coalescing so it behaves
-        // exactly like an idle-pause triggered by the last voice stopping.
-        if (soloud.getActiveVoiceCount() == 0)
-            pauseEngine();
-    }
-    else
-    {
-        // Reverting to the historical always-on behavior: if a previous
-        // idle-pause already stopped the device, start it back up. Done off
-        // the UI thread so the blocking native ma_device_start() does not
-        // freeze the app. A no-op at the backend when already running.
-        resumeEngine();
-    }
-#else
-    (void)enable;
-#endif
-}
-
 void Player::setAudioDeviceKeepAlive(bool keepAlive)
 {
     mDeviceKeepAlive.store(keepAlive);
@@ -907,8 +873,7 @@ void Player::setAudioDeviceKeepAlive(bool keepAlive)
     else if (soloud.getActiveVoiceCount() == 0)
     {
         // Back to the normal idle policy: nothing is playing, so schedule the
-        // usual deferred idle-pause (which honors the platform policy, e.g.
-        // setAndroidPauseDeviceWhenIdle on Android).
+        // usual deferred idle-pause.
         pauseEngine();
     }
 }

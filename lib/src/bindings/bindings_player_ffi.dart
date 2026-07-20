@@ -373,18 +373,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       .asFunction<void Function(int)>();
 
   @override
-  void setAndroidPauseDeviceWhenIdle(bool enable) {
-    _setAndroidPauseDeviceWhenIdle(enable ? 1 : 0);
-  }
-
-  late final _setAndroidPauseDeviceWhenIdlePtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt)>>(
-        'setAndroidPauseDeviceWhenIdle',
-      );
-  late final _setAndroidPauseDeviceWhenIdle = _setAndroidPauseDeviceWhenIdlePtr
-      .asFunction<void Function(int)>();
-
-  @override
   void setAudioDeviceKeepAlive(bool keepAlive) {
     // Cheap native call (atomic store; any device start is posted to the
     // background scheduler thread), so call it directly on the UI isolate.
