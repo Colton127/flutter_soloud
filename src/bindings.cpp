@@ -257,15 +257,6 @@ FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed) {
   SoLoud::miniaudio_setAndroidAAudioAttributes(managed != 0);
 }
 
-/// Android only: choose whether SoLoud stops the audio device when the engine
-/// goes idle (no active voices), releasing the audioserver AudioMix partial
-/// wakelock. [enable] != 0 turns this on; 0 (default) keeps the historical
-/// behavior of leaving the device running. Can be called any time. No effect on
-/// other backends.
-FFI_PLUGIN_EXPORT void setAndroidPauseDeviceWhenIdle(unsigned int enable) {
-  player.get()->setAndroidPauseDeviceWhenIdle(enable != 0);
-}
-
 /// Keep the audio output device running even while the engine is idle (no
 /// active voices), on every platform. While enabled the deferred idle-pause is
 /// suppressed, so the device keeps rendering (silence when nothing plays) and

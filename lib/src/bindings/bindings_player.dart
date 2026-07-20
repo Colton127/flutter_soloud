@@ -100,13 +100,6 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   void setAndroidAAudioAttributes(bool managed);
 
-  /// Android only: when [enable] is true, SoLoud stops the audio device once
-  /// the engine goes idle (no active voices), releasing the audioserver
-  /// AudioMix partial wakelock. Defaults to false, keeping the device running.
-  /// Can be called any time. No effect on non-Android backends or on web.
-  @mustBeOverridden
-  void setAndroidPauseDeviceWhenIdle(bool enable);
-
   /// Keep the audio output device running even while the engine is idle (no
   /// active voices), on every platform. While enabled the deferred idle-pause
   /// is suppressed, so the device keeps rendering (silence when nothing plays)

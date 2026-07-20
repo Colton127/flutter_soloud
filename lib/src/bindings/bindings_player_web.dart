@@ -142,11 +142,6 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  void setAndroidPauseDeviceWhenIdle(bool enable) {
-    // No-op on web: no wakelock concept, device lifecycle differs.
-  }
-
-  @override
   void setAudioDeviceKeepAlive(bool keepAlive) {
     // No-op on web: the device is always kept running there (the idle-pause
     // is disabled on web to avoid stale-buffer glitches), so it is already
