@@ -100,16 +100,18 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   void setAndroidAAudioAttributes(bool managed);
 
-  /// Keep the audio output device running even while the engine is idle (no
-  /// active voices), on every platform. While enabled the deferred idle-pause
-  /// is suppressed, so the device keeps rendering (silence when nothing plays)
-  /// and the app keeps its OS audio session alive. Enabling also starts the
-  /// device immediately if it was stopped; disabling restores the normal idle
-  /// policy and, when nothing is playing, schedules the usual deferred
-  /// idle-pause. Defaults to false. Can be called any time. No effect on web
-  /// (the device is always kept running there).
+  /// Set how long the audio output device keeps running while the engine is
+  /// idle (no active voices) before it is automatically stopped, on every
+  /// platform. A `null` [timeout] keeps the device running indefinitely while
+  /// idle (the deferred idle-pause is suppressed, so the device keeps rendering
+  /// silence and the app keeps its OS audio session alive) and starts it
+  /// immediately if it was stopped. [Duration.zero] stops the device as soon as
+  /// possible once idle. A positive [timeout] keeps it running for that long
+  /// after going idle. Any play/unpause before the deadline cancels the pending
+  /// stop. Defaults to 500 ms. Can be called any time. No effect on web (the
+  /// device is always kept running there).
   @mustBeOverridden
-  void setAudioDeviceKeepAlive(bool keepAlive);
+  void setAudioDeviceIdleTimeout(Duration? timeout);
 
   /// Stop the audio output device without deinitializing the engine. Only the
   /// miniaudio device is stopped; loaded sounds, active voices and the

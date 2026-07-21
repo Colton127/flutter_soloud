@@ -108,14 +108,16 @@ FFI_PLUGIN_EXPORT void busAnnexSound(unsigned int busId,
 /// Returns the active voice count, or 0 if the bus is not found.
 FFI_PLUGIN_EXPORT unsigned int busGetActiveVoiceCount(unsigned int busId);
 
-/// Keep the audio output device running even while the engine is idle (no
-/// active voices), on every platform. While enabled the deferred idle-pause is
-/// suppressed, so the device keeps rendering (silence when nothing plays) and
-/// the app keeps its OS audio session alive. [keepAlive] != 0 also starts the
-/// device immediately if it was stopped; 0 (default) restores the normal idle
-/// policy and, when nothing is playing, schedules the usual deferred
-/// idle-pause. Can be called any time.
-FFI_PLUGIN_EXPORT void setAudioDeviceKeepAlive(unsigned int keepAlive);
+/// Set how long the audio output device keeps running while the engine is idle
+/// (no active voices) before it is automatically stopped, on every platform.
+/// [timeoutMs] < 0 keeps the device running indefinitely while idle (the
+/// deferred idle-pause is suppressed, so the device keeps rendering silence and
+/// the app keeps its OS audio session alive) and starts it immediately if it
+/// was stopped. [timeoutMs] == 0 stops the device as soon as possible once
+/// idle. [timeoutMs] > 0 keeps it running for that many milliseconds after
+/// going idle. Any play/unpause before the deadline cancels the pending stop.
+/// The default is 500. Can be called any time.
+FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs);
 
 /// Stop the audio output device without deinitializing the engine. Only the
 /// miniaudio device is stopped; loaded sounds, active voices and the
