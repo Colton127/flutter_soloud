@@ -217,18 +217,27 @@ public:
   /// at the backend if the device is already started.
   void resumeEngine();
 
-  /// @brief Keep the audio output device running even while the engine is
-  /// idle (no active voices). While enabled, the deferred idle-pause is
-  /// suppressed on every platform, so the device keeps rendering (silence
-  /// when nothing plays) and the app keeps its OS audio session alive — a
-  /// device-level replacement for playing a silent looping sound. Enabling
-  /// also starts the device immediately (off the UI thread) if it was
-  /// stopped. Disabling restores the normal idle policy and, if nothing is
-  /// playing, schedules the usual deferred idle-pause so the device stops.
-  /// OS-initiated interruptions (e.g. a phone call) still stop the device
-  /// regardless.
-  /// @param keepAlive whether the device must be kept running while idle.
-  void setAudioDeviceKeepAlive(bool keepAlive);
+  /// @brief Set how long the audio output device keeps running while the
+  /// engine is idle (no active voices) before it is automatically stopped.
+  /// This generalizes the deferred idle-pause: instead of a fixed ~500 ms
+  /// delay, the caller chooses the delay, disables it entirely, or makes the
+  /// device stop as soon as possible.
+  ///
+  /// [timeoutMs] < 0 keeps the device running indefinitely while idle (a
+  /// device-level replacement for playing a silent looping sound; the device
+  /// keeps rendering silence and the app keeps its OS audio session alive).
+  /// [timeoutMs] == 0 stops the device as soon as possible once idle (still
+  /// asynchronously, off the UI thread). [timeoutMs] > 0 keeps the device
+  /// running for that many milliseconds after going idle. Any play/unpause
+  /// before the deadline cancels the pending stop. The default is 500 ms.
+  ///
+  /// Switching to an indefinite timeout starts the device immediately (off the
+  /// UI thread) if it was stopped; switching to a finite timeout while nothing
+  /// is playing schedules the deferred idle-stop. OS-initiated interruptions
+  /// (e.g. a phone call) still stop the device regardless.
+  /// @param timeoutMs the idle timeout in milliseconds, or a negative value to
+  /// keep the device running indefinitely.
+  void setAudioDeviceIdleTimeout(int timeoutMs);
 
   /// @brief Stop the audio output device without deinitializing the engine.
   /// Only the miniaudio device is stopped; loaded sounds, active voices and
@@ -694,7 +703,7 @@ private:
   // stray background thread. The same thread handles both the deferred device
   // stop (pause) and the immediate device start (resume) so neither native
   // ma_device_stop()/ma_device_start() call ever blocks the UI thread.
-  static constexpr unsigned int kPauseEngineDelayMs = 500;
+  static constexpr int kDefaultIdleTimeoutMs = 500;
   std::thread mPauseThread;
   std::mutex mPauseMutex;
   std::condition_variable mPauseCv;
@@ -702,10 +711,12 @@ private:
   std::atomic<bool> mResumeRequested{false};
   std::atomic<bool> mStopPauseThread{false};
   bool mPauseThreadRunning = false;
-  /// While true, the deferred idle-pause never stops the device (see
-  /// setAudioDeviceKeepAlive). Read by the scheduler thread, written from the
-  /// FFI thread.
-  std::atomic<bool> mDeviceKeepAlive{false};
+  /// How long the device keeps running while idle before the deferred
+  /// idle-pause stops it (see setAudioDeviceIdleTimeout). A negative value
+  /// keeps the device running indefinitely (the idle-pause never stops it);
+  /// 0 stops it as soon as possible; a positive value is the delay in
+  /// milliseconds. Read by the scheduler thread, written from the FFI thread.
+  std::atomic<int> mIdleTimeoutMs{kDefaultIdleTimeoutMs};
 
   void pauseEngineScheduler();
   void startPauseEngineScheduler();
