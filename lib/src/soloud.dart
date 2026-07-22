@@ -541,10 +541,14 @@ interface class SoLoud {
   /// playback resumes exactly where it left off once [startAudioDevice] is
   /// called.
   ///
-  /// By default this is a successful no-op while any voice is active. Set
-  /// [force] to `true` to stop the device during active playback. A forced stop
-  /// does not pause or otherwise mutate voices; a later play, unpause, or
-  /// [startAudioDevice] call can start the device normally.
+  /// By default this is a successful no-op while any active, unpaused voice
+  /// exists. Set [force] to `true` to stop the device during active playback. A
+  /// forced stop does not pause or otherwise mutate voices; a later play,
+  /// unpause, or [startAudioDevice] call can start the device normally.
+  ///
+  /// This is different from [setPause]: stopping the device changes output
+  /// availability, while pausing a handle changes that voice's authoritative
+  /// state inside SoLoud.
   ///
   /// This is idempotent: calling it while the device is already stopped does
   /// nothing.
@@ -565,11 +569,15 @@ interface class SoLoud {
     }
   }
 
-  /// Restarts the audio output device previously stopped by [stopAudioDevice],
-  /// so existing voices and loaded [AudioSource]s keep operating.
+  /// Starts or prewarms the audio output device without changing any voice or
+  /// loaded [AudioSource]. This uses the same serialized lifecycle path as
+  /// automatic startup.
   ///
   /// This is idempotent: calling it while the device is already started does
-  /// nothing.
+  /// nothing. It cancels an obsolete pending idle stop, but does not enable a
+  /// sticky or permanent keep-alive mode. If the engine remains idle after
+  /// startup, the current timeout configured by [setAudioDeviceIdleTimeout]
+  /// starts again. Pass `null` to that method for indefinite keep-alive.
   ///
   /// The blocking native device operation runs off the UI thread, so this does
   /// not freeze the app; await the returned future to know when the device is
@@ -590,7 +598,9 @@ interface class SoLoud {
 
   /// Gets the current state of the audio output device.
   ///
-  /// Use this to check whether the device is currently
+  /// This reports miniaudio's actual current device state, not a pending
+  /// scheduler request or the last requested operation. Use it to check
+  /// whether the device is currently
   /// [AudioDeviceState.started] (actively delivering audio),
   /// [AudioDeviceState.stopped] (for example after [stopAudioDevice]), or in a
   /// transitional state. Returns [AudioDeviceState.uninitialized] if the engine
@@ -1616,7 +1626,8 @@ interface class SoLoud {
   /// start paused. This is helpful if you want to change some attributes
   /// of the sound instance before you play it. For example, you could
   /// call [setRelativePlaySpeed] or [setProtectVoice] on the sound before
-  /// un-pausing it.
+  /// un-pausing it. Creating a paused instance does not start the output
+  /// device; unpausing the valid handle later starts it.
   ///
   /// To play a looping sound, set [looping] to `true`. You can also
   /// define the region to loop by setting [loopingStartAt]
@@ -1624,7 +1635,10 @@ interface class SoLoud {
   /// There is no way to set the end of the looping region — it will
   /// always be the end of the [sound].
   ///
-  /// Returns the [SoundHandle] of the new sound instance.
+  /// This method is synchronous and returns the [SoundHandle] of the new sound
+  /// instance immediately. For an unpaused instance, output-device startup is
+  /// requested only after the voice has been created and registered
+  /// successfully.
   ///
   /// **NOTE**: by default, the maximum number of sounds you can play is 16 and
   /// it can be changed with [setMaxActiveVoiceCount]. If this limit is reached
@@ -2444,8 +2458,10 @@ interface class SoLoud {
   /// audio output (on Android the audioserver `AudioMix` partial wakelock, on
   /// iOS an active audio session), so only keep it running while the user is
   /// actually playing something or expects playback to start. OS-initiated
-  /// interruptions (e.g. a phone call) still stop the device regardless; it
-  /// restarts when the interruption ends or on the next play.
+  /// interruptions (e.g. a phone call) still stop the device regardless. When
+  /// the interruption ends, it restarts only if active playback requires it or
+  /// this timeout is `null`; otherwise it remains stopped until later playback
+  /// or an explicit [startAudioDevice].
   ///
   /// Defaults to 500 ms. Can be called any time, before or after [init] (the
   /// setting persists across [deinit]/[init] cycles). A negative [timeout] is
@@ -2967,7 +2983,9 @@ interface class SoLoud {
   /// The rest of the parameters are equivalent to the non-3D version of this
   /// method ([play]).
   ///
-  /// Returns the [SoundHandle] of this new sound.
+  /// This method is synchronous and returns the [SoundHandle] immediately.
+  /// As with [play], a paused voice does not start the output device, and an
+  /// unpaused voice requests startup only after successful creation.
   ///
   /// **Note**: by default, the maximum number of sounds you can play is 16 and
   /// it can be changed with [setMaxActiveVoiceCount]. If this limit is reached
