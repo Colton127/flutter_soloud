@@ -57,6 +57,10 @@ public:
   /// @brief Set a function callback triggered when a voice is stopped/ended.
   void setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int *));
 
+  /// @brief Set a function callback triggered after a voice stops or becomes
+  /// paused and the SoLoud audio mutex has been released.
+  void setVoiceInactiveCallback(void (*voiceInactiveCallback)());
+
   /// @brief Set a function callback triggered when the state of the player
   /// changes.
   void setStateChangedCallback(void (*stateChangedCallback)(unsigned int));
@@ -210,6 +214,11 @@ public:
   /// background pause, giving the audio backend and OS time to stabilize the
   /// audio session (e.g. Control Center on iOS).
   void pauseEngine();
+
+  /// @brief Apply the configured idle policy after a voice may have become
+  /// inactive. The lifecycle scheduler performs the authoritative active voice
+  /// count check before stopping the device.
+  void evaluateAudioDeviceIdle();
 
   /// @brief Ensure the audio device is started, off the UI thread. Posts an
   /// immediate resume request to the background scheduler so the blocking

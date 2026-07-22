@@ -25,6 +25,7 @@ freely, subject to the following restrictions:
 #ifndef SOLOUD_H
 #define SOLOUD_H
 
+#include <atomic>
 #include <stdlib.h> // rand
 #include <math.h> // sin
 
@@ -174,6 +175,15 @@ namespace SoLoud
 		void (*_voiceEndedCallback)(unsigned int*) = nullptr;
 		void setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int*)) {
 			_voiceEndedCallback = voiceEndedCallback;
+		}
+
+		// Called after a mix cycle in which a voice stopped or became paused.
+		// The callback runs after the audio mutex has been released.
+		std::atomic<void (*)()> _voiceInactiveCallback{nullptr};
+		bool mVoiceInactiveCallbackPending = false;
+		void setVoiceInactiveCallback(void (*voiceInactiveCallback)()) {
+			_voiceInactiveCallback.store(voiceInactiveCallback,
+				std::memory_order_release);
 		}
 
 		// Set the callback to call when the device receive a state changed

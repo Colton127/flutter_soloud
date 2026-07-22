@@ -177,6 +177,7 @@ void Player::dispose() {
 
     // Clean up SoLoud
     setVoiceEndedCallback(nullptr);
+    setVoiceInactiveCallback(nullptr);
     setStateChangedCallback(nullptr);
     {
         std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
@@ -188,6 +189,11 @@ void Player::dispose() {
 void Player::setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int *))
 {
     soloud.setVoiceEndedCallback(voiceEndedCallback);
+}
+
+void Player::setVoiceInactiveCallback(void (*voiceInactiveCallback)())
+{
+    soloud.setVoiceInactiveCallback(voiceInactiveCallback);
 }
 
 void Player::setStateChangedCallback(void (*stateChangedCallback)(unsigned int))
@@ -791,7 +797,34 @@ void Player::setPause(unsigned int handle, bool pause)
 
     // When pausing, check if there are any remaining active voices. If no
     // voices are active, the scheduler applies the configured idle timeout.
-    pauseEngine();
+    evaluateAudioDeviceIdle();
+}
+
+void Player::evaluateAudioDeviceIdle()
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        return;
+#ifdef __EMSCRIPTEN__
+    // The mixer invokes the inactive callback only after releasing SoLoud's
+    // audio mutex, so this count is safe even for scheduled/natural endings.
+    if (soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
+        soloud.pause();
+#else
+    {
+        // Serialize the count-and-request decision with start requests. If a
+        // play/unpause is already registered it prevents the idle request; if
+        // it registers immediately after this check, its newer start request
+        // supersedes this one.
+        std::lock_guard<std::mutex> lock(mPauseMutex);
+        if (!mPauseThreadRunning || mStopPauseThread ||
+            soloud.getActiveVoiceCount() != 0)
+            return;
+        mPendingDeviceRequest = DeviceLifecycleRequest::idleStop;
+        ++mDeviceRequestGeneration;
+    }
+    mPauseCv.notify_one();
+#endif
 }
 
 // On some platforms (notably iOS) the OS can take a short time to fully
@@ -1159,7 +1192,7 @@ void Player::stop(unsigned int handle)
     // After stopping, check if there are any remaining active voices.
     // If no voices are active, pause the audio device to allow the OS
     // to properly manage the audio session.
-    pauseEngine();
+    evaluateAudioDeviceIdle();
 }
 
 void Player::removeHandle(unsigned int handle)
@@ -1243,7 +1276,7 @@ void Player::disposeSound(unsigned int soundHash)
     
     // After disposing a sound, check if there are any remaining active voices.
     // If no voices are active, pause the audio device.
-    pauseEngine();
+    evaluateAudioDeviceIdle();
 }
 
 void Player::disposeAllSound()
@@ -1295,6 +1328,8 @@ void Player::disposeAllSound()
     }
     // Sounds (and their filters) are destroyed here when soundsToDestroy goes out of scope
 
+    evaluateAudioDeviceIdle();
+
     // The unconditional soloud.pause() above may have stopped the device. If
     // the app asked for the device to stay alive while idle (indefinite
     // timeout), restart it (off the UI thread) now that the sounds have been
@@ -1305,6 +1340,8 @@ void Player::disposeAllSound()
 
 void Player::clearDartCallbackRegistrations()
 {
+    // The voice-inactive callback is native lifecycle support, not a Dart
+    // callback, and must remain registered across a Dart hot restart.
     setVoiceEndedCallback(nullptr);
     setStateChangedCallback(nullptr);
 
@@ -1922,6 +1959,7 @@ unsigned int Player::createBus() {
 
 void Player::destroyBus(unsigned int busId) {
     busMap.erase(busId);
+    evaluateAudioDeviceIdle();
 }
 
 unsigned int Player::busPlayOnEngine(unsigned int busId, float volume,

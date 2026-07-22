@@ -144,6 +144,13 @@ FFI_PLUGIN_EXPORT void voiceEndedCallback(unsigned int *handle) {
   voiceEndedCb(n);
 }
 
+/// Requests a device-idle evaluation after SoLoud stops or pauses a voice.
+/// SoLoud invokes this only after releasing its audio mutex.
+FFI_PLUGIN_EXPORT void voiceInactiveCallback() {
+  if (player != nullptr)
+    player->evaluateAudioDeviceIdle();
+}
+
     /// The callback to monitor when a file is loaded.
     void fileLoadedCallback(enum PlayerErrors error, char *completeFileName, unsigned int *hash, uint64_t counter)
     {
@@ -244,6 +251,7 @@ FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
 
   // Set the callback for when a voice is ended/stopped
   player.get()->setVoiceEndedCallback(voiceEndedCallback);
+  player.get()->setVoiceInactiveCallback(voiceInactiveCallback);
 
         return PlayerErrors::noError;
     }

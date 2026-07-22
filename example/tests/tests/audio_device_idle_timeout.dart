@@ -195,7 +195,64 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
       'State after scheduleStop + idle timeout: $stateAfterScheduleStopIdle',
     );
 
+    // 14) Load a real asset and get its playback duration.
     await SoLoud.instance.disposeSource(waveform);
+    final explosion = await SoLoud.instance.loadAsset(
+      'assets/audio/explosion.mp3',
+    );
+    final explosionDuration = SoLoud.instance.getLength(explosion);
+    strBuf.writeln(
+      'Explosion duration: ${explosionDuration.inMilliseconds}ms',
+    );
+
+    // 15) Play unpaused and non-looping, then wait for started (max 1000 ms).
+    final explosionHandle = SoLoud.instance.play(
+      explosion,
+      paused: false,
+      looping: false,
+    );
+    var stateDuringExplosionStart = SoLoud.instance.getAudioDeviceState();
+    final startedExplosionDeadline =
+        DateTime.now().add(const Duration(milliseconds: 1000));
+    while (stateDuringExplosionStart != AudioDeviceState.started &&
+        DateTime.now().isBefore(startedExplosionDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateDuringExplosionStart = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateDuringExplosionStart == AudioDeviceState.started,
+      'After starting explosion playback, expected AudioDeviceState.started '
+      'within 1000 ms but got $stateDuringExplosionStart.',
+    );
+    strBuf.writeln('State during explosion playback: $stateDuringExplosionStart');
+
+    // 16) Wait for full playback duration.
+    await Future<void>.delayed(explosionDuration);
+
+    // 17) Validate device stops following playback completion.
+    var stateAfterExplosionPlayback = SoLoud.instance.getAudioDeviceState();
+    final stoppedAfterExplosionDeadline =
+        DateTime.now().add(idleTimeout + const Duration(milliseconds: 1000));
+    while (stateAfterExplosionPlayback != AudioDeviceState.stopped &&
+        DateTime.now().isBefore(stoppedAfterExplosionDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateAfterExplosionPlayback = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateAfterExplosionPlayback == AudioDeviceState.stopped,
+      'After explosion playback completion, expected '
+      'AudioDeviceState.stopped but got $stateAfterExplosionPlayback.',
+    );
+    strBuf.writeln(
+      'State after explosion playback completion: '
+      '$stateAfterExplosionPlayback',
+    );
+    assert(
+      !SoLoud.instance.getIsValidVoiceHandle(explosionHandle),
+      'Explosion handle should be invalid after playback completion.',
+    );
+
+    await SoLoud.instance.disposeSource(explosion);
   } finally {
     if (SoLoud.instance.isInitialized) {
       SoLoud.instance.deinit();
