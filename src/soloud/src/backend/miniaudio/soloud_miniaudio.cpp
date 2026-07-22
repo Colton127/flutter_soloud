@@ -168,17 +168,29 @@ namespace SoLoud
 
             case ma_device_notification_type_interruption_began:
             {
-                // Automatically pause the audio device when the OS signals an interruption.
-                soloud_miniaudio_pause(currentSoloud);
+                auto interruptionCallback =
+                    currentSoloud->_audioInterruptionCallback.load(
+                        std::memory_order_acquire);
+                void *interruptionContext =
+                    currentSoloud->_audioInterruptionContext.load(
+                        std::memory_order_acquire);
+                if (interruptionCallback != nullptr &&
+                    interruptionContext != nullptr)
+                    interruptionCallback(interruptionContext, true);
                 if (currentSoloud->_stateChangedCallback != nullptr) currentSoloud->_stateChangedCallback(3);
             } break;
 
             case ma_device_notification_type_interruption_ended:
             {
-                // On CoreAudio platforms (macOS/iOS) when the the interruption begins
-                // the device is automatically stopped (not uninited with ma_device_uninit).
-                // So we need to start it again when the interruption ends.
-                currentSoloud->resume();
+                auto interruptionCallback =
+                    currentSoloud->_audioInterruptionCallback.load(
+                        std::memory_order_acquire);
+                void *interruptionContext =
+                    currentSoloud->_audioInterruptionContext.load(
+                        std::memory_order_acquire);
+                if (interruptionCallback != nullptr &&
+                    interruptionContext != nullptr)
+                    interruptionCallback(interruptionContext, false);
                 if (currentSoloud->_stateChangedCallback != nullptr)
                     currentSoloud->_stateChangedCallback(4);
             } break;
@@ -631,9 +643,9 @@ namespace SoLoud
             ma_device_stop(&gDevice);
         }
 
-        // Lock the audio mutex to prevent race conditions during device change
-        currentSoloud->lockAudioMutex_internal();
-
+        // ma_device_stop() above waits for the callback to leave the mixer.
+        // Do not hold SoLoud's audio mutex across the blocking device
+        // uninitialization/reinitialization calls.
         ma_device_uninit(&gDevice);
         gDeviceInitialized = false;
 
@@ -680,22 +692,14 @@ namespace SoLoud
         if (result != MA_SUCCESS)
         {
             gDeviceInitialized = false;
-            currentSoloud->unlockAudioMutex_internal();
             return UNKNOWN_ERROR;
         }
 
         gDeviceInitialized = true;
-        gDeviceStopped = false;  // Device is about to start
-        ma_result startResult = ma_device_start(&gDevice);
-        if (startResult != MA_SUCCESS) {
-            soloud_platform_log("miniaudio_changeDevice_impl: ma_device_start failed with error %d\n", startResult);
-            ma_device_uninit(&gDevice);
-            gDeviceInitialized = false;
-            currentSoloud->unlockAudioMutex_internal();
-            return UNKNOWN_ERROR;
-        }
-
-        currentSoloud->unlockAudioMutex_internal();
+        gDeviceStopped = true;
+        // Leave the replacement device stopped. Player's serialized lifecycle
+        // coordinator decides whether active playback, an in-flight timeout,
+        // or indefinite keep-alive policy requires it to be started.
         return 0;
     }
 };

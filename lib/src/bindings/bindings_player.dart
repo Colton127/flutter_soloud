@@ -141,8 +141,9 @@ abstract class FlutterSoLoud {
   /// Change the playback device.
   ///
   /// [deviceId] the device ID. -1 for default OS output device.
+  /// The returned future completes after the blocking native replacement.
   @mustBeOverridden
-  PlayerErrors changeDevice(int deviceId);
+  Future<PlayerErrors> changeDevice(int deviceId);
 
   /// List available playback devices.
   List<PlaybackDevice> listPlaybackDevices();

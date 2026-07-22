@@ -192,6 +192,24 @@ namespace SoLoud
 			_stateChangedCallback = stateChangedCallback;
 		}
 
+		// Device-interruption callback used by the embedding lifecycle owner.
+		// The context is published before the callback and cleared afterward so
+		// notification threads never call through a non-null callback with a
+		// partially registered context.
+		std::atomic<void (*)(void *, bool)> _audioInterruptionCallback{nullptr};
+		std::atomic<void *> _audioInterruptionContext{nullptr};
+		void setAudioInterruptionCallback(
+			void (*audioInterruptionCallback)(void *, bool), void *context) {
+			if (audioInterruptionCallback == nullptr) {
+				_audioInterruptionCallback.store(nullptr, std::memory_order_release);
+				_audioInterruptionContext.store(nullptr, std::memory_order_release);
+				return;
+			}
+			_audioInterruptionContext.store(context, std::memory_order_release);
+			_audioInterruptionCallback.store(
+				audioInterruptionCallback, std::memory_order_release);
+		}
+
 		// CTor
 		Soloud();
 		// DTor

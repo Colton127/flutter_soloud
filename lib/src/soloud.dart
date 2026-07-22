@@ -512,13 +512,17 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudNoPlaybackDevicesFoundCppException] if the given [newDevice]
   /// is not found.
-  void changeDevice({PlaybackDevice? newDevice}) {
+  ///
+  /// Device enumeration and replacement can block, so native platforms run
+  /// the operation off the UI isolate. The returned future completes after
+  /// replacement and any lifecycle-required restart have finished.
+  Future<void> changeDevice({PlaybackDevice? newDevice}) async {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
 
     final deviceId = newDevice?.id ?? -1;
-    final error = _controller.soLoudFFI.changeDevice(deviceId);
+    final error = await _controller.soLoudFFI.changeDevice(deviceId);
     _logPlayerError(error, from: 'changeDevice() result');
     if (error != PlayerErrors.noError) {
       throw SoLoudCppException.fromPlayerError(error);

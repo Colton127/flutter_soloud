@@ -723,6 +723,7 @@ private:
   enum class DeviceLifecycleRequest : uint8_t {
     none,
     start,
+    interruptionStop,
     idleStop,
   };
   // The pending request and generation are protected by mPauseMutex. Each new
@@ -737,6 +738,11 @@ private:
   // shutdown onward. Lifecycle entry points use this to reject work that
   // could otherwise race with scheduler teardown or backend destruction.
   std::atomic<bool> mLifecycleRequestsAccepted{false};
+  // True between OS interruption-began and interruption-ended notifications.
+  // Start requests are deferred during this interval; interruption recovery
+  // reevaluates active playback and idle-timeout policy.
+  std::atomic<bool> mInterruptionActive{false};
+  std::mutex mInterruptionMutex;
   bool mPauseThreadRunning = false;
   /// How long the device keeps running while idle before the deferred
   /// idle-pause stops it (see setAudioDeviceIdleTimeout). A negative value
@@ -754,6 +760,8 @@ private:
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();
   void stopDeviceAndDestroyAllSounds();
+  void handleAudioInterruption(bool began);
+  static void audioInterruptionCallback(void *context, bool began);
 };
 
 #endif // PLAYER_H

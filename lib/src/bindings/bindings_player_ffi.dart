@@ -45,6 +45,16 @@ int _invokeDeviceStop(int address, bool force) {
   return fn(force ? 1 : 0);
 }
 
+/// Rebuilds and invokes the blocking native playback-device change function.
+int _invokeChangeDevice(int address, int deviceId) {
+  final fn =
+      ffi.Pointer<
+            ffi.NativeFunction<ffi.UnsignedInt Function(ffi.Int)>
+          >.fromAddress(address)
+          .asFunction<int Function(int)>();
+  return fn(deviceId);
+}
+
 /// Rebuilds the native `initEngine` function from its raw pointer [address] and
 /// invokes it, returning the raw [PlayerErrors] code.
 ///
@@ -447,8 +457,9 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       .asFunction<int Function()>();
 
   @override
-  PlayerErrors changeDevice(int deviceId) {
-    final ret = _changeDevice(deviceId);
+  Future<PlayerErrors> changeDevice(int deviceId) async {
+    final address = _changeDevicePtr.address;
+    final ret = await Isolate.run(() => _invokeChangeDevice(address, deviceId));
     return PlayerErrors.values[ret];
   }
 
@@ -456,7 +467,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       _lookup<ffi.NativeFunction<ffi.UnsignedInt Function(ffi.Int)>>(
         'changeDevice',
       );
-  late final _changeDevice = _changeDevicePtr.asFunction<int Function(int)>();
 
   @override
   List<PlaybackDevice> listPlaybackDevices() {

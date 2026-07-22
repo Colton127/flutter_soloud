@@ -148,6 +148,7 @@ Player::Player() : mFilters(&soloud, nullptr, nullptr),
 
 Player::~Player() {
     mLifecycleRequestsAccepted.store(false, std::memory_order_release);
+    soloud.setAudioInterruptionCallback(nullptr, nullptr);
 
     // If the scheduler was started, stop it before touching Soloud.
     stopPauseEngineScheduler();
@@ -181,6 +182,8 @@ void Player::dispose() {
 
     // Reject new lifecycle work before waking and joining the scheduler.
     mLifecycleRequestsAccepted.store(false, std::memory_order_release);
+    soloud.setAudioInterruptionCallback(nullptr, nullptr);
+    mInterruptionActive.store(false, std::memory_order_release);
     mInited.store(false, std::memory_order_release);
     stopPauseEngineScheduler();
 
@@ -278,7 +281,11 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
             return backendNotInited;
         }
         mLifecycleRequestsAccepted.store(true, std::memory_order_release);
-        // Publish initialized state only after lifecycle support is ready.
+        mInterruptionActive.store(false, std::memory_order_release);
+        soloud.setAudioInterruptionCallback(
+            &Player::audioInterruptionCallback, this);
+        // Publish initialized state only after all lifecycle support,
+        // including interruption routing, is ready.
         mInited.store(true, std::memory_order_release);
         // Treat the freshly initialized engine as having just entered the idle
         // state and apply the configured idle timeout. With a finite timeout
@@ -305,22 +312,55 @@ PlayerErrors Player::changeDevice(int deviceID)
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
-    // Get the device list and find the requested device
+    // Resolve the requested device before entering the lifecycle operation.
+    // A null device ID selects the OS default output.
     auto const devices = listPlaybackDevices();
-    if (devices.size() == 0 || deviceID >= devices.size())
-        return noPlaybackDevicesFound;
-    
-    // Use the stored device ID from the PlaybackDevice struct
-    void *playbackInfos_id = (void *)&devices[deviceID].deviceId;
+    void *playbackInfos_id = nullptr;
+    if (deviceID != -1)
+    {
+        if (deviceID < 0 || devices.empty() ||
+            static_cast<size_t>(deviceID) >= devices.size())
+            return noPlaybackDevicesFound;
+        playbackInfos_id = (void *)&devices[deviceID].deviceId;
+    }
 
-    SoLoud::result result = soloud.miniaudio_changeDevice(playbackInfos_id);
+    bool shouldStartReplacement = false;
+    PlayerErrors changeResult = noError;
+    {
+        std::lock_guard<std::mutex> operationLock(
+            mDeviceLifecycleOperationMutex);
+        if (!mInited.load(std::memory_order_acquire) ||
+            !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+            return backendNotInited;
 
-    // miniaudio_changeDevice can only throw UNKNOWN_ERROR. This means that
-    // for some reasons the device could not be changed (maybe the engine
-    // was turned off in the meantime?).
-    if (result != SoLoud::SO_NO_ERROR)
-        result = backendNotInited;
-    return noError;
+        const AudioDeviceState previousState = getAudioDeviceState();
+        shouldStartReplacement =
+            soloud.getActiveVoiceCount() != 0 ||
+            mIdleTimeoutMs.load(std::memory_order_acquire) < 0 ||
+            previousState == audioDeviceStarted ||
+            previousState == audioDeviceStarting;
+
+        // Device replacement supersedes any request targeting the old device.
+        // Playback/idle changes that occur during replacement post a newer
+        // request and run after this operation releases the lock.
+        invalidatePendingDeviceRequest();
+        const SoLoud::result result =
+            soloud.miniaudio_changeDevice(playbackInfos_id);
+        if (result != SoLoud::SO_NO_ERROR)
+        {
+            changeResult = backendNotInited;
+        }
+        else if (shouldStartReplacement)
+        {
+            // Use the normal lifecycle start path so iOS reactivates the
+            // AVAudioSession before starting the replacement Audio Unit.
+            changeResult = performAudioDeviceStart();
+        }
+    }
+
+    if (changeResult == noError && shouldStartReplacement)
+        evaluateAudioDeviceIdle();
+    return changeResult;
 }
 
 // List available playback devices.
@@ -834,8 +874,10 @@ void Player::setPause(unsigned int handle, bool pause)
 
 void Player::evaluateAudioDeviceIdle()
 {
+    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
     if (!mInited.load(std::memory_order_acquire) ||
-        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
+        mInterruptionActive.load(std::memory_order_acquire))
         return;
 #ifdef __EMSCRIPTEN__
     // The mixer invokes the inactive callback only after releasing SoLoud's
@@ -859,6 +901,50 @@ void Player::evaluateAudioDeviceIdle()
 #endif
 }
 
+void Player::audioInterruptionCallback(void *context, bool began)
+{
+    if (context != nullptr)
+        static_cast<Player *>(context)->handleAudioInterruption(began);
+}
+
+void Player::handleAudioInterruption(bool began)
+{
+    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        return;
+
+    mInterruptionActive.store(began, std::memory_order_release);
+#ifdef __EMSCRIPTEN__
+    if (began)
+    {
+        soloud.pause();
+    }
+    else if (soloud.getActiveVoiceCount() != 0 ||
+             mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
+    {
+        // Web has no lifecycle scheduler thread. Its AudioContext operations
+        // are nonblocking, so recover inline when policy requires it.
+        soloud.resume();
+    }
+#else
+    if (began)
+    {
+        // This immediate stop supersedes pending starts/idle deadlines. The
+        // callback only posts work; the backend call runs on the scheduler.
+        requestDeviceLifecycle(DeviceLifecycleRequest::interruptionStop);
+    }
+    else if (soloud.getActiveVoiceCount() != 0 ||
+             mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
+    {
+        // Resume only for active playback or indefinite keep-alive. A finite
+        // timeout with an idle engine leaves the interruption-stopped device
+        // stopped; later play/unpause starts it normally.
+        requestDeviceLifecycle(DeviceLifecycleRequest::start);
+    }
+#endif
+}
+
 // On some platforms (notably iOS) the OS can take a short time to fully
 // tear down or hand back the audio session after the last active voice is
 // stopped/paused. If we pause the SoLoud engine immediately, a subsequent
@@ -877,7 +963,9 @@ void Player::evaluateAudioDeviceIdle()
 // persistent scheduler thread handles all device lifecycle requests.
 void Player::pauseEngine()
 {
-    if (!mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    if (!mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
+        mInterruptionActive.load(std::memory_order_acquire))
         return;
 #ifdef __EMSCRIPTEN__
     // Web: the wasm build is single-threaded (no pthreads), so the deferred
@@ -901,8 +989,10 @@ void Player::pauseEngine()
 // coalescing window keeps the device running.
 void Player::resumeEngine()
 {
+    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
     if (!mInited.load(std::memory_order_acquire) ||
-        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
+        mInterruptionActive.load(std::memory_order_acquire))
         return;
 #ifdef __EMSCRIPTEN__
     // Web: the wasm build is single-threaded (no pthreads), so there is no
@@ -961,6 +1051,8 @@ PlayerErrors Player::performAudioDeviceStart()
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
+    if (mInterruptionActive.load(std::memory_order_acquire))
+        return noError;
 
     // Use the normal resume hook so iOS reactivates AVAudioSession before the
     // Audio Unit is restarted.
@@ -1024,6 +1116,8 @@ PlayerErrors Player::startAudioDevice()
     {
         std::lock_guard<std::mutex> operationLock(
             mDeviceLifecycleOperationMutex);
+        if (mInterruptionActive.load(std::memory_order_acquire))
+            return noError;
         // Cancel a stale delayed idle stop before prewarming the device.
         invalidatePendingDeviceRequest();
         result = performAudioDeviceStart();
@@ -1118,16 +1212,22 @@ void Player::pauseEngineScheduler()
         const uint64_t requestGeneration = mDeviceRequestGeneration;
         mPendingDeviceRequest = DeviceLifecycleRequest::none;
 
-        // A start is performed immediately. Any stop request arriving while
-        // the backend call is in progress receives a newer generation and is
-        // handled on the next iteration rather than being cleared here.
-        if (request == DeviceLifecycleRequest::start)
+        // Starts and interruption stops are performed immediately. Any newer
+        // request arriving while the backend call is in progress receives a
+        // newer generation and is handled on the next iteration.
+        if (request == DeviceLifecycleRequest::start ||
+            request == DeviceLifecycleRequest::interruptionStop)
         {
             lock.unlock();
             std::lock_guard<std::mutex> operationLock(
                 mDeviceLifecycleOperationMutex);
             if (isDeviceRequestCurrent(requestGeneration))
-                performAudioDeviceStart();
+            {
+                if (request == DeviceLifecycleRequest::start)
+                    performAudioDeviceStart();
+                else
+                    performAudioDeviceStop(true);
+            }
             continue;
         }
 
