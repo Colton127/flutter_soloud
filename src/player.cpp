@@ -778,25 +778,20 @@ void Player::pauseSwitch(unsigned int handle)
 
 void Player::setPause(unsigned int handle, bool pause)
 {
+    soloud.setPause(handle, pause);
+
     if (!pause)
     {
-        // When unpausing, ensure the audio device is started.
-        // This handles cases where the OS stopped the device without notifying us
-        // (e.g., Control Center pause on iOS). Done off the UI thread so the
-        // blocking native ma_device_start() does not freeze the app.
-        resumeEngine();
+        // Mutate the voice first. Only a handle that is still valid after the
+        // mutation is allowed to request device startup.
+        if (isValidHandle(handle))
+            resumeEngine();
+        return;
     }
-    
-    soloud.setPause(handle, pause);
-    
-    if (pause)
-    {
-        // When pausing, check if there are any remaining active voices.
-        // If no voices are active, pause the audio device to allow the OS
-        // to properly manage the audio session (important for Control Center
-        // and remote command handling on iOS).
-        pauseEngine();
-    }
+
+    // When pausing, check if there are any remaining active voices. If no
+    // voices are active, the scheduler applies the configured idle timeout.
+    pauseEngine();
 }
 
 // On some platforms (notably iOS) the OS can take a short time to fully
@@ -1076,10 +1071,19 @@ PlayerErrors Player::play(
     bool looping,
     double loopingStartAt)
 {
+    handle = 0;
     ActiveSound *sound = findByHash(soundHash);
 
     if (sound == nullptr)
         return soundHashNotFound;
+
+    BusData *targetBus = nullptr;
+    if (busId != 0) {
+        auto it = busMap.find(busId);
+        if (it == busMap.end())
+            return PlayerErrors::busIdNotFound;
+        targetBus = &it->second;
+    }
 
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
@@ -1105,31 +1109,23 @@ PlayerErrors Player::play(
         }
     }
 
-    // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    // Done off the UI thread so the blocking native ma_device_start() does not
-    // freeze the app; soloud.play() below only registers the voice, which the
-    // device picks up as soon as it has finished starting.
-    resumeEngine();
-
-    handle = 0;
-    SoLoud::handle newHandle = 0;
+    // Create paused so the voice cannot render before its handle and initial
+    // state have been registered. The requested pause state is applied only
+    // after creation succeeds.
+    SoLoud::handle newHandle;
     if (busId == 0) {
-        newHandle = soloud.play(*sound->sound.get(), volume, pan, paused, 0);
+        newHandle = soloud.play(*sound->sound.get(), volume, pan, true, 0);
     } else {
-        auto it = busMap.find(busId);
-        if (it != busMap.end())
-            newHandle = it->second.bus.play(*sound->sound.get(), volume, pan, paused);
-        else
-            return PlayerErrors::busIdNotFound;
+        newHandle = targetBus->bus.play(
+            *sound->sound.get(), volume, pan, true);
     }
 
-    if (newHandle != 0) {
+    if (!soloud.isValidVoiceHandle(newHandle))
+        return PlayerErrors::unknownError;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
         sound->handle.push_back({newHandle, MAX_DOUBLE});
-        // Check if this buffer has enough data to be played
-        if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
-        {
-            static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
-        }
     }
 
     if (looping)
@@ -1137,7 +1133,23 @@ PlayerErrors Player::play(
         setLoopPoint(newHandle, loopingStartAt);
         setLooping(newHandle, true);
     }
+
+    if (!paused)
+    {
+        soloud.setPause(newHandle, false);
+        // Buffer streams may pause themselves again if they do not yet have
+        // enough data. In that case no active voice requires device startup.
+        if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
+            static_cast<SoLoud::BufferStream *>(sound->sound.get())
+                ->checkBuffering(0);
+    }
+
     handle = newHandle;
+
+    if (soloud.isValidVoiceHandle(newHandle) &&
+        !soloud.getPause(newHandle))
+        resumeEngine();
+
     return PlayerErrors::noError;
 }
 
@@ -1331,32 +1343,37 @@ void Player::setLoopPoint(unsigned int handle, double time)
 
 PlayerErrors Player::textToSpeech(const std::string &textToSpeech, unsigned int &handle)
 {
+    handle = 0;
     if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
-    // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    // Done off the UI thread so the blocking native ma_device_start() does not
-    // freeze the app; soloud.play() below only registers the voice, which the
-    // device picks up as soon as it has finished starting.
-    resumeEngine();
-
     SoLoud::result result = speech.setText(textToSpeech.c_str());
-    
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-    sounds.push_back(std::make_unique<ActiveSound>());
-    sounds.back().get()->completeFileName = std::string("");
-    if (result == SoLoud::SO_NO_ERROR)
+    if (result != SoLoud::SO_NO_ERROR)
+        return static_cast<PlayerErrors>(result);
+
+    // Speech always begins unpaused, but create it paused until its handle is
+    // known and registered.
+    const SoLoud::handle newHandle = soloud.play(speech, -1.0f, 0.0f, true);
+    if (!soloud.isValidVoiceHandle(newHandle))
+        return PlayerErrors::unknownError;
+
     {
-        handle = soloud.play(speech);
-        sounds.back().get()->soundHash = handle;
-        sounds.back().get()->filters = std::make_unique<Filters>(&soloud, sounds.back().get(), nullptr);
-        sounds.back().get()->handle.push_back({handle, MAX_DOUBLE});
+        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        auto activeSpeech = std::make_unique<ActiveSound>();
+        activeSpeech->completeFileName = std::string("");
+        activeSpeech->soundType = SoundType::TYPE_SYNTH;
+        activeSpeech->soundHash = newHandle;
+        activeSpeech->filters = std::make_unique<Filters>(
+            &soloud, activeSpeech.get(), nullptr);
+        activeSpeech->handle.push_back({newHandle, MAX_DOUBLE});
+        sounds.push_back(std::move(activeSpeech));
     }
-    else
-    {
-        sounds.emplace_back();
-    }
-    return (PlayerErrors)result;
+
+    handle = newHandle;
+    soloud.setPause(newHandle, false);
+    if (soloud.isValidVoiceHandle(newHandle))
+        resumeEngine();
+    return PlayerErrors::noError;
 }
 
 void Player::setVisualizationEnabled(bool enabled)
@@ -1701,9 +1718,18 @@ PlayerErrors Player::play3d(
     bool looping,
     double loopingStartAt)
 {
+    handle = 0;
     ActiveSound *sound = findByHash(soundHash);
     if (sound == 0)
         return soundHashNotFound;
+
+    BusData *targetBus = nullptr;
+    if (busId != 0) {
+        auto it = busMap.find(busId);
+        if (it == busMap.end())
+            return PlayerErrors::busIdNotFound;
+        targetBus = &it->second;
+    }
 
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
@@ -1729,52 +1755,56 @@ PlayerErrors Player::play3d(
         }
     }
 
-    // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    // Done off the UI thread so the blocking native ma_device_start() does not
-    // freeze the app; soloud.play() below only registers the voice, which the
-    // device picks up as soon as it has finished starting.
-    resumeEngine();
-
-    handle = 0;
-    SoLoud::handle newHandle = 0;
+    // Create paused so the 3D voice and its initial state are fully registered
+    // before it can render or request device startup.
+    SoLoud::handle newHandle;
     if (busId == 0) {
         newHandle = soloud.play3d(
             *sound->sound.get(),
             posX, posY, posZ,
             velX, velY, velZ,
             volume,
-            paused,
+            true,
             0);
     } else {
-        auto it = busMap.find(busId);
-        if (it != busMap.end())
-            newHandle = it->second.bus.play3d(
-                *sound->sound.get(),
-                posX, posY, posZ,
-                velX, velY, velZ,
-                volume,
-                paused
-            );
-        else
-            return PlayerErrors::busIdNotFound;
+        newHandle = targetBus->bus.play3d(
+            *sound->sound.get(),
+            posX, posY, posZ,
+            velX, velY, velZ,
+            volume,
+            true
+        );
     }
 
-    if (newHandle != 0) {
+    if (!soloud.isValidVoiceHandle(newHandle))
+        return PlayerErrors::unknownError;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
         sound->handle.push_back({newHandle, MAX_DOUBLE});
-        // Check if this buffer has enough data to be played
-        if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
-        {
-            static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
-        }
     }
+
     if (looping)
     {
         seek(newHandle, loopingStartAt);
         setLoopPoint(newHandle, loopingStartAt);
         setLooping(newHandle, true);
-        setPause(newHandle, paused);
     }
+
+    if (!paused)
+    {
+        soloud.setPause(newHandle, false);
+        if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
+            static_cast<SoLoud::BufferStream *>(sound->sound.get())
+                ->checkBuffering(0);
+    }
+
     handle = newHandle;
+
+    if (soloud.isValidVoiceHandle(newHandle) &&
+        !soloud.getPause(newHandle))
+        resumeEngine();
+
     return PlayerErrors::noError;
 }
 
@@ -1901,11 +1931,26 @@ unsigned int Player::busPlayOnEngine(unsigned int busId, float volume,
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return 0;
-    SoLoud::handle handle = soloud.play(it->second.bus, volume, 0.0f, paused);
+
+    // Create paused so the bus handle and initial pan are committed before the
+    // bus can render or request device startup.
+    SoLoud::handle handle = soloud.play(
+        it->second.bus, volume, 0.0f, true);
+    if (!soloud.isValidVoiceHandle(handle))
+        return 0;
+
     it->second.handle = handle;
     // Playing a sound inside a bus decreases the volume compared to playing it directly.
     // https://github.com/jarikomppa/soloud/issues/395#issuecomment-4148675275
     soloud.setPanAbsolute(handle, 1.0f, 1.0f);
+
+    if (!paused)
+    {
+        soloud.setPause(handle, false);
+        if (soloud.isValidVoiceHandle(handle))
+            resumeEngine();
+    }
+
     return handle;
 }
 

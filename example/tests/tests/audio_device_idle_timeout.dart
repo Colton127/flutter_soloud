@@ -55,7 +55,12 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
     SoLoud.instance.setWaveformFreq(waveform, 440);
 
     // 2) Create a handle with playback initially disabled (paused).
-    final handle = SoLoud.instance.play(waveform, paused: true, volume: 0.2);
+    final handle = SoLoud.instance.play(
+      waveform,
+      paused: true,
+      looping: true,
+      volume: 0.2,
+    );
 
     // 3) Validate device state remains stopped.
     final stateAfterPausedHandle = SoLoud.instance.getAudioDeviceState();
@@ -98,6 +103,97 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
       'AudioDeviceState.stopped but got $stateAfterPauseIdle.',
     );
     strBuf.writeln('State after pause + idle timeout: $stateAfterPauseIdle');
+
+    // 8) Resume and verify started before schedulePause.
+    SoLoud.instance.setPause(handle, false);
+    var stateBeforeSchedulePause = SoLoud.instance.getAudioDeviceState();
+    final startedBeforePauseDeadline = DateTime.now().add(const Duration(milliseconds: 1000));
+    while (stateBeforeSchedulePause != AudioDeviceState.started && DateTime.now().isBefore(startedBeforePauseDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateBeforeSchedulePause = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateBeforeSchedulePause == AudioDeviceState.started,
+      'Before schedulePause, expected AudioDeviceState.started '
+      'but got $stateBeforeSchedulePause.',
+    );
+    strBuf.writeln('State before schedulePause: $stateBeforeSchedulePause');
+
+    // 9) Schedule pause in 1000 ms and verify handle paused.
+    SoLoud.instance.schedulePause(handle, const Duration(milliseconds: 1000));
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    final pausedAfterSchedulePause = SoLoud.instance.getPause(handle);
+    assert(
+      pausedAfterSchedulePause,
+      'After schedulePause(1000ms), expected handle to be paused.',
+    );
+    strBuf.writeln('Handle paused after schedulePause: $pausedAfterSchedulePause');
+
+    // 10) Wait idle timeout again and verify stopped.
+    await Future<void>.delayed(idleTimeout);
+    var stateAfterSchedulePauseIdle = SoLoud.instance.getAudioDeviceState();
+    final stoppedAfterSchedulePauseDeadline = DateTime.now().add(const Duration(milliseconds: 1000));
+    while (stateAfterSchedulePauseIdle != AudioDeviceState.stopped && DateTime.now().isBefore(stoppedAfterSchedulePauseDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateAfterSchedulePauseIdle = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateAfterSchedulePauseIdle == AudioDeviceState.stopped,
+      'After schedulePause and idle timeout, expected '
+      'AudioDeviceState.stopped but got $stateAfterSchedulePauseIdle.',
+    );
+    strBuf.writeln(
+      'State after schedulePause + idle timeout: $stateAfterSchedulePauseIdle',
+    );
+
+    // 11) Resume and verify started before scheduleStop.
+    SoLoud.instance.setPause(handle, false);
+    var stateBeforeScheduleStop = SoLoud.instance.getAudioDeviceState();
+    final startedBeforeStopDeadline = DateTime.now().add(const Duration(milliseconds: 1000));
+    while (stateBeforeScheduleStop != AudioDeviceState.started && DateTime.now().isBefore(startedBeforeStopDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateBeforeScheduleStop = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateBeforeScheduleStop == AudioDeviceState.started,
+      'Before scheduleStop, expected AudioDeviceState.started '
+      'but got $stateBeforeScheduleStop.',
+    );
+    strBuf.writeln('State before scheduleStop: $stateBeforeScheduleStop');
+
+    // 12) Schedule stop in 1000 ms and verify handle invalidated.
+    SoLoud.instance.scheduleStop(handle, const Duration(milliseconds: 1000));
+    await Future<void>.delayed(const Duration(milliseconds: 1100));
+    var isHandleValidAfterScheduleStop = SoLoud.instance.getIsValidVoiceHandle(handle);
+    final invalidHandleDeadline = DateTime.now().add(const Duration(milliseconds: 1000));
+    while (isHandleValidAfterScheduleStop && DateTime.now().isBefore(invalidHandleDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      isHandleValidAfterScheduleStop = SoLoud.instance.getIsValidVoiceHandle(handle);
+    }
+    assert(
+      !isHandleValidAfterScheduleStop,
+      'After scheduleStop(1000ms), expected handle to be invalid.',
+    );
+    strBuf.writeln(
+      'Handle valid after scheduleStop: $isHandleValidAfterScheduleStop',
+    );
+
+    // 13) Wait idle timeout again and verify stopped (scheduleStop last).
+    await Future<void>.delayed(idleTimeout);
+    var stateAfterScheduleStopIdle = SoLoud.instance.getAudioDeviceState();
+    final stoppedAfterScheduleStopDeadline = DateTime.now().add(const Duration(milliseconds: 1000));
+    while (stateAfterScheduleStopIdle != AudioDeviceState.stopped && DateTime.now().isBefore(stoppedAfterScheduleStopDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateAfterScheduleStopIdle = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateAfterScheduleStopIdle == AudioDeviceState.stopped,
+      'After scheduleStop and idle timeout, expected '
+      'AudioDeviceState.stopped but got $stateAfterScheduleStopIdle.',
+    );
+    strBuf.writeln(
+      'State after scheduleStop + idle timeout: $stateAfterScheduleStopIdle',
+    );
 
     await SoLoud.instance.disposeSource(waveform);
   } finally {
