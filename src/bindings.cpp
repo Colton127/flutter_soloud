@@ -267,7 +267,9 @@ FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed) {
 /// going idle. Any play/unpause before the deadline cancels the pending stop.
 /// The default is 500. Can be called any time.
 FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs) {
-  player.get()->setAudioDeviceIdleTimeout(timeoutMs);
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
+  if (player.get() != nullptr)
+    player.get()->setAudioDeviceIdleTimeout(timeoutMs);
 }
 
 /// Stop the audio output device without deinitializing the engine. Only the
@@ -275,6 +277,7 @@ FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs) {
 /// initialized state are preserved so playback can be resumed later with
 /// startAudioDevice(). Idempotent: a no-op if the device is already stopped.
 FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice() {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() == nullptr)
     return backendNotInited;
 
@@ -285,6 +288,7 @@ FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice() {
 /// existing voices and loaded sounds keep operating. Idempotent: a no-op if the
 /// device is already started.
 FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice() {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() == nullptr)
     return backendNotInited;
 
@@ -295,6 +299,7 @@ FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice() {
 /// [AudioDeviceState.audioDeviceUninitialized] if the engine is not
 /// initialized.
 FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() == nullptr)
     return audioDeviceUninitialized;
 
@@ -305,6 +310,7 @@ FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
 ///
 /// [deviceID] the device ID. -1 for default OS output device.
 FFI_PLUGIN_EXPORT enum PlayerErrors changeDevice(int deviceID) {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() == nullptr)
     return backendNotInited;
 
@@ -358,11 +364,11 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 /// app
 ///
 FFI_PLUGIN_EXPORT void dispose() {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
+  std::lock_guard<std::mutex> guard_load(loadMutex);
   if (player.get() == nullptr)
     return;
   player.get()->disposeAllSound();
-  std::lock_guard<std::mutex> guard(init_deinit_mutex);
-  std::lock_guard<std::mutex> guard_load(loadMutex);
   dartVoiceEndedCallback = nullptr;
   dartFileLoadedCallback = nullptr;
   dartStateChangedCallback = nullptr;
@@ -375,6 +381,7 @@ FFI_PLUGIN_EXPORT void dispose() {
 }
 
 FFI_PLUGIN_EXPORT int isInited() {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() == nullptr)
     return 0;
   return player.get()->isInited() ? 1 : 0;

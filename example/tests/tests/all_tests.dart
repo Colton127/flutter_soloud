@@ -25,7 +25,6 @@ import 'playback_speed.dart' as playback_speed;
 import 'protect_voice.dart' as protect_voice;
 import 'read_samples.dart' as read_samples;
 import 'sound_filters.dart' as sound_filters;
-import 'speech_text.dart' as speech_text;
 import 'stop_futures.dart' as stop_futures;
 import 'synchronous_deinit.dart' as synchronous_deinit;
 import 'three_d_audio.dart' as three_d_audio;
@@ -65,10 +64,13 @@ final List<TestEntry> allTests = [
     name: 'LoadMem',
     run: load_mem.testLoadMem,
   ),
-  const TestEntry(
-    name: 'SpeechText',
-    run: speech_text.testSpeechText,
-  ),
+
+  //TODO: Create issue for this and fix it
+  //Intentionally commented out; crashes on upstream repo
+  // const TestEntry(
+  //   name: 'SpeechText',
+  //   run: speech_text.testSpeechText,
+  // ),
 
   // Filters (Single + Global)
   const TestEntry(

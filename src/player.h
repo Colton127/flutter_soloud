@@ -672,8 +672,9 @@ public:
   /// all the sounds loaded
   std::vector<std::unique_ptr<ActiveSound>> sounds;
 
-  /// true when the backend is initialized
-  bool mInited;
+  /// True when the backend is initialized. This is read by the FFI thread,
+  /// lifecycle scheduler, and teardown path.
+  std::atomic<bool> mInited{false};
 
   /// main SoLoud engine
   SoLoud::Soloud soloud;
@@ -710,6 +711,10 @@ private:
   std::atomic<bool> mPauseRequested{false};
   std::atomic<bool> mResumeRequested{false};
   std::atomic<bool> mStopPauseThread{false};
+  // False before initialization is complete and from the first step of
+  // shutdown onward. Lifecycle entry points use this to reject work that
+  // could otherwise race with scheduler teardown or backend destruction.
+  std::atomic<bool> mLifecycleRequestsAccepted{false};
   bool mPauseThreadRunning = false;
   /// How long the device keeps running while idle before the deferred
   /// idle-pause stops it (see setAudioDeviceIdleTimeout). A negative value

@@ -132,17 +132,19 @@ PlayerErrors loadOggXiphBufferStream(Player *player,
 }
 }
 
-Player::Player() : mInited(false), mFilters(&soloud, nullptr, nullptr),
+Player::Player() : mFilters(&soloud, nullptr, nullptr),
                    mPauseRequested(false), mResumeRequested(false),
                    mStopPauseThread(false), mPauseThreadRunning(false)
 {
 }
 
 Player::~Player() {
+    mLifecycleRequestsAccepted.store(false, std::memory_order_release);
+
     // If the scheduler was started, stop it before touching Soloud.
     stopPauseEngineScheduler();
 
-    if (!mInited) {
+    if (!mInited.load(std::memory_order_acquire)) {
         // dispose() was called properly — Soloud is already deinited and safe.
         // Let ~Soloud() run normally to free its remaining allocations.
         return;
@@ -166,13 +168,13 @@ Player::~Player() {
 }
 
 void Player::dispose() {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return;
 
-    // Stop accepting new pause requests and wake the scheduler so it exits.
+    // Reject new lifecycle work before waking and joining the scheduler.
+    mLifecycleRequestsAccepted.store(false, std::memory_order_release);
+    mInited.store(false, std::memory_order_release);
     stopPauseEngineScheduler();
-
-    mInited = false;
 
     // Clean up SoLoud
     setVoiceEndedCallback(nullptr);
@@ -203,8 +205,10 @@ namespace SoLoud { unsigned int miniaudio_getAudioDeviceState(); }
 
 PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsigned int channels, int deviceID, bool lowLatency)
 {
-    if (mInited)
+    if (mInited.load(std::memory_order_acquire))
         return playerAlreadyInited;
+
+    mLifecycleRequestsAccepted.store(false, std::memory_order_release);
 
     // Choose the device performance profile before SoLoud opens the backend.
     SoLoud::miniaudio_setLowLatency(lowLatency);
@@ -236,12 +240,14 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
 
     if (result == SoLoud::SO_NO_ERROR)
     {
-        mInited = true;
         mSampleRate = sampleRate;
         mBufferSize = bufferSize;
         mChannels = channels;
         // Start the deferred-pause scheduler now that the engine is in use.
         startPauseEngineScheduler();
+        mLifecycleRequestsAccepted.store(true, std::memory_order_release);
+        // Publish initialized state only after lifecycle support is ready.
+        mInited.store(true, std::memory_order_release);
         // Treat the freshly initialized engine as having just entered the idle
         // state and apply the configured idle timeout. With a finite timeout
         // (including zero) and nothing playing yet, this schedules the deferred
@@ -258,7 +264,8 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
 
 PlayerErrors Player::changeDevice(int deviceID)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
     // Get the device list and find the requested device
@@ -330,7 +337,7 @@ std::vector<PlaybackDevice> Player::listPlaybackDevices()
 
 bool Player::isInited()
 {
-    return mInited;
+    return mInited.load(std::memory_order_acquire);
 }
 
 int Player::getSoundsCount()
@@ -416,7 +423,7 @@ PlayerErrors Player::loadFile(
     bool loadIntoMem,
     unsigned int *hash)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
     *hash = 0;
@@ -495,7 +502,7 @@ PlayerErrors Player::loadMem(
     bool loadIntoMem,
     unsigned int &hash)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
     hash = 0;
@@ -568,7 +575,7 @@ PlayerErrors Player::setBufferStream(
     dartOnBufferingCallback_t onBufferingCallback,
     dartOnMetadataCallback_t onMetadataCallback)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
     std::random_device rd;
@@ -689,7 +696,7 @@ PlayerErrors Player::loadWaveform(
     float detune,
     unsigned int &hash)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
     hash = 0;
@@ -811,12 +818,15 @@ void Player::setPause(unsigned int handle, bool pause)
 // persistent scheduler thread handles all pause requests.
 void Player::pauseEngine()
 {
+    if (!mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        return;
 #ifdef __EMSCRIPTEN__
     // Web: the wasm build is single-threaded (no pthreads), so the deferred
     // scheduler thread cannot run. Pause the device immediately instead. The
     // browser's AudioContext does not have the OS audio-session settling issue
     // that motivates the delay on native platforms.
-    if (mInited && soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
+    if (mInited.load(std::memory_order_acquire) &&
+        soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
         soloud.pause();
 #else
     {
@@ -838,7 +848,8 @@ void Player::pauseEngine()
 // coalescing window keeps the device running.
 void Player::resumeEngine()
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return;
 #ifdef __EMSCRIPTEN__
     // Web: the wasm build is single-threaded (no pthreads), so there is no
@@ -868,7 +879,8 @@ void Player::setAudioDeviceIdleTimeout(int timeoutMs)
 {
     mIdleTimeoutMs.store(timeoutMs);
 
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return;
 
     if (timeoutMs < 0)
@@ -888,7 +900,8 @@ void Player::setAudioDeviceIdleTimeout(int timeoutMs)
 
 PlayerErrors Player::stopAudioDevice()
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
     SoLoud::result result = SoLoud::miniaudio_stopAudioDevice();
@@ -899,7 +912,8 @@ PlayerErrors Player::stopAudioDevice()
 
 PlayerErrors Player::startAudioDevice()
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
     SoLoud::result result = SoLoud::miniaudio_startAudioDevice();
@@ -910,7 +924,7 @@ PlayerErrors Player::startAudioDevice()
 
 AudioDeviceState Player::getAudioDeviceState()
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return audioDeviceUninitialized;
 
     return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
@@ -970,7 +984,8 @@ void Player::pauseEngineScheduler()
             mResumeRequested = false;
             mPauseRequested = false;
             lock.unlock();
-            if (mInited)
+            if (mInited.load(std::memory_order_acquire) &&
+                mLifecycleRequestsAccepted.load(std::memory_order_acquire))
                 soloud.resume();
             continue;
         }
@@ -1006,7 +1021,9 @@ void Player::pauseEngineScheduler()
             continue;
 
         lock.unlock();
-        if (mInited && soloud.getActiveVoiceCount() == 0 &&
+        if (mInited.load(std::memory_order_acquire) &&
+            mLifecycleRequestsAccepted.load(std::memory_order_acquire) &&
+            soloud.getActiveVoiceCount() == 0 &&
             mIdleTimeoutMs.load() >= 0)
         {
             soloud.pause();
@@ -1312,7 +1329,7 @@ void Player::setLoopPoint(unsigned int handle, double time)
 
 PlayerErrors Player::textToSpeech(const std::string &textToSpeech, unsigned int &handle)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
     // Ensure miniaudio device is started if it's stopped, ie by an interruption.
@@ -1403,7 +1420,7 @@ double Player::getLength(unsigned int soundHash)
 // time in seconds
 PlayerErrors Player::seek(SoLoud::handle handle, float time)
 {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
     ActiveSound *sound = findByHandle(handle);
@@ -1877,7 +1894,7 @@ void Player::destroyBus(unsigned int busId) {
 
 unsigned int Player::busPlayOnEngine(unsigned int busId, float volume,
                                      bool paused) {
-    if (!mInited)
+    if (!mInited.load(std::memory_order_acquire))
         return 0;
     auto it = busMap.find(busId);
     if (it == busMap.end())
