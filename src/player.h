@@ -250,12 +250,12 @@ public:
   void setAudioDeviceIdleTimeout(int timeoutMs);
 
   /// @brief Stop the audio output device without deinitializing the engine.
-  /// Only the miniaudio device is stopped; loaded sounds, active voices and
-  /// the initialized state are all preserved so playback can be resumed later
-  /// with startAudioDevice(). Stops the device even while voices are actively
-  /// playing. Idempotent: a no-op if the device is already stopped.
+  /// By default the device is stopped only when there are no active voices.
+  /// When [force] is true it is stopped even during active playback. Neither
+  /// mode pauses or otherwise mutates voices, and both are idempotent.
+  /// @param force whether to stop even when active voices exist.
   /// @return Returns [PlayerErrors.SO_NO_ERROR] if success.
-  PlayerErrors stopAudioDevice();
+  PlayerErrors stopAudioDevice(bool force = false);
 
   /// @brief Restart the audio output device previously stopped by
   /// stopAudioDevice(), so existing voices and loaded sounds keep operating.
@@ -717,6 +717,9 @@ private:
   static constexpr int kDefaultIdleTimeoutMs = 500;
   std::thread mPauseThread;
   std::mutex mPauseMutex;
+  // Serializes the actual blocking device operations performed by both the
+  // scheduler and the explicit lifecycle APIs.
+  std::mutex mDeviceLifecycleOperationMutex;
   std::condition_variable mPauseCv;
   enum class DeviceLifecycleRequest : uint8_t {
     none,
@@ -744,6 +747,10 @@ private:
   std::atomic<int> mIdleTimeoutMs{kDefaultIdleTimeoutMs};
 
   void pauseEngineScheduler();
+  PlayerErrors performAudioDeviceStart();
+  PlayerErrors performAudioDeviceStop(bool explicitRequest);
+  void invalidatePendingDeviceRequest();
+  bool isDeviceRequestCurrent(uint64_t generation);
   bool requestDeviceLifecycle(DeviceLifecycleRequest request);
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();

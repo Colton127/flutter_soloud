@@ -494,7 +494,12 @@ interface class SoLoud {
   /// Only the underlying audio device is stopped. Loaded [AudioSource]s, active
   /// voices, filters and the [isInitialized] state are all left untouched, so
   /// playback resumes exactly where it left off once [startAudioDevice] is
-  /// called. The device is stopped even while sounds are actively playing.
+  /// called.
+  ///
+  /// By default this is a successful no-op while any voice is active. Set
+  /// [force] to `true` to stop the device during active playback. A forced stop
+  /// does not pause or otherwise mutate voices; a later play, unpause, or
+  /// [startAudioDevice] call can start the device normally.
   ///
   /// This is idempotent: calling it while the device is already stopped does
   /// nothing.
@@ -503,12 +508,12 @@ interface class SoLoud {
   /// not freeze the app; await the returned future to know when it completed.
   ///
   /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
-  Future<void> stopAudioDevice() async {
+  Future<void> stopAudioDevice({bool force = false}) async {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
 
-    final error = await _controller.soLoudFFI.stopAudioDevice();
+    final error = await _controller.soLoudFFI.stopAudioDevice(force: force);
     _logPlayerError(error, from: 'stopAudioDevice() result');
     if (error != PlayerErrors.noError) {
       throw SoLoudCppException.fromPlayerError(error);

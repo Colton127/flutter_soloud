@@ -21,11 +21,11 @@ import 'package:flutter_soloud/src/sound_hash.dart';
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 
-/// Rebuilds a `PlayerErrors Function()` device-lifecycle native function from
-/// its raw pointer [address] and invokes it, returning the raw error code.
+/// Rebuilds the no-argument native device-start function from its raw pointer
+/// [address] and invokes it, returning the raw error code.
 ///
 /// Top-level so it can run inside an [Isolate.run] worker: the blocking native
-/// device start/stop then executes off the UI isolate instead of stalling it.
+/// device start then executes off the UI isolate instead of stalling it.
 /// Only [address] (a sendable int) crosses the isolate boundary; the pointer is
 /// reconstructed here and the same process-global device is operated on.
 int _invokeDeviceLifecycle(int address) {
@@ -33,6 +33,16 @@ int _invokeDeviceLifecycle(int address) {
       .fromAddress(address)
       .asFunction<int Function()>();
   return fn();
+}
+
+/// Rebuilds and invokes the native conditional/forced device-stop function.
+int _invokeDeviceStop(int address, bool force) {
+  final fn =
+      ffi.Pointer<
+            ffi.NativeFunction<ffi.UnsignedInt Function(ffi.UnsignedInt)>
+          >.fromAddress(address)
+          .asFunction<int Function(int)>();
+  return fn(force ? 1 : 0);
 }
 
 /// Rebuilds the native `initEngine` function from its raw pointer [address] and
@@ -393,17 +403,17 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       .asFunction<void Function(int)>();
 
   @override
-  Future<PlayerErrors> stopAudioDevice() async {
+  Future<PlayerErrors> stopAudioDevice({bool force = false}) async {
     // Run the blocking native ma_device_stop() off the UI isolate. Only the
     // raw function pointer address (a sendable int) is captured; the pointer
     // is rebuilt and called inside the worker.
     final address = _stopAudioDevicePtr.address;
-    final ret = await Isolate.run(() => _invokeDeviceLifecycle(address));
+    final ret = await Isolate.run(() => _invokeDeviceStop(address, force));
     return PlayerErrors.values[ret];
   }
 
   late final _stopAudioDevicePtr =
-      _lookup<ffi.NativeFunction<ffi.UnsignedInt Function()>>(
+      _lookup<ffi.NativeFunction<ffi.UnsignedInt Function(ffi.UnsignedInt)>>(
         'stopAudioDevice',
       );
 

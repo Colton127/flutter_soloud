@@ -84,6 +84,46 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
     );
     strBuf.writeln('State while playing: $stateWhilePlaying');
 
+    // Default explicit stop is idle-only and must not interrupt playback.
+    await SoLoud.instance.stopAudioDevice();
+    final stateAfterConditionalStop = SoLoud.instance.getAudioDeviceState();
+    assert(
+      stateAfterConditionalStop == AudioDeviceState.started,
+      'stopAudioDevice() while active should be a no-op, but got '
+      '$stateAfterConditionalStop.',
+    );
+    assert(
+      !SoLoud.instance.getPause(handle),
+      'Conditional device stop must not pause the active voice.',
+    );
+    strBuf.writeln(
+      'State after conditional stop while active: '
+      '$stateAfterConditionalStop',
+    );
+
+    // Forced stop operates only the output device and preserves voice state.
+    await SoLoud.instance.stopAudioDevice(force: true);
+    final stateAfterForcedStop = SoLoud.instance.getAudioDeviceState();
+    assert(
+      stateAfterForcedStop == AudioDeviceState.stopped,
+      'stopAudioDevice(force: true) should stop during active playback, but '
+      'got $stateAfterForcedStop.',
+    );
+    assert(
+      !SoLoud.instance.getPause(handle),
+      'Forced device stop must not pause or mutate the active voice.',
+    );
+    strBuf.writeln('State after forced stop: $stateAfterForcedStop');
+
+    await SoLoud.instance.startAudioDevice();
+    final stateAfterExplicitStart = SoLoud.instance.getAudioDeviceState();
+    assert(
+      stateAfterExplicitStart == AudioDeviceState.started,
+      'startAudioDevice() should complete after restart, but got '
+      '$stateAfterExplicitStart.',
+    );
+    strBuf.writeln('State after explicit restart: $stateAfterExplicitStart');
+
     // 6) Pause the sound handle.
     SoLoud.instance.setPause(handle, true);
 

@@ -119,11 +119,8 @@ FFI_PLUGIN_EXPORT unsigned int busGetActiveVoiceCount(unsigned int busId);
 /// The default is 500. Can be called any time.
 FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs);
 
-/// Stop the audio output device without deinitializing the engine. Only the
-/// miniaudio device is stopped; loaded sounds, active voices and the
-/// initialized state are preserved so playback can be resumed later with
-/// startAudioDevice(). Idempotent: a no-op if the device is already stopped.
-FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice();
+/// Stop the device while idle, or regardless of active voices when force != 0.
+FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice(unsigned int force);
 
 /// Restart the audio output device previously stopped by stopAudioDevice(), so
 /// existing voices and loaded sounds keep operating. Idempotent: a no-op if the

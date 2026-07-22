@@ -280,16 +280,15 @@ FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs) {
     player.get()->setAudioDeviceIdleTimeout(timeoutMs);
 }
 
-/// Stop the audio output device without deinitializing the engine. Only the
-/// miniaudio device is stopped; loaded sounds, active voices and the
-/// initialized state are preserved so playback can be resumed later with
-/// startAudioDevice(). Idempotent: a no-op if the device is already stopped.
-FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice() {
+/// Stop the audio output device without deinitializing the engine. By default
+/// this is a successful no-op while voices are active. [force] stops the device
+/// even during active playback without mutating any voice.
+FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice(unsigned int force) {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() == nullptr)
     return backendNotInited;
 
-  return player.get()->stopAudioDevice();
+  return player.get()->stopAudioDevice(force != 0);
 }
 
 /// Restart the audio output device previously stopped by stopAudioDevice(), so
@@ -307,11 +306,9 @@ FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice() {
 /// [AudioDeviceState.audioDeviceUninitialized] if the engine is not
 /// initialized.
 FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
-  std::lock_guard<std::mutex> guard(init_deinit_mutex);
-  if (player.get() == nullptr)
-    return audioDeviceUninitialized;
-
-  return player.get()->getAudioDeviceState();
+  // Read the process-global backend state directly so this cheap synchronous
+  // query never waits behind an initialization or lifecycle API call.
+  return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
 }
 
 /// Change the playback device.

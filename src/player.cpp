@@ -878,14 +878,7 @@ void Player::resumeEngine()
     // start the device inline.
     soloud.resume();
 #else
-    if (!requestDeviceLifecycle(DeviceLifecycleRequest::start))
-    {
-        // No scheduler running (should not happen while inited): fall back to
-        // a synchronous resume rather than silently dropping it.
-        if (mInited.load(std::memory_order_acquire) &&
-            mLifecycleRequestsAccepted.load(std::memory_order_acquire))
-            soloud.resume();
-    }
+    requestDeviceLifecycle(DeviceLifecycleRequest::start);
 #endif
 }
 
@@ -912,16 +905,79 @@ void Player::setAudioDeviceIdleTimeout(int timeoutMs)
     }
 }
 
-PlayerErrors Player::stopAudioDevice()
+PlayerErrors Player::performAudioDeviceStop(bool explicitRequest)
 {
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
-    SoLoud::result result = SoLoud::miniaudio_stopAudioDevice();
+    // Web deliberately suppresses automatic idle pauses, but an explicit stop
+    // must still operate the device. Native explicit and automatic stops both
+    // reach the same miniaudio backend operation through these two entry paths.
+    SoLoud::result result = explicitRequest
+        ? SoLoud::miniaudio_stopAudioDevice()
+        : soloud.pause();
     if (result != SoLoud::SO_NO_ERROR)
         return unknownError;
     return noError;
+}
+
+PlayerErrors Player::performAudioDeviceStart()
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        return backendNotInited;
+
+    // Use the normal resume hook so iOS reactivates AVAudioSession before the
+    // Audio Unit is restarted.
+    SoLoud::result result = soloud.resume();
+    if (result != SoLoud::SO_NO_ERROR)
+        return unknownError;
+    return noError;
+}
+
+void Player::invalidatePendingDeviceRequest()
+{
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(mPauseMutex);
+        mPendingDeviceRequest = DeviceLifecycleRequest::none;
+        ++mDeviceRequestGeneration;
+    }
+    mPauseCv.notify_one();
+#endif
+}
+
+bool Player::isDeviceRequestCurrent(uint64_t generation)
+{
+#ifdef __EMSCRIPTEN__
+    (void)generation;
+    return true;
+#else
+    std::lock_guard<std::mutex> lock(mPauseMutex);
+    return !mStopPauseThread &&
+           mDeviceRequestGeneration == generation;
+#endif
+}
+
+PlayerErrors Player::stopAudioDevice(bool force)
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+        return backendNotInited;
+
+    std::lock_guard<std::mutex> operationLock(
+        mDeviceLifecycleOperationMutex);
+
+    // The conditional form is intentionally a successful no-op while any
+    // voice is active. This is also the final active-count check before an
+    // actual stop; playback beginning immediately afterward posts a newer
+    // start request and therefore wins after this operation completes.
+    if (!force && soloud.getActiveVoiceCount() != 0)
+        return noError;
+
+    invalidatePendingDeviceRequest();
+    return performAudioDeviceStop(true);
 }
 
 PlayerErrors Player::startAudioDevice()
@@ -930,10 +986,24 @@ PlayerErrors Player::startAudioDevice()
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
-    SoLoud::result result = SoLoud::miniaudio_startAudioDevice();
-    if (result != SoLoud::SO_NO_ERROR)
-        return unknownError;
-    return noError;
+    PlayerErrors result;
+    {
+        std::lock_guard<std::mutex> operationLock(
+            mDeviceLifecycleOperationMutex);
+        // Cancel a stale delayed idle stop before prewarming the device.
+        invalidatePendingDeviceRequest();
+        result = performAudioDeviceStart();
+        if (result == noError)
+        {
+            // Any idle request posted while startup was in progress predates
+            // the completed prewarm. Replace it with a fresh timeout below.
+            invalidatePendingDeviceRequest();
+        }
+    }
+
+    if (result == noError)
+        evaluateAudioDeviceIdle();
+    return result;
 }
 
 AudioDeviceState Player::getAudioDeviceState()
@@ -1020,9 +1090,10 @@ void Player::pauseEngineScheduler()
         if (request == DeviceLifecycleRequest::start)
         {
             lock.unlock();
-            if (mInited.load(std::memory_order_acquire) &&
-                mLifecycleRequestsAccepted.load(std::memory_order_acquire))
-                soloud.resume();
+            std::lock_guard<std::mutex> operationLock(
+                mDeviceLifecycleOperationMutex);
+            if (isDeviceRequestCurrent(requestGeneration))
+                performAudioDeviceStart();
             continue;
         }
 
@@ -1051,12 +1122,15 @@ void Player::pauseEngineScheduler()
             continue;
 
         lock.unlock();
-        if (mInited.load(std::memory_order_acquire) &&
+        std::lock_guard<std::mutex> operationLock(
+            mDeviceLifecycleOperationMutex);
+        if (isDeviceRequestCurrent(requestGeneration) &&
+            mInited.load(std::memory_order_acquire) &&
             mLifecycleRequestsAccepted.load(std::memory_order_acquire) &&
             soloud.getActiveVoiceCount() == 0 &&
             mIdleTimeoutMs.load() >= 0)
         {
-            soloud.pause();
+            performAudioDeviceStop(false);
         }
     }
 }

@@ -98,7 +98,7 @@ external int wasmInitEngine(
 );
 
 @JS('Module_soloud._stopAudioDevice')
-external int wasmStopAudioDevice();
+external int wasmStopAudioDevice(int force);
 
 @JS('Module_soloud._startAudioDevice')
 external int wasmStartAudioDevice();
