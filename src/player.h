@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -708,9 +709,19 @@ private:
   std::thread mPauseThread;
   std::mutex mPauseMutex;
   std::condition_variable mPauseCv;
-  std::atomic<bool> mPauseRequested{false};
-  std::atomic<bool> mResumeRequested{false};
-  std::atomic<bool> mStopPauseThread{false};
+  enum class DeviceLifecycleRequest : uint8_t {
+    none,
+    start,
+    idleStop,
+  };
+  // The pending request and generation are protected by mPauseMutex. Each new
+  // request replaces the older intent and advances the generation, allowing a
+  // delayed idle stop to detect that it has become stale without maintaining a
+  // command queue.
+  DeviceLifecycleRequest mPendingDeviceRequest =
+      DeviceLifecycleRequest::none;
+  uint64_t mDeviceRequestGeneration = 0;
+  bool mStopPauseThread = false;
   // False before initialization is complete and from the first step of
   // shutdown onward. Lifecycle entry points use this to reject work that
   // could otherwise race with scheduler teardown or backend destruction.
@@ -724,6 +735,7 @@ private:
   std::atomic<int> mIdleTimeoutMs{kDefaultIdleTimeoutMs};
 
   void pauseEngineScheduler();
+  bool requestDeviceLifecycle(DeviceLifecycleRequest request);
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();
 };

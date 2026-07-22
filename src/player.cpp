@@ -133,8 +133,7 @@ PlayerErrors loadOggXiphBufferStream(Player *player,
 }
 
 Player::Player() : mFilters(&soloud, nullptr, nullptr),
-                   mPauseRequested(false), mResumeRequested(false),
-                   mStopPauseThread(false), mPauseThreadRunning(false)
+                   mPauseThreadRunning(false)
 {
 }
 
@@ -815,7 +814,7 @@ void Player::setPause(unsigned int handle, bool pause)
 // are then started causing a lag when starting to play again.
 //
 // Instead of spawning a detached thread for every request, a single
-// persistent scheduler thread handles all pause requests.
+// persistent scheduler thread handles all device lifecycle requests.
 void Player::pauseEngine()
 {
     if (!mLifecycleRequestsAccepted.load(std::memory_order_acquire))
@@ -829,13 +828,7 @@ void Player::pauseEngine()
         soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
         soloud.pause();
 #else
-    {
-        std::lock_guard<std::mutex> lock(mPauseMutex);
-        if (!mPauseThreadRunning)
-            return;
-        mPauseRequested = true;
-    }
-    mPauseCv.notify_one();
+    requestDeviceLifecycle(DeviceLifecycleRequest::idleStop);
 #endif
 }
 
@@ -843,8 +836,8 @@ void Player::pauseEngine()
 // blocks for tens of milliseconds (seconds on some Android devices) while the
 // OS restarts the device, so running it inline on the FFI (UI) thread freezes
 // the app. Post the request to the same scheduler thread that handles the
-// deferred pause; it calls soloud.resume() there instead. A pending resume
-// also cancels a pending deferred pause so a play() arriving during the pause
+// deferred pause; it calls soloud.resume() there instead. A newer start request
+// invalidates a pending deferred pause so a play() arriving during the pause
 // coalescing window keeps the device running.
 void Player::resumeEngine()
 {
@@ -857,21 +850,14 @@ void Player::resumeEngine()
     // start the device inline.
     soloud.resume();
 #else
-    bool schedulerRunning;
-    {
-        std::lock_guard<std::mutex> lock(mPauseMutex);
-        schedulerRunning = mPauseThreadRunning;
-        if (schedulerRunning)
-            mResumeRequested = true;
-    }
-    if (!schedulerRunning)
+    if (!requestDeviceLifecycle(DeviceLifecycleRequest::start))
     {
         // No scheduler running (should not happen while inited): fall back to
         // a synchronous resume rather than silently dropping it.
-        soloud.resume();
-        return;
+        if (mInited.load(std::memory_order_acquire) &&
+            mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+            soloud.resume();
     }
-    mPauseCv.notify_one();
 #endif
 }
 
@@ -930,6 +916,24 @@ AudioDeviceState Player::getAudioDeviceState()
     return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
 }
 
+bool Player::requestDeviceLifecycle(DeviceLifecycleRequest request)
+{
+#ifdef __EMSCRIPTEN__
+    (void)request;
+    return false;
+#else
+    {
+        std::lock_guard<std::mutex> lock(mPauseMutex);
+        if (!mPauseThreadRunning || mStopPauseThread)
+            return false;
+        mPendingDeviceRequest = request;
+        ++mDeviceRequestGeneration;
+    }
+    mPauseCv.notify_one();
+    return true;
+#endif
+}
+
 void Player::startPauseEngineScheduler()
 {
 #ifndef __EMSCRIPTEN__
@@ -937,8 +941,8 @@ void Player::startPauseEngineScheduler()
     if (mPauseThreadRunning)
         return;
     mStopPauseThread = false;
-    mPauseRequested = false;
-    mResumeRequested = false;
+    mPendingDeviceRequest = DeviceLifecycleRequest::none;
+    ++mDeviceRequestGeneration;
     mPauseThread = std::thread(&Player::pauseEngineScheduler, this);
     mPauseThreadRunning = true;
 #endif
@@ -952,6 +956,8 @@ void Player::stopPauseEngineScheduler()
         if (!mPauseThreadRunning)
             return;
         mStopPauseThread = true;
+        mPendingDeviceRequest = DeviceLifecycleRequest::none;
+        ++mDeviceRequestGeneration;
     }
     mPauseCv.notify_all();
     if (mPauseThread.joinable()) {
@@ -966,23 +972,25 @@ void Player::stopPauseEngineScheduler()
 
 void Player::pauseEngineScheduler()
 {
-    while (!mStopPauseThread)
+    while (true)
     {
         std::unique_lock<std::mutex> lock(mPauseMutex);
         mPauseCv.wait(lock, [this] {
-            return mPauseRequested || mResumeRequested || mStopPauseThread;
+            return mPendingDeviceRequest != DeviceLifecycleRequest::none ||
+                   mStopPauseThread;
         });
         if (mStopPauseThread)
             break;
 
-        // Resume takes priority over a pending pause: a play()/unpause that
-        // arrives while a device stop is queued means the device must stay
-        // running. Start the device immediately (off the UI thread) and drop
-        // any pending pause.
-        if (mResumeRequested)
+        const DeviceLifecycleRequest request = mPendingDeviceRequest;
+        const uint64_t requestGeneration = mDeviceRequestGeneration;
+        mPendingDeviceRequest = DeviceLifecycleRequest::none;
+
+        // A start is performed immediately. Any stop request arriving while
+        // the backend call is in progress receives a newer generation and is
+        // handled on the next iteration rather than being cleared here.
+        if (request == DeviceLifecycleRequest::start)
         {
-            mResumeRequested = false;
-            mPauseRequested = false;
             lock.unlock();
             if (mInited.load(std::memory_order_acquire) &&
                 mLifecycleRequestsAccepted.load(std::memory_order_acquire))
@@ -990,19 +998,18 @@ void Player::pauseEngineScheduler()
             continue;
         }
 
-        // A pause request arrived. Reset it and wait for the configured idle
-        // timeout, but wake early if another request arrives (coalescing rapid
-        // calls). A zero timeout stops the device as soon as possible (still
-        // off this thread), so skip the wait. A negative timeout means "keep
-        // alive indefinitely"; it should not have been enqueued, but if it was
-        // the final guard below (>= 0) prevents the pause anyway.
-        mPauseRequested = false;
-        int timeoutMs = mIdleTimeoutMs.load();
+        // An idle-stop request waits for the configured timeout. Any newer
+        // request advances the generation and invalidates this deadline. A
+        // newer idle-stop restarts the delay; a newer start cancels it.
+        const int timeoutMs = mIdleTimeoutMs.load();
+        if (timeoutMs < 0)
+            continue;
         if (timeoutMs > 0)
         {
             mPauseCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                              [this] {
-                                  return mPauseRequested || mResumeRequested ||
+                              [this, requestGeneration] {
+                                  return mDeviceRequestGeneration !=
+                                             requestGeneration ||
                                          mStopPauseThread;
                               });
         }
@@ -1010,14 +1017,9 @@ void Player::pauseEngineScheduler()
         if (mStopPauseThread)
             break;
 
-        // A resume that arrived during the delay cancels this pause; handle it
-        // on the next loop iteration.
-        if (mResumeRequested)
-            continue;
-
-        // If another pause request arrived during the wait, loop back and
-        // restart the delay so the pause happens only after the burst ends.
-        if (mPauseRequested)
+        // The request is stale. The replacement intent remains pending and is
+        // processed on the next iteration.
+        if (mDeviceRequestGeneration != requestGeneration)
             continue;
 
         lock.unlock();
