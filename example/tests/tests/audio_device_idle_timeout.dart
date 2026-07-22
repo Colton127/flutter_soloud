@@ -293,7 +293,52 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
     );
 
     await SoLoud.instance.disposeSource(explosion);
+
+    // This exceeds unsigned 32-bit milliseconds. The previous signed 32-bit
+    // native ABI wrapped it to 100 ms.
+    const largeTimeout = Duration(milliseconds: 0x100000000 + 100);
+    SoLoud.instance.setAudioDeviceIdleTimeout(largeTimeout);
   } finally {
+    if (SoLoud.instance.isInitialized) {
+      SoLoud.instance.deinit();
+    }
+  }
+
+  // Verify both persistence across Player recreation and the 64-bit native
+  // representation: the restored timeout must not behave like wrapped 100 ms
+  // or the default 500 ms timeout.
+  await SoLoud.instance.init();
+  try {
+    await Future<void>.delayed(const Duration(milliseconds: 750));
+    final stateAfterLargePersistentTimeout =
+        SoLoud.instance.getAudioDeviceState();
+    assert(
+      stateAfterLargePersistentTimeout == AudioDeviceState.started,
+      'A persisted timeout larger than 32-bit milliseconds wrapped or reset: '
+      '$stateAfterLargePersistentTimeout.',
+    );
+    strBuf.writeln(
+      'State after persisted 64-bit timeout: '
+      '$stateAfterLargePersistentTimeout',
+    );
+
+    SoLoud.instance.setAudioDeviceIdleTimeout(Duration.zero);
+    var stateAfterRuntimeZero = SoLoud.instance.getAudioDeviceState();
+    final zeroTimeoutDeadline =
+        DateTime.now().add(const Duration(milliseconds: 1000));
+    while (stateAfterRuntimeZero != AudioDeviceState.stopped &&
+        DateTime.now().isBefore(zeroTimeoutDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      stateAfterRuntimeZero = SoLoud.instance.getAudioDeviceState();
+    }
+    assert(
+      stateAfterRuntimeZero == AudioDeviceState.stopped,
+      'Changing a restored timeout to zero while idle should stop the device, '
+      'but got $stateAfterRuntimeZero.',
+    );
+    strBuf.writeln('State after runtime zero timeout: $stateAfterRuntimeZero');
+  } finally {
+    SoLoud.instance.setAudioDeviceIdleTimeout(idleTimeout);
     if (SoLoud.instance.isInitialized) {
       SoLoud.instance.deinit();
     }

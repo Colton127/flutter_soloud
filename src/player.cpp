@@ -30,6 +30,12 @@
 
 namespace {
 constexpr unsigned int kOggXiphBufferStreamMaxBytes = 512u * 1024u * 1024u;
+constexpr int64_t kDefaultIdleTimeoutMs = 500;
+constexpr int64_t kMaxIdleWaitChunkMs = 24LL * 60 * 60 * 1000;
+
+// Device lifecycle configuration outlives each Player instance so a native
+// deinit/reinit cycle preserves the user's timeout policy.
+std::atomic<int64_t> gAudioDeviceIdleTimeoutMs{kDefaultIdleTimeoutMs};
 
 bool readFileBytes(const std::string &filePath,
                    std::vector<unsigned char> &bytes)
@@ -133,7 +139,10 @@ PlayerErrors loadOggXiphBufferStream(Player *player,
 }
 
 Player::Player() : mFilters(&soloud, nullptr, nullptr),
-                   mPauseThreadRunning(false)
+                   mPauseThreadRunning(false),
+                   mIdleTimeoutMs(
+                       gAudioDeviceIdleTimeoutMs.load(
+                           std::memory_order_acquire))
 {
 }
 
@@ -882,9 +891,10 @@ void Player::resumeEngine()
 #endif
 }
 
-void Player::setAudioDeviceIdleTimeout(int timeoutMs)
+void Player::setAudioDeviceIdleTimeout(int64_t timeoutMs)
 {
-    mIdleTimeoutMs.store(timeoutMs);
+    gAudioDeviceIdleTimeoutMs.store(timeoutMs, std::memory_order_release);
+    mIdleTimeoutMs.store(timeoutMs, std::memory_order_release);
 
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
@@ -897,11 +907,12 @@ void Player::setAudioDeviceIdleTimeout(int timeoutMs)
         // even with no active voices.
         resumeEngine();
     }
-    else if (soloud.getActiveVoiceCount() == 0)
+    else
     {
-        // A finite timeout (including zero) is now in effect and nothing is
-        // playing, so schedule the deferred idle-stop using the new timeout.
-        pauseEngine();
+        // A finite timeout (including zero) takes effect immediately if the
+        // engine is already idle. The helper makes the count-and-request
+        // decision atomic with respect to a concurrent play/unpause.
+        evaluateAudioDeviceIdle();
     }
 }
 
@@ -1100,17 +1111,31 @@ void Player::pauseEngineScheduler()
         // An idle-stop request waits for the configured timeout. Any newer
         // request advances the generation and invalidates this deadline. A
         // newer idle-stop restarts the delay; a newer start cancels it.
-        const int timeoutMs = mIdleTimeoutMs.load();
+        const int64_t timeoutMs = mIdleTimeoutMs.load();
         if (timeoutMs < 0)
             continue;
         if (timeoutMs > 0)
         {
-            mPauseCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                              [this, requestGeneration] {
-                                  return mDeviceRequestGeneration !=
-                                             requestGeneration ||
-                                         mStopPauseThread;
-                              });
+            // std::condition_variable may convert its duration to a
+            // higher-resolution clock representation. Bound each individual
+            // wait so a valid 64-bit millisecond timeout cannot overflow that
+            // conversion on platforms whose clock uses 64-bit nanoseconds.
+            int64_t remainingMs = timeoutMs;
+            while (remainingMs > 0)
+            {
+                const int64_t waitMs =
+                    std::min(remainingMs, kMaxIdleWaitChunkMs);
+                const bool interrupted = mPauseCv.wait_for(
+                    lock,
+                    std::chrono::milliseconds(waitMs),
+                    [this, requestGeneration] {
+                        return mDeviceRequestGeneration != requestGeneration ||
+                               mStopPauseThread;
+                    });
+                if (interrupted)
+                    break;
+                remainingMs -= waitMs;
+            }
         }
 
         if (mStopPauseThread)

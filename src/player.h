@@ -247,7 +247,7 @@ public:
   /// (e.g. a phone call) still stop the device regardless.
   /// @param timeoutMs the idle timeout in milliseconds, or a negative value to
   /// keep the device running indefinitely.
-  void setAudioDeviceIdleTimeout(int timeoutMs);
+  void setAudioDeviceIdleTimeout(int64_t timeoutMs);
 
   /// @brief Stop the audio output device without deinitializing the engine.
   /// By default the device is stopped only when there are no active voices.
@@ -714,7 +714,6 @@ private:
   // stray background thread. The same thread handles both the deferred device
   // stop (pause) and the immediate device start (resume) so neither native
   // ma_device_stop()/ma_device_start() call ever blocks the UI thread.
-  static constexpr int kDefaultIdleTimeoutMs = 500;
   std::thread mPauseThread;
   std::mutex mPauseMutex;
   // Serializes the actual blocking device operations performed by both the
@@ -744,7 +743,7 @@ private:
   /// keeps the device running indefinitely (the idle-pause never stops it);
   /// 0 stops it as soon as possible; a positive value is the delay in
   /// milliseconds. Read by the scheduler thread, written from the FFI thread.
-  std::atomic<int> mIdleTimeoutMs{kDefaultIdleTimeoutMs};
+  std::atomic<int64_t> mIdleTimeoutMs;
 
   void pauseEngineScheduler();
   PlayerErrors performAudioDeviceStart();

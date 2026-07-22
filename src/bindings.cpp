@@ -274,7 +274,7 @@ FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed) {
 /// idle. [timeoutMs] > 0 keeps it running for that many milliseconds after
 /// going idle. Any play/unpause before the deadline cancels the pending stop.
 /// The default is 500. Can be called any time.
-FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs) {
+FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs) {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() != nullptr)
     player.get()->setAudioDeviceIdleTimeout(timeoutMs);

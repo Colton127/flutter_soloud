@@ -396,7 +396,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   late final _setAudioDeviceIdleTimeoutPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int)>>(
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
         'setAudioDeviceIdleTimeout',
       );
   late final _setAudioDeviceIdleTimeout = _setAudioDeviceIdleTimeoutPtr

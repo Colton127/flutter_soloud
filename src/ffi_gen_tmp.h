@@ -13,6 +13,7 @@
 // copy the generated definition into flutter_soloud_bindings_ffi.dart
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "enums.h"
 #include "audiobuffer/metadata_ffi.h"
@@ -117,7 +118,7 @@ FFI_PLUGIN_EXPORT unsigned int busGetActiveVoiceCount(unsigned int busId);
 /// idle. [timeoutMs] > 0 keeps it running for that many milliseconds after
 /// going idle. Any play/unpause before the deadline cancels the pending stop.
 /// The default is 500. Can be called any time.
-FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int timeoutMs);
+FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs);
 
 /// Stop the device while idle, or regardless of active voices when force != 0.
 FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice(unsigned int force);
