@@ -184,14 +184,21 @@ void Player::dispose() {
     mInited.store(false, std::memory_order_release);
     stopPauseEngineScheduler();
 
-    // Clean up SoLoud
-    setVoiceEndedCallback(nullptr);
+    // The scheduler join above waits for any device operation it was already
+    // performing. Keep the same serialization lock held through the remaining
+    // stop and backend teardown so no real device operation can overlap it.
+    std::lock_guard<std::mutex> operationLock(
+        mDeviceLifecycleOperationMutex);
+
+    // Unregister callbacks before stopping voices. In particular, keep stale
+    // Dart callback pointers from being used while teardown destroys sources.
+    clearDartCallbackRegistrations();
     setVoiceInactiveCallback(nullptr);
-    setStateChangedCallback(nullptr);
-    {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-        sounds.clear();
-    }
+
+    // Player::dispose() is the sole owner of native sound destruction during
+    // engine teardown. This helper deliberately does not evaluate idle policy
+    // or request a restart when the timeout is indefinite.
+    stopDeviceAndDestroyAllSounds();
     soloud.deinit();
 }
 
@@ -249,6 +256,9 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
             soloud.setPostClipScaler(1.0f);
         }
     } catch (...) {
+        // SoLoud may already have allocated its audio mutex or partially
+        // opened the backend. Roll all of that back before reporting failure.
+        soloud.deinit();
         return backendNotInited;
     }
 
@@ -258,7 +268,15 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
         mBufferSize = bufferSize;
         mChannels = channels;
         // Start the deferred-pause scheduler now that the engine is in use.
-        startPauseEngineScheduler();
+        // Thread creation is part of initialization: if it fails, leave no
+        // initialized backend or partially published lifecycle state behind.
+        try {
+            startPauseEngineScheduler();
+        } catch (...) {
+            stopPauseEngineScheduler();
+            soloud.deinit();
+            return backendNotInited;
+        }
         mLifecycleRequestsAccepted.store(true, std::memory_order_release);
         // Publish initialized state only after lifecycle support is ready.
         mInited.store(true, std::memory_order_release);
@@ -272,7 +290,12 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
             pauseEngine();
     }
     else
+    {
+        // A failed backend init can still leave partial miniaudio/SoLoud
+        // resources allocated. Initialization failure must be all-or-nothing.
+        soloud.deinit();
         result = backendNotInited;
+    }
     return (PlayerErrors)result;
 }
 
@@ -1378,7 +1401,7 @@ void Player::disposeSound(unsigned int soundHash)
     evaluateAudioDeviceIdle();
 }
 
-void Player::disposeAllSound()
+void Player::stopDeviceAndDestroyAllSounds()
 {
     // Stop all voices first. This stops all active audio processing.
     soloud.stopAll();
@@ -1426,6 +1449,17 @@ void Player::disposeAllSound()
         sounds.clear();
     }
     // Sounds (and their filters) are destroyed here when soundsToDestroy goes out of scope
+}
+
+void Player::disposeAllSound()
+{
+    {
+        // Stopping the device is a real backend operation, so serialize it
+        // with automatic/explicit lifecycle work and teardown.
+        std::lock_guard<std::mutex> operationLock(
+            mDeviceLifecycleOperationMutex);
+        stopDeviceAndDestroyAllSounds();
+    }
 
     evaluateAudioDeviceIdle();
 

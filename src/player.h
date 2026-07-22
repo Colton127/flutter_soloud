@@ -753,6 +753,7 @@ private:
   bool requestDeviceLifecycle(DeviceLifecycleRequest request);
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();
+  void stopDeviceAndDestroyAllSounds();
 };
 
 #endif // PLAYER_H

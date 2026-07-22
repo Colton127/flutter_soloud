@@ -50,7 +50,8 @@ abstract class FlutterSoLoud {
   Stream<PlayerStateNotification> get stateChangedEvents =>
       stateChangedController.stream;
 
-  /// Used with FFI only to close NativeCallable callbacks.
+  /// Used with FFI only to close NativeCallable callbacks after native code
+  /// has unregistered them during teardown.
   @mustBeOverridden
   void disposeNativeCallables();
 

@@ -371,12 +371,14 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 FFI_PLUGIN_EXPORT void dispose() {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
-  if (player.get() == nullptr)
-    return;
-  player.get()->disposeAllSound();
+  // Make every native-to-Dart bridge inert before Player::dispose() stops
+  // voices and destroys sources. Dart keeps its NativeCallables alive until
+  // this off-isolate native teardown has completed.
   dartVoiceEndedCallback = nullptr;
   dartFileLoadedCallback = nullptr;
   dartStateChangedCallback = nullptr;
+  if (player.get() == nullptr)
+    return;
   player.get()->dispose();
   player.reset();
   player = nullptr;

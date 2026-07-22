@@ -235,7 +235,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   @override
   void disposeNativeCallables() {
     _disposeAllBufferStreamCallbacks();
-    clearDartCallbackRegistrations();
     nativeVoiceEndedCallable?.close();
     nativeVoiceEndedCallable = null;
     nativeFileLoadedCallable?.close();
