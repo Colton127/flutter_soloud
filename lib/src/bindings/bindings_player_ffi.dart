@@ -380,6 +380,22 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       >('initEngine');
 
   @override
+  void prepareEngineInit() => _prepareEngineInit();
+
+  late final _prepareEngineInitPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('prepareEngineInit');
+  late final _prepareEngineInit = _prepareEngineInitPtr
+      .asFunction<void Function()>();
+
+  @override
+  void requestEngineShutdown() => _requestEngineShutdown();
+
+  late final _requestEngineShutdownPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('requestEngineShutdown');
+  late final _requestEngineShutdown = _requestEngineShutdownPtr
+      .asFunction<void Function()>();
+
+  @override
   void setAndroidAAudioAttributes(bool managed) {
     _setAndroidAAudioAttributes(managed ? 1 : 0);
   }
@@ -455,6 +471,18 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       );
   late final _getAudioDeviceState = _getAudioDeviceStatePtr
       .asFunction<int Function()>();
+
+  /// Test-only interruption injection through the native notification path.
+  void debugTriggerAudioInterruption({required bool began}) {
+    _debugTriggerAudioInterruption(began ? 1 : 0);
+  }
+
+  late final _debugTriggerAudioInterruptionPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt)>>(
+        'debugTriggerAudioInterruption',
+      );
+  late final _debugTriggerAudioInterruption = _debugTriggerAudioInterruptionPtr
+      .asFunction<void Function(int)>();
 
   @override
   Future<PlayerErrors> changeDevice(int deviceId) async {

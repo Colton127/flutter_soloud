@@ -39,6 +39,12 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   bool _eventCallbacksSetUp = false;
 
   @override
+  void prepareEngineInit() {}
+
+  @override
+  void requestEngineShutdown() {}
+
+  @override
   void disposeNativeCallables() {
     /// Nothing to do on web.
   }
@@ -168,6 +174,10 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   AudioDeviceState getAudioDeviceState() {
     return AudioDeviceState.fromValue(wasmGetAudioDeviceState());
   }
+
+  /// Test-only no-op. Browser AudioContext interruptions are not driven by
+  /// miniaudio notifications.
+  void debugTriggerAudioInterruption({required bool began}) {}
 
   @override
   Future<PlayerErrors> changeDevice(int deviceId) async {

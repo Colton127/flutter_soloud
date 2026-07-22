@@ -6,8 +6,18 @@ import 'common.dart';
 
 /// Test asynchronous `init()`-`deinit()`.
 Future<StringBuffer> testAsynchronousDeinit() async {
-  /// test asynchronous init-deinit looping with a short decreasing time
-  for (var t = 10; t >= 0; t--) {
+  // Repeat the shortest delays because they specifically exercise workers
+  // reaching the native init/deinit serialization mutex in reverse order.
+  final delays = <int>[
+    for (var t = 10; t >= 0; t--) t,
+    2,
+    0,
+    2,
+    0,
+    2,
+    0,
+  ];
+  for (final t in delays) {
     Object? initializationError;
 
     // Attach the error handler immediately, but retain the Future so every

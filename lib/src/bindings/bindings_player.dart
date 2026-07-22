@@ -93,6 +93,15 @@ abstract class FlutterSoLoud {
     bool lowLatency,
   );
 
+  /// Marks the next native initialization request as current before it is
+  /// dispatched to a worker isolate.
+  @mustBeOverridden
+  void prepareEngineInit();
+
+  /// Rejects an initialization worker that has not entered native code yet.
+  @mustBeOverridden
+  void requestEngineShutdown();
+
   /// Android only: when [managed] is true (default) SoLoud tags the AAudio
   /// stream as media/music; when false it leaves usage/contentType unset so the
   /// app can manage AudioAttributes externally (e.g. via audio_session). Only

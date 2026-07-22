@@ -77,6 +77,9 @@ namespace SoLoud
 	// MiniAudio back-end initialization call
 	result miniaudio_init(SoLoud::Soloud* aSoloud, unsigned int aFlags = Soloud::CLIP_ROUNDOFF, unsigned int aSamplerate = 44100, unsigned int aBuffer = 2048, unsigned int aChannels = 2, void *pPlaybackInfos_id = nullptr);
 	result miniaudio_changeDevice_impl(void *pPlaybackInfos_id);
+	// Test hook: deliver an interruption notification through the same backend
+	// callback used by the OS. Not exposed by the public Dart API.
+	void miniaudio_debugTriggerAudioInterruption(bool aBegan);
 	// When false, opens the device on the conservative (legacy mixer) profile
 	// instead of the default low-latency/MMAP path. Must be called before init.
 	void miniaudio_setLowLatency(bool aLowLatency);

@@ -204,6 +204,20 @@ namespace SoLoud
         }
     }
 
+    void miniaudio_debugTriggerAudioInterruption(bool aBegan)
+    {
+        if (!gDeviceInitialized.load(std::memory_order_acquire) ||
+            gSoloud.load(std::memory_order_acquire) == nullptr)
+            return;
+
+        ma_device_notification notification = {};
+        notification.pDevice = &gDevice;
+        notification.type = aBegan
+            ? ma_device_notification_type_interruption_began
+            : ma_device_notification_type_interruption_ended;
+        on_notification(&notification);
+    }
+
     void miniaudio_setLowLatency(bool aLowLatency)
     {
         std::lock_guard<std::recursive_mutex> lock(gDeviceOperationMutex);

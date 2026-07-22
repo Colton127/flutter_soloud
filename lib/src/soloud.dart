@@ -443,6 +443,11 @@ interface class SoLoud {
 
     final initializationGeneration = _lifecycleGeneration;
 
+    // Record the request synchronously before initEngine() is dispatched to a
+    // worker isolate. A later deinit can then cancel a worker that has not yet
+    // entered native code instead of allowing it to initialize after dispose.
+    _controller.soLoudFFI.prepareEngineInit();
+
     // Must be set before the engine opens the device so the backend picks it
     // up at stream creation (and re-applies it on device changes).
     _controller.soLoudFFI.setAndroidAAudioAttributes(
@@ -661,6 +666,10 @@ interface class SoLoud {
   /// The isolate-bound native callables must remain alive until native teardown
   /// unregisters them, so they are closed by [_postdeinit].
   void _predeinit() {
+    // This cheap atomic native write happens on the calling isolate before the
+    // blocking dispose is dispatched. It preserves the Dart request order if
+    // the init and dispose workers reach the native mutex in reverse order.
+    _controller.soLoudFFI.requestEngineShutdown();
     _lifecycleGeneration++;
     _nativeCallbacksInitialized = false;
   }

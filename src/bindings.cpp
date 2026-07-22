@@ -27,6 +27,11 @@ extern "C" {
 /// mutex to lock the init and dispose methods.
 std::mutex init_deinit_mutex;
 
+// Set synchronously by Dart before it dispatches init/dispose to worker
+// isolates. This preserves request ordering even when the workers reach
+// init_deinit_mutex in the opposite order.
+std::atomic<bool> engine_shutdown_requested{false};
+
 /// mutex to lock the loading audio methods and make safe operations on
 /// player.sounds list.
 std::mutex loadMutex;
@@ -225,6 +230,14 @@ FFI_PLUGIN_EXPORT bool areXiphLibsAvailable() {
 /// 2=stereo, 4=quad, 6=5.1, 8=7.1.
 ///
 /// Returns [PlayerErrors.noError] if success.
+FFI_PLUGIN_EXPORT void prepareEngineInit() {
+  engine_shutdown_requested.store(false, std::memory_order_release);
+}
+
+FFI_PLUGIN_EXPORT void requestEngineShutdown() {
+  engine_shutdown_requested.store(true, std::memory_order_release);
+}
+
 FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
                                                unsigned int sampleRate,
                                                unsigned int bufferSize,
@@ -232,6 +245,12 @@ FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
                                                unsigned int lowLatency) {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
+
+  // A teardown request may have reached its worker before this initialization
+  // worker. In that case dispose() has already completed as a no-op, so the
+  // delayed init must not recreate the engine afterward.
+  if (engine_shutdown_requested.load(std::memory_order_acquire))
+    return backendNotInited;
 
   if (player.get() == nullptr)
     player = std::make_unique<Player>();
@@ -311,6 +330,15 @@ FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
   return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
 }
 
+/// Test-only hook that sends an interruption through miniaudio's normal
+/// notification callback. This is intentionally absent from the public API.
+FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began) {
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
+  if (player.get() == nullptr || !player.get()->isInited())
+    return;
+  SoLoud::miniaudio_debugTriggerAudioInterruption(began != 0);
+}
+
 /// Change the playback device.
 ///
 /// [deviceID] the device ID. -1 for default OS output device.
@@ -369,6 +397,10 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 /// app
 ///
 FFI_PLUGIN_EXPORT void dispose() {
+  // Keep direct native callers safe too; Dart normally sets this before
+  // dispatching dispose() so request order is recorded without waiting for
+  // this worker to start.
+  engine_shutdown_requested.store(true, std::memory_order_release);
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
   // Make every native-to-Dart bridge inert before Player::dispose() stops
