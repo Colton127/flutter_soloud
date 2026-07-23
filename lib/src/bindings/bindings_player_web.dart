@@ -39,6 +39,12 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   bool _eventCallbacksSetUp = false;
 
   @override
+  void prepareEngineInit() {}
+
+  @override
+  void requestEngineShutdown() {}
+
+  @override
   void disposeNativeCallables() {
     /// Nothing to do on web.
   }
@@ -149,10 +155,10 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  Future<PlayerErrors> stopAudioDevice() async {
+  Future<PlayerErrors> stopAudioDevice({bool force = false}) async {
     // Web is single-threaded (no isolates) and the device change is instant,
     // so call the wasm function directly.
-    final ret = wasmStopAudioDevice();
+    final ret = wasmStopAudioDevice(force ? 1 : 0);
     return PlayerErrors.values[ret];
   }
 
@@ -169,8 +175,12 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     return AudioDeviceState.fromValue(wasmGetAudioDeviceState());
   }
 
+  /// Test-only no-op. Browser AudioContext interruptions are not driven by
+  /// miniaudio notifications.
+  void debugTriggerAudioInterruption({required bool began}) {}
+
   @override
-  PlayerErrors changeDevice(int deviceId) {
+  Future<PlayerErrors> changeDevice(int deviceId) async {
     final ret = wasmChangeDevice(deviceId);
     return PlayerErrors.values[ret];
   }

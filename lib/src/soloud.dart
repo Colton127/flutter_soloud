@@ -265,6 +265,14 @@ interface class SoLoud {
   /// engine must be treated as not ready from Dart.
   bool _nativeCallbacksInitialized = false;
 
+  /// Advances whenever Dart requests teardown, allowing an in-flight [init]
+  /// to detect that it must not publish initialized state afterward.
+  int _lifecycleGeneration = 0;
+
+  /// The current asynchronous native teardown, if any. A new [init] waits for
+  /// this before replacing callback registrations on the recreated player.
+  Future<void>? _pendingAsyncDeinit;
+
   /// The current status of the engine. This is `true` when the engine
   /// has been initialized and is immediately ready.
   ///
@@ -382,6 +390,14 @@ interface class SoLoud {
     AndroidAAudioAttributes androidAAudioAttributes =
         AndroidAAudioAttributes.mediaMusic,
   }) async {
+    final pendingAsyncDeinit = _pendingAsyncDeinit;
+    if (pendingAsyncDeinit != null) {
+      await pendingAsyncDeinit;
+    }
+
+    // Do not expose a previous callback registration as ready while this
+    // initialization is replacing the native engine and callbacks.
+    _nativeCallbacksInitialized = false;
     final nativeIsInitialized = _controller.soLoudFFI.isInited();
     _log.finest('init() called');
 
@@ -419,9 +435,18 @@ interface class SoLoud {
         'a bug in your code. You may have neglected to deinit() SoLoud '
         'during the current lifetime of the app.',
       );
-      _controller.soLoudFFI.clearDartCallbackRegistrations();
-      deinit();
+      // Reinitialization must not make the UI isolate wait for the previous
+      // engine/device teardown. deinitAsync() keeps the Dart callback objects
+      // alive until native teardown has unregistered them.
+      await deinitAsync();
     }
+
+    final initializationGeneration = _lifecycleGeneration;
+
+    // Record the request synchronously before initEngine() is dispatched to a
+    // worker isolate. A later deinit can then cancel a worker that has not yet
+    // entered native code instead of allowing it to initialize after dispose.
+    _controller.soLoudFFI.prepareEngineInit();
 
     // Must be set before the engine opens the device so the backend picks it
     // up at stream creation (and re-applies it on device changes).
@@ -439,6 +464,7 @@ interface class SoLoud {
       channels,
       lowLatency,
     );
+    await _throwIfInitializationWasStopped(initializationGeneration);
     _logPlayerError(error, from: 'initialize() result');
     if (error == PlayerErrors.noError) {
       /// get the visualization flag from the player on C side.
@@ -453,12 +479,27 @@ interface class SoLoud {
       // Initialize [SoLoudLoader]
       _loader.automaticCleanup = automaticCleanup;
 
-      // Register fresh Dart callbacks only after the native player has been
-      // reset and re-initialized.
-      await _initializeNativeCallbacks();
-      _nativeCallbacksInitialized = true;
+      try {
+        // Register fresh Dart callbacks only after the native player has been
+        // reset and re-initialized.
+        await _initializeNativeCallbacks();
+        await _throwIfInitializationWasStopped(initializationGeneration);
 
-      await _loader.initialize();
+        await _loader.initialize();
+        await _throwIfInitializationWasStopped(initializationGeneration);
+
+        // Publish Dart readiness only after callbacks, loader state, and the
+        // native lifecycle coordinator are all ready.
+        _nativeCallbacksInitialized = true;
+      } catch (_) {
+        // Callback/loader setup is part of initialization. If it fails, tear
+        // the native engine back down so no scheduler or device remains alive
+        // behind an initialization Future that completed with an error.
+        if (_controller.soLoudFFI.isInited()) {
+          await deinitAsync();
+        }
+        rethrow;
+      }
     } else {
       _nativeCallbacksInitialized = false;
       _log.severe('initialize() failed with error: $error');
@@ -476,13 +517,17 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudNoPlaybackDevicesFoundCppException] if the given [newDevice]
   /// is not found.
-  void changeDevice({PlaybackDevice? newDevice}) {
+  ///
+  /// Device enumeration and replacement can block, so native platforms run
+  /// the operation off the UI isolate. The returned future completes after
+  /// replacement and any lifecycle-required restart have finished.
+  Future<void> changeDevice({PlaybackDevice? newDevice}) async {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
 
     final deviceId = newDevice?.id ?? -1;
-    final error = _controller.soLoudFFI.changeDevice(deviceId);
+    final error = await _controller.soLoudFFI.changeDevice(deviceId);
     _logPlayerError(error, from: 'changeDevice() result');
     if (error != PlayerErrors.noError) {
       throw SoLoudCppException.fromPlayerError(error);
@@ -494,7 +539,16 @@ interface class SoLoud {
   /// Only the underlying audio device is stopped. Loaded [AudioSource]s, active
   /// voices, filters and the [isInitialized] state are all left untouched, so
   /// playback resumes exactly where it left off once [startAudioDevice] is
-  /// called. The device is stopped even while sounds are actively playing.
+  /// called.
+  ///
+  /// By default this is a successful no-op while any active, unpaused voice
+  /// exists. Set [force] to `true` to stop the device during active playback. A
+  /// forced stop does not pause or otherwise mutate voices; a later play,
+  /// unpause, or [startAudioDevice] call can start the device normally.
+  ///
+  /// This is different from [setPause]: stopping the device changes output
+  /// availability, while pausing a handle changes that voice's authoritative
+  /// state inside SoLoud.
   ///
   /// This is idempotent: calling it while the device is already stopped does
   /// nothing.
@@ -503,23 +557,27 @@ interface class SoLoud {
   /// not freeze the app; await the returned future to know when it completed.
   ///
   /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
-  Future<void> stopAudioDevice() async {
+  Future<void> stopAudioDevice({bool force = false}) async {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
 
-    final error = await _controller.soLoudFFI.stopAudioDevice();
+    final error = await _controller.soLoudFFI.stopAudioDevice(force: force);
     _logPlayerError(error, from: 'stopAudioDevice() result');
     if (error != PlayerErrors.noError) {
       throw SoLoudCppException.fromPlayerError(error);
     }
   }
 
-  /// Restarts the audio output device previously stopped by [stopAudioDevice],
-  /// so existing voices and loaded [AudioSource]s keep operating.
+  /// Starts or prewarms the audio output device without changing any voice or
+  /// loaded [AudioSource]. This uses the same serialized lifecycle path as
+  /// automatic startup.
   ///
   /// This is idempotent: calling it while the device is already started does
-  /// nothing.
+  /// nothing. It cancels an obsolete pending idle stop, but does not enable a
+  /// sticky or permanent keep-alive mode. If the engine remains idle after
+  /// startup, the current timeout configured by [setAudioDeviceIdleTimeout]
+  /// starts again. Pass `null` to that method for indefinite keep-alive.
   ///
   /// The blocking native device operation runs off the UI thread, so this does
   /// not freeze the app; await the returned future to know when the device is
@@ -540,7 +598,9 @@ interface class SoLoud {
 
   /// Gets the current state of the audio output device.
   ///
-  /// Use this to check whether the device is currently
+  /// This reports miniaudio's actual current device state, not a pending
+  /// scheduler request or the last requested operation. Use it to check
+  /// whether the device is currently
   /// [AudioDeviceState.started] (actively delivering audio),
   /// [AudioDeviceState.stopped] (for example after [stopAudioDevice]), or in a
   /// transitional state. Returns [AudioDeviceState.uninitialized] if the engine
@@ -570,8 +630,11 @@ interface class SoLoud {
   void deinit() {
     _log.finest('deinit() called');
     _predeinit();
-    _controller.soLoudFFI.deinit();
-    _postdeinit();
+    try {
+      _controller.soLoudFFI.deinit();
+    } finally {
+      _postdeinit();
+    }
   }
 
   /// Like [deinit], but runs the blocking native teardown (audio device
@@ -581,25 +644,63 @@ interface class SoLoud {
   /// still provided for synchronous contexts such as
   /// "AppLifecycleListener.onExitRequested".
   Future<void> deinitAsync() async {
+    final pendingAsyncDeinit = _pendingAsyncDeinit;
+    if (pendingAsyncDeinit != null) {
+      await pendingAsyncDeinit;
+      return;
+    }
+
     _log.finest('deinitAsync() called');
     _predeinit();
-    await _controller.soLoudFFI.deinitAsync();
-    _postdeinit();
+    final teardown = _deinitNativeAsync();
+    _pendingAsyncDeinit = teardown;
+    try {
+      await teardown;
+    } finally {
+      if (identical(_pendingAsyncDeinit, teardown)) {
+        _pendingAsyncDeinit = null;
+      }
+    }
   }
 
-  /// Shared teardown steps that must run on the calling (UI) isolate before the
-  /// native teardown: closing the isolate-bound native callables and disposing
-  /// loaded sounds. See [deinit] and [deinitAsync].
+  Future<void> _deinitNativeAsync() async {
+    try {
+      await _controller.soLoudFFI.deinitAsync();
+    } finally {
+      _postdeinit();
+    }
+  }
+
+  /// Marks the Dart side unavailable before native teardown begins.
+  ///
+  /// The isolate-bound native callables must remain alive until native teardown
+  /// unregisters them, so they are closed by [_postdeinit].
   void _predeinit() {
+    // This cheap atomic native write happens on the calling isolate before the
+    // blocking dispose is dispatched. It preserves the Dart request order if
+    // the init and dispose workers reach the native mutex in reverse order.
+    _controller.soLoudFFI.requestEngineShutdown();
+    _lifecycleGeneration++;
     _nativeCallbacksInitialized = false;
-    _controller.soLoudFFI.disposeNativeCallables();
-    _controller.soLoudFFI.disposeAllSound();
   }
 
   /// Shared teardown steps that run after the native teardown. See [deinit] and
   /// [deinitAsync].
   void _postdeinit() {
+    _controller.soLoudFFI.disposeNativeCallables();
     _activeSounds.clear();
+  }
+
+  Future<void> _throwIfInitializationWasStopped(int generation) async {
+    if (generation == _lifecycleGeneration) {
+      return;
+    }
+
+    final pendingAsyncDeinit = _pendingAsyncDeinit;
+    if (pendingAsyncDeinit != null) {
+      await pendingAsyncDeinit;
+    }
+    throw const SoLoudInitializationStoppedByDeinitException();
   }
 
   /// Find the [AudioSource] which owns the given [handle].
@@ -1525,7 +1626,8 @@ interface class SoLoud {
   /// start paused. This is helpful if you want to change some attributes
   /// of the sound instance before you play it. For example, you could
   /// call [setRelativePlaySpeed] or [setProtectVoice] on the sound before
-  /// un-pausing it.
+  /// un-pausing it. Creating a paused instance does not start the output
+  /// device; unpausing the valid handle later starts it.
   ///
   /// To play a looping sound, set [looping] to `true`. You can also
   /// define the region to loop by setting [loopingStartAt]
@@ -1533,7 +1635,10 @@ interface class SoLoud {
   /// There is no way to set the end of the looping region — it will
   /// always be the end of the [sound].
   ///
-  /// Returns the [SoundHandle] of the new sound instance.
+  /// This method is synchronous and returns the [SoundHandle] of the new sound
+  /// instance immediately. For an unpaused instance, output-device startup is
+  /// requested only after the voice has been created and registered
+  /// successfully.
   ///
   /// **NOTE**: by default, the maximum number of sounds you can play is 16 and
   /// it can be changed with [setMaxActiveVoiceCount]. If this limit is reached
@@ -2353,8 +2458,10 @@ interface class SoLoud {
   /// audio output (on Android the audioserver `AudioMix` partial wakelock, on
   /// iOS an active audio session), so only keep it running while the user is
   /// actually playing something or expects playback to start. OS-initiated
-  /// interruptions (e.g. a phone call) still stop the device regardless; it
-  /// restarts when the interruption ends or on the next play.
+  /// interruptions (e.g. a phone call) still stop the device regardless. When
+  /// the interruption ends, it restarts only if active playback requires it or
+  /// this timeout is `null`; otherwise it remains stopped until later playback
+  /// or an explicit [startAudioDevice].
   ///
   /// Defaults to 500 ms. Can be called any time, before or after [init] (the
   /// setting persists across [deinit]/[init] cycles). A negative [timeout] is
@@ -2876,7 +2983,9 @@ interface class SoLoud {
   /// The rest of the parameters are equivalent to the non-3D version of this
   /// method ([play]).
   ///
-  /// Returns the [SoundHandle] of this new sound.
+  /// This method is synchronous and returns the [SoundHandle] immediately.
+  /// As with [play], a paused voice does not start the output device, and an
+  /// unpaused voice requests startup only after successful creation.
   ///
   /// **Note**: by default, the maximum number of sounds you can play is 16 and
   /// it can be changed with [setMaxActiveVoiceCount]. If this limit is reached

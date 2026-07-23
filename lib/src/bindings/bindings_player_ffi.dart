@@ -21,11 +21,11 @@ import 'package:flutter_soloud/src/sound_hash.dart';
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 
-/// Rebuilds a `PlayerErrors Function()` device-lifecycle native function from
-/// its raw pointer [address] and invokes it, returning the raw error code.
+/// Rebuilds the no-argument native device-start function from its raw pointer
+/// [address] and invokes it, returning the raw error code.
 ///
 /// Top-level so it can run inside an [Isolate.run] worker: the blocking native
-/// device start/stop then executes off the UI isolate instead of stalling it.
+/// device start then executes off the UI isolate instead of stalling it.
 /// Only [address] (a sendable int) crosses the isolate boundary; the pointer is
 /// reconstructed here and the same process-global device is operated on.
 int _invokeDeviceLifecycle(int address) {
@@ -33,6 +33,26 @@ int _invokeDeviceLifecycle(int address) {
       .fromAddress(address)
       .asFunction<int Function()>();
   return fn();
+}
+
+/// Rebuilds and invokes the native conditional/forced device-stop function.
+int _invokeDeviceStop(int address, bool force) {
+  final fn =
+      ffi.Pointer<
+            ffi.NativeFunction<ffi.UnsignedInt Function(ffi.UnsignedInt)>
+          >.fromAddress(address)
+          .asFunction<int Function(int)>();
+  return fn(force ? 1 : 0);
+}
+
+/// Rebuilds and invokes the blocking native playback-device change function.
+int _invokeChangeDevice(int address, int deviceId) {
+  final fn =
+      ffi.Pointer<
+            ffi.NativeFunction<ffi.UnsignedInt Function(ffi.Int)>
+          >.fromAddress(address)
+          .asFunction<int Function(int)>();
+  return fn(deviceId);
 }
 
 /// Rebuilds the native `initEngine` function from its raw pointer [address] and
@@ -225,7 +245,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   @override
   void disposeNativeCallables() {
     _disposeAllBufferStreamCallbacks();
-    clearDartCallbackRegistrations();
     nativeVoiceEndedCallable?.close();
     nativeVoiceEndedCallable = null;
     nativeFileLoadedCallable?.close();
@@ -361,6 +380,22 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       >('initEngine');
 
   @override
+  void prepareEngineInit() => _prepareEngineInit();
+
+  late final _prepareEngineInitPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('prepareEngineInit');
+  late final _prepareEngineInit = _prepareEngineInitPtr
+      .asFunction<void Function()>();
+
+  @override
+  void requestEngineShutdown() => _requestEngineShutdown();
+
+  late final _requestEngineShutdownPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('requestEngineShutdown');
+  late final _requestEngineShutdown = _requestEngineShutdownPtr
+      .asFunction<void Function()>();
+
+  @override
   void setAndroidAAudioAttributes(bool managed) {
     _setAndroidAAudioAttributes(managed ? 1 : 0);
   }
@@ -386,24 +421,24 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   late final _setAudioDeviceIdleTimeoutPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int)>>(
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
         'setAudioDeviceIdleTimeout',
       );
   late final _setAudioDeviceIdleTimeout = _setAudioDeviceIdleTimeoutPtr
       .asFunction<void Function(int)>();
 
   @override
-  Future<PlayerErrors> stopAudioDevice() async {
+  Future<PlayerErrors> stopAudioDevice({bool force = false}) async {
     // Run the blocking native ma_device_stop() off the UI isolate. Only the
     // raw function pointer address (a sendable int) is captured; the pointer
     // is rebuilt and called inside the worker.
     final address = _stopAudioDevicePtr.address;
-    final ret = await Isolate.run(() => _invokeDeviceLifecycle(address));
+    final ret = await Isolate.run(() => _invokeDeviceStop(address, force));
     return PlayerErrors.values[ret];
   }
 
   late final _stopAudioDevicePtr =
-      _lookup<ffi.NativeFunction<ffi.UnsignedInt Function()>>(
+      _lookup<ffi.NativeFunction<ffi.UnsignedInt Function(ffi.UnsignedInt)>>(
         'stopAudioDevice',
       );
 
@@ -437,9 +472,22 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   late final _getAudioDeviceState = _getAudioDeviceStatePtr
       .asFunction<int Function()>();
 
+  /// Test-only interruption injection through the native notification path.
+  void debugTriggerAudioInterruption({required bool began}) {
+    _debugTriggerAudioInterruption(began ? 1 : 0);
+  }
+
+  late final _debugTriggerAudioInterruptionPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.UnsignedInt)>>(
+        'debugTriggerAudioInterruption',
+      );
+  late final _debugTriggerAudioInterruption = _debugTriggerAudioInterruptionPtr
+      .asFunction<void Function(int)>();
+
   @override
-  PlayerErrors changeDevice(int deviceId) {
-    final ret = _changeDevice(deviceId);
+  Future<PlayerErrors> changeDevice(int deviceId) async {
+    final address = _changeDevicePtr.address;
+    final ret = await Isolate.run(() => _invokeChangeDevice(address, deviceId));
     return PlayerErrors.values[ret];
   }
 
@@ -447,7 +495,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       _lookup<ffi.NativeFunction<ffi.UnsignedInt Function(ffi.Int)>>(
         'changeDevice',
       );
-  late final _changeDevice = _changeDevicePtr.asFunction<int Function(int)>();
 
   @override
   List<PlaybackDevice> listPlaybackDevices() {

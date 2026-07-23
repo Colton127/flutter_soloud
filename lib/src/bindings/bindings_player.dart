@@ -50,7 +50,8 @@ abstract class FlutterSoLoud {
   Stream<PlayerStateNotification> get stateChangedEvents =>
       stateChangedController.stream;
 
-  /// Used with FFI only to close NativeCallable callbacks.
+  /// Used with FFI only to close NativeCallable callbacks after native code
+  /// has unregistered them during teardown.
   @mustBeOverridden
   void disposeNativeCallables();
 
@@ -92,6 +93,15 @@ abstract class FlutterSoLoud {
     bool lowLatency,
   );
 
+  /// Marks the next native initialization request as current before it is
+  /// dispatched to a worker isolate.
+  @mustBeOverridden
+  void prepareEngineInit();
+
+  /// Rejects an initialization worker that has not entered native code yet.
+  @mustBeOverridden
+  void requestEngineShutdown();
+
   /// Android only: when [managed] is true (default) SoLoud tags the AAudio
   /// stream as media/music; when false it leaves usage/contentType unset so the
   /// app can manage AudioAttributes externally (e.g. via audio_session). Only
@@ -113,15 +123,15 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   void setAudioDeviceIdleTimeout(Duration? timeout);
 
-  /// Stop the audio output device without deinitializing the engine. Only the
-  /// miniaudio device is stopped; loaded sounds, active voices and the
-  /// initialized state are preserved so playback can resume later with
-  /// [startAudioDevice]. Idempotent: a no-op if the device is already stopped.
+  /// Stop the audio output device without deinitializing the engine. By default
+  /// this is a successful no-op while voices are active. Set [force] to stop
+  /// the device during active playback without pausing or mutating voices.
   ///
   /// The blocking native device call runs off the UI thread so it does not
-  /// freeze the app; the returned future completes once the device is stopped.
+  /// freeze the app; the returned future completes once the conditional check
+  /// and any resulting device stop have finished.
   @mustBeOverridden
-  Future<PlayerErrors> stopAudioDevice();
+  Future<PlayerErrors> stopAudioDevice({bool force = false});
 
   /// Restart the audio output device previously stopped by [stopAudioDevice],
   /// so existing voices and loaded sounds keep operating. Idempotent: a no-op
@@ -140,8 +150,9 @@ abstract class FlutterSoLoud {
   /// Change the playback device.
   ///
   /// [deviceId] the device ID. -1 for default OS output device.
+  /// The returned future completes after the blocking native replacement.
   @mustBeOverridden
-  PlayerErrors changeDevice(int deviceId);
+  Future<PlayerErrors> changeDevice(int deviceId);
 
   /// List available playback devices.
   List<PlaybackDevice> listPlaybackDevices();
