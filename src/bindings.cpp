@@ -16,6 +16,7 @@
 #endif
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory.h>
 #include <memory>
@@ -23,6 +24,13 @@
 #include <stdio.h>
 
 std::mutex dart_callback_invocation_mutex;
+
+namespace {
+constexpr int64_t kNoDartCallbackOwnerEngineId = -1;
+
+// Protected by dart_callback_invocation_mutex.
+int64_t dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -194,11 +202,24 @@ void stateChangedCallback(unsigned int state) {
 FFI_PLUGIN_EXPORT void
 setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
                      dartFileLoadedCallback_t file_loaded_callback,
-                     dartStateChangedCallback_t state_changed_callback) {
+                     dartStateChangedCallback_t state_changed_callback,
+                     int64_t owner_engine_id) {
   std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
   dartVoiceEndedCallback.store(voice_ended_callback, std::memory_order_release);
   dartFileLoadedCallback.store(file_loaded_callback, std::memory_order_release);
   dartStateChangedCallback.store(state_changed_callback, std::memory_order_release);
+  dartCallbackOwnerEngineId = owner_engine_id;
+}
+
+static void clearDartCallbackRegistrationsLocked() {
+  dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
+  dartFileLoadedCallback.store(nullptr, std::memory_order_release);
+  dartStateChangedCallback.store(nullptr, std::memory_order_release);
+  dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+
+  if (player.get() != nullptr) {
+    player.get()->clearDartCallbackRegistrations();
+  }
 }
 
 FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
@@ -206,13 +227,20 @@ FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
   std::lock_guard<std::mutex> guard_load(loadMutex);
   std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
 
-  dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
-  dartFileLoadedCallback.store(nullptr, std::memory_order_release);
-  dartStateChangedCallback.store(nullptr, std::memory_order_release);
+  clearDartCallbackRegistrationsLocked();
+}
 
-  if (player.get() != nullptr) {
-    player.get()->clearDartCallbackRegistrations();
-  }
+FFI_PLUGIN_EXPORT bool
+clearDartCallbackRegistrationsForEngine(int64_t engine_id) {
+  std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
+  std::lock_guard<std::mutex> guard_load(loadMutex);
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+
+  if (dartCallbackOwnerEngineId != engine_id)
+    return false;
+
+  clearDartCallbackRegistrationsLocked();
+  return true;
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -420,6 +448,7 @@ FFI_PLUGIN_EXPORT void dispose() {
   dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
   dartFileLoadedCallback.store(nullptr, std::memory_order_release);
   dartStateChangedCallback.store(nullptr, std::memory_order_release);
+  dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
   if (player.get() == nullptr)
     return;
   player.get()->dispose();
@@ -433,10 +462,12 @@ FFI_PLUGIN_EXPORT void dispose() {
 #if defined(__ANDROID__)
 #include <jni.h>
 
-extern "C" JNIEXPORT void JNICALL
-Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeClearDartCallbackRegistrations(
-    JNIEnv *, jclass) {
-  clearDartCallbackRegistrations();
+extern "C" JNIEXPORT jboolean JNICALL
+Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeClearDartCallbackRegistrationsForEngine(
+    JNIEnv *, jclass, jlong engine_id) {
+  return clearDartCallbackRegistrationsForEngine(static_cast<int64_t>(engine_id))
+             ? JNI_TRUE
+             : JNI_FALSE;
 }
 #endif
 

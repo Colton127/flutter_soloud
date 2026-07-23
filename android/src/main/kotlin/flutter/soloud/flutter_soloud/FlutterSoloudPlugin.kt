@@ -9,14 +9,25 @@ class FlutterSoloudPlugin : FlutterPlugin {
         }
 
         @JvmStatic
-        private external fun nativeClearDartCallbackRegistrations()
+        private external fun nativeClearDartCallbackRegistrationsForEngine(
+            engineId: Long,
+        ): Boolean
     }
 
+    private var engineId: Long? = null
+
+    @Suppress("DEPRECATION")
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         // Dart continues using FFI; no platform channel is required.
+        engineId = binding.flutterEngine.engineId
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        nativeClearDartCallbackRegistrations()
+        val detachedEngineId = engineId
+        engineId = null
+
+        if (detachedEngineId != null) {
+            nativeClearDartCallbackRegistrationsForEngine(detachedEngineId)
+        }
     }
 }

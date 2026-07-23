@@ -196,6 +196,8 @@ void Player::dispose() {
     // Unregister callbacks before stopping voices. In particular, keep stale
     // Dart callback pointers from being used while teardown destroys sources.
     clearDartCallbackRegistrations();
+    setVoiceEndedCallback(nullptr);
+    setStateChangedCallback(nullptr);
     setVoiceInactiveCallback(nullptr);
 
     // Player::dispose() is the sole owner of native sound destruction during
@@ -1573,11 +1575,6 @@ void Player::disposeAllSound()
 
 void Player::clearDartCallbackRegistrations()
 {
-    // The voice-inactive callback is native lifecycle support, not a Dart
-    // callback, and must remain registered across a Dart hot restart.
-    setVoiceEndedCallback(nullptr);
-    setStateChangedCallback(nullptr);
-
     std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
     for (auto &sound : sounds)
     {

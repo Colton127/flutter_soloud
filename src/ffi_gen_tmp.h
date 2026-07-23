@@ -20,6 +20,19 @@
 
 #define FFI_PLUGIN_EXPORT
 
+typedef void (*dartVoiceEndedCallback_t)(unsigned int *);
+typedef void (*dartFileLoadedCallback_t)(enum PlayerErrors *,
+                                         char *,
+                                         unsigned int *,
+                                         uint64_t *);
+typedef void (*dartStateChangedCallback_t)(enum PlayerStateEvents *);
+
+FFI_PLUGIN_EXPORT void setDartEventCallback(
+    dartVoiceEndedCallback_t voiceEnded,
+    dartFileLoadedCallback_t fileLoaded,
+    dartStateChangedCallback_t stateChanged,
+    int64_t ownerEngineId);
+
 //--------------------- copy here the new functions to generate
 
  /// Create a new mixing bus.

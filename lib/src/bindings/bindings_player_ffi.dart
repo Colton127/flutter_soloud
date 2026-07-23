@@ -5,8 +5,10 @@
 // ignore_for_file: omit_local_variable_types,public_member_api_docs
 
 import 'dart:ffi' as ffi;
+import 'dart:io' as io;
 import 'dart:isolate';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter_soloud/src/bindings/audio_data.dart';
@@ -263,6 +265,15 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   Future<void> setDartEventCallbacks() async {
+    final engineId = ui.PlatformDispatcher.instance.engineId;
+
+    if (io.Platform.isAndroid && engineId == null) {
+      throw StateError(
+        'PlatformDispatcher.engineId was null while registering '
+        'flutter_soloud Android callbacks.',
+      );
+    }
+
     // Create a NativeCallable for the Dart functions
     nativeVoiceEndedCallable =
         ffi.NativeCallable<DartVoiceEndedCallbackTFunction>.listener(
@@ -281,6 +292,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       nativeVoiceEndedCallable!.nativeFunction,
       nativeFileLoadedCallable!.nativeFunction,
       nativeStateChangedCallable!.nativeFunction,
+      engineId ?? -1,
     );
   }
 
@@ -291,6 +303,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
             DartVoiceEndedCallbackT,
             DartFileLoadedCallbackT,
             DartStateChangedCallbackT,
+            ffi.Int64,
           )
         >
       >('setDartEventCallback');
@@ -300,6 +313,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
           DartVoiceEndedCallbackT,
           DartFileLoadedCallbackT,
           DartStateChangedCallbackT,
+          int,
         )
       >();
 
