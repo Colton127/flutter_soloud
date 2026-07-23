@@ -25,6 +25,10 @@
 
 std::mutex dart_callback_invocation_mutex;
 
+// This mutex protects callback registration and invocation only. It must
+// never be held while joining the lifecycle scheduler, starting or stopping
+// the audio device, disposing Player, or destroying native audio sources.
+
 namespace {
 constexpr int64_t kNoDartCallbackOwnerEngineId = -1;
 
@@ -435,25 +439,27 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 /// app
 ///
 FFI_PLUGIN_EXPORT void dispose() {
-  // Keep direct native callers safe too; Dart normally sets this before
-  // dispatching dispose() so request order is recorded without waiting for
-  // this worker to start.
+  // Preserve request ordering for asynchronous Dart init/deinit workers.
   engine_shutdown_requested.store(true, std::memory_order_release);
+
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
-  // Make every native-to-Dart bridge inert before Player::dispose() stops
-  // voices and destroys sources. Dart keeps its NativeCallables alive until
-  // this off-isolate native teardown has completed.
-  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
-  dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
-  dartFileLoadedCallback.store(nullptr, std::memory_order_release);
-  dartStateChangedCallback.store(nullptr, std::memory_order_release);
-  dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+
+  // Wait for any Dart callback currently executing, then make every bridge
+  // inert. Do not retain the callback mutex while stopping devices, joining
+  // threads, destroying sources, or resetting Player.
+  {
+    std::lock_guard<std::mutex> callbackGuard(
+        dart_callback_invocation_mutex);
+    clearDartCallbackRegistrationsLocked();
+  }
+
   if (player.get() == nullptr)
     return;
-  player.get()->dispose();
+
+  // dart_callback_invocation_mutex must not be held beyond this point.
+  player->dispose();
   player.reset();
-  player = nullptr;
   player = std::make_unique<Player>();
   analyzer.reset();
   analyzer = std::make_unique<Analyzer>(256);
