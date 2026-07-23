@@ -729,13 +729,24 @@ private:
     interruptionStop,
     idleStop,
   };
-  // The pending request and generation are protected by mPauseMutex. Each new
-  // request replaces the older intent and advances the generation, allowing a
+  // The pending request and generation are protected by mPauseMutex. Requests
+  // normally replace older intent and advance the generation, allowing a
   // delayed idle stop to detect that it has become stale without maintaining a
-  // command queue.
+  // command queue. Immediate requests have priority over idle work.
   DeviceLifecycleRequest mPendingDeviceRequest =
       DeviceLifecycleRequest::none;
   uint64_t mDeviceRequestGeneration = 0;
+  // Protected by mPauseMutex.
+  //
+  // mImmediateDeviceRequestInFlight identifies a start/interruption operation
+  // that has been dequeued but has not completed.
+  //
+  // mIdleStopRequestedAfterImmediateOperation records idle policy work that
+  // arrived after an immediate operation was already pending or in flight.
+  // Such idle work must not invalidate the immediate operation.
+  DeviceLifecycleRequest mImmediateDeviceRequestInFlight =
+      DeviceLifecycleRequest::none;
+  bool mIdleStopRequestedAfterImmediateOperation = false;
   bool mStopPauseThread = false;
   // False before initialization is complete and from the first step of
   // shutdown onward. Lifecycle entry points use this to reject work that

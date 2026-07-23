@@ -1169,14 +1169,76 @@ bool Player::requestDeviceLifecycle(DeviceLifecycleRequest request)
     (void)request;
     return false;
 #else
+    bool shouldNotify = false;
+
     {
         std::lock_guard<std::mutex> lock(mPauseMutex);
+
         if (!mPauseThreadRunning || mStopPauseThread)
             return false;
-        mPendingDeviceRequest = request;
-        ++mDeviceRequestGeneration;
+
+        const bool immediatePending =
+            mPendingDeviceRequest == DeviceLifecycleRequest::start ||
+            mPendingDeviceRequest ==
+                DeviceLifecycleRequest::interruptionStop;
+
+        const bool immediateInFlight =
+            mImmediateDeviceRequestInFlight == DeviceLifecycleRequest::start ||
+            mImmediateDeviceRequestInFlight ==
+                DeviceLifecycleRequest::interruptionStop;
+
+        switch (request)
+        {
+        case DeviceLifecycleRequest::idleStop:
+            if (immediatePending || immediateInFlight)
+            {
+                // Do not replace the immediate operation or advance the
+                // generation that validates it. Run a fresh idle timeout
+                // after the immediate operation completes.
+                mIdleStopRequestedAfterImmediateOperation = true;
+                return true;
+            }
+
+            // A newer idle request restarts an existing idle deadline.
+            mPendingDeviceRequest = DeviceLifecycleRequest::idleStop;
+            ++mDeviceRequestGeneration;
+            shouldNotify = true;
+            break;
+
+        case DeviceLifecycleRequest::start:
+            // An OS interruption stop has higher priority than startup.
+            if (mPendingDeviceRequest ==
+                    DeviceLifecycleRequest::interruptionStop ||
+                mImmediateDeviceRequestInFlight ==
+                    DeviceLifecycleRequest::interruptionStop)
+            {
+                return true;
+            }
+
+            // Playback startup supersedes all older idle work.
+            mIdleStopRequestedAfterImmediateOperation = false;
+            mPendingDeviceRequest = DeviceLifecycleRequest::start;
+            ++mDeviceRequestGeneration;
+            shouldNotify = true;
+            break;
+
+        case DeviceLifecycleRequest::interruptionStop:
+            // Highest-priority operation.
+            mIdleStopRequestedAfterImmediateOperation = false;
+            mPendingDeviceRequest =
+                DeviceLifecycleRequest::interruptionStop;
+            ++mDeviceRequestGeneration;
+            shouldNotify = true;
+            break;
+
+        case DeviceLifecycleRequest::none:
+            return false;
+        }
     }
-    mPauseCv.notify_one();
+
+    if (shouldNotify)
+        mPauseCv.notify_one();
+
     return true;
 #endif
 }
@@ -1189,6 +1251,8 @@ void Player::startPauseEngineScheduler()
         return;
     mStopPauseThread = false;
     mPendingDeviceRequest = DeviceLifecycleRequest::none;
+    mImmediateDeviceRequestInFlight = DeviceLifecycleRequest::none;
+    mIdleStopRequestedAfterImmediateOperation = false;
     ++mDeviceRequestGeneration;
     mPauseThread = std::thread(&Player::pauseEngineScheduler, this);
     mPauseThreadRunning = true;
@@ -1204,6 +1268,7 @@ void Player::stopPauseEngineScheduler()
             return;
         mStopPauseThread = true;
         mPendingDeviceRequest = DeviceLifecycleRequest::none;
+        mIdleStopRequestedAfterImmediateOperation = false;
         ++mDeviceRequestGeneration;
     }
     mPauseCv.notify_all();
@@ -1213,6 +1278,7 @@ void Player::stopPauseEngineScheduler()
     {
         std::lock_guard<std::mutex> lock(mPauseMutex);
         mPauseThreadRunning = false;
+        mImmediateDeviceRequestInFlight = DeviceLifecycleRequest::none;
     }
 #endif
 }
@@ -1233,15 +1299,18 @@ void Player::pauseEngineScheduler()
         const uint64_t requestGeneration = mDeviceRequestGeneration;
         mPendingDeviceRequest = DeviceLifecycleRequest::none;
 
-        // Starts and interruption stops are performed immediately. Any newer
-        // request arriving while the backend call is in progress receives a
-        // newer generation and is handled on the next iteration.
+        // Starts and interruption stops are performed immediately. Mark the
+        // operation in flight before releasing mPauseMutex so idle requests
+        // cannot replace or invalidate it while the backend call is running.
         if (request == DeviceLifecycleRequest::start ||
             request == DeviceLifecycleRequest::interruptionStop)
         {
+            mImmediateDeviceRequestInFlight = request;
             lock.unlock();
+
             std::lock_guard<std::mutex> operationLock(
                 mDeviceLifecycleOperationMutex);
+
             if (isDeviceRequestCurrent(requestGeneration))
             {
                 if (request == DeviceLifecycleRequest::start)
@@ -1249,6 +1318,49 @@ void Player::pauseEngineScheduler()
                 else
                     performAudioDeviceStop(true);
             }
+
+            bool shouldNotify = false;
+
+            {
+                std::lock_guard<std::mutex> pauseLock(mPauseMutex);
+
+                mImmediateDeviceRequestInFlight =
+                    DeviceLifecycleRequest::none;
+
+                if (mStopPauseThread)
+                {
+                    mIdleStopRequestedAfterImmediateOperation = false;
+                }
+                else if (mIdleStopRequestedAfterImmediateOperation)
+                {
+                    const bool anotherImmediatePending =
+                        mPendingDeviceRequest ==
+                            DeviceLifecycleRequest::start ||
+                        mPendingDeviceRequest ==
+                            DeviceLifecycleRequest::interruptionStop;
+
+                    if (!anotherImmediatePending)
+                    {
+                        mIdleStopRequestedAfterImmediateOperation = false;
+
+                        if (mPendingDeviceRequest !=
+                            DeviceLifecycleRequest::idleStop)
+                        {
+                            mPendingDeviceRequest =
+                                DeviceLifecycleRequest::idleStop;
+                            ++mDeviceRequestGeneration;
+                        }
+
+                        shouldNotify = true;
+                    }
+                    // Otherwise leave the deferred flag set. It must run
+                    // after the newer immediate operation completes.
+                }
+            }
+
+            if (shouldNotify)
+                mPauseCv.notify_one();
+
             continue;
         }
 

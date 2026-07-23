@@ -68,6 +68,44 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     );
     output.writeln('Failed playback leaves device stopped: OK');
 
+    // An idle-policy update arriving immediately after an unpause must not
+    // replace the required device start. Repeat this while a paused voice is
+    // kept alive so the final idle check cannot legitimately stop the device.
+    final raceHandle = SoLoud.instance.play(
+      waveform,
+      paused: true,
+      looping: true,
+      volume: 0.1,
+    );
+    for (var i = 0; i < 10; i++) {
+      SoLoud.instance.setPause(raceHandle, false);
+      SoLoud.instance.setAudioDeviceIdleTimeout(raceTimeout);
+      state = await _waitForDeviceState(AudioDeviceState.started);
+      assert(
+        state == AudioDeviceState.started &&
+            SoLoud.instance.getIsValidVoiceHandle(raceHandle) &&
+            !SoLoud.instance.getPause(raceHandle),
+        'Start/idle race iteration $i lost active playback: $state',
+      );
+      await Future<void>.delayed(
+        raceTimeout + const Duration(milliseconds: 50),
+      );
+      assert(
+        SoLoud.instance.getAudioDeviceState() == AudioDeviceState.started,
+        'Active voice was stopped by idle policy in iteration $i.',
+      );
+
+      SoLoud.instance.setPause(raceHandle, true);
+      state = await _waitForDeviceState(AudioDeviceState.stopped);
+      assert(
+        state == AudioDeviceState.stopped,
+        'Paused voice did not stop the device in iteration $i: $state',
+      );
+    }
+    await SoLoud.instance.stop(raceHandle);
+    output
+        .writeln('Start followed by idle update preserves playback (10x): OK');
+
     // Explicit prewarming while idle must apply a fresh timeout afterward.
     SoLoud.instance.setAudioDeviceIdleTimeout(raceTimeout);
     await SoLoud.instance.startAudioDevice();
@@ -150,15 +188,23 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     }
     output.writeln('Concurrent start/stop serialization (5x): OK');
 
-    // Drive interruptions through miniaudio's notification callback. Active
-    // voice state must survive begin/end and require recovery on interruption
-    // end.
+    // Queue a start immediately before an interruption. The interruption stop
+    // must win over the pending start, while the active voice remains intact
+    // and recovery still applies on interruption end.
     final handle = SoLoud.instance.play(waveform, looping: true, volume: 0.1);
     state = await _waitForDeviceState(AudioDeviceState.started);
     assert(
       state == AudioDeviceState.started,
       'Playback did not start: $state',
     );
+
+    SoLoud.instance.setPause(handle, true);
+    state = await _waitForDeviceState(AudioDeviceState.stopped);
+    assert(
+      state == AudioDeviceState.stopped,
+      'Could not establish a stopped device before interruption race: $state',
+    );
+    SoLoud.instance.setPause(handle, false);
 
     final beganEvent = SoLoudController()
         .soLoudFFI
@@ -267,20 +313,36 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     );
     output.writeln('Teardown during active lifecycle operation: OK');
 
-    // Repeated fully asynchronous recreation must not leak scheduler threads.
-    for (var i = 0; i < 5; i++) {
+    // Repeated start/deinit races must not deadlock callback teardown or leak
+    // scheduler threads. Keep the timeout finite so each cycle also exercises
+    // the idle lifecycle path before the immediate start request.
+    for (var i = 0; i < 100; i++) {
       await SoLoud.instance.init();
       assert(
         SoLoud.instance.isInitialized,
         'Async cycle $i failed to initialize.',
       );
+
+      final startOperation = _captureError(
+        SoLoud.instance.startAudioDevice(),
+      );
       await SoLoud.instance.deinitAsync().timeout(const Duration(seconds: 5));
+      final startError = await startOperation;
+      assert(
+        startError == null || startError is SoLoudException,
+        'Async cycle $i start failed unexpectedly: $startError',
+      );
       assert(
         !SoLoud.instance.isInitialized,
         'Async cycle $i failed to deinit.',
       );
+      assert(
+        SoLoud.instance.getAudioDeviceState() ==
+            AudioDeviceState.uninitialized,
+        'Async cycle $i left the backend initialized.',
+      );
     }
-    output.writeln('Repeated async init/deinit cycles (5x): OK');
+    output.writeln('Repeated start/deinit races (100x): OK');
   } finally {
     SoLoud.instance.setAudioDeviceIdleTimeout(defaultTimeout);
     await SoLoud.instance.deinitAsync();
