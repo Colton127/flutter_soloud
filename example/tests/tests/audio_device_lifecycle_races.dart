@@ -253,6 +253,20 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
             (event) => event == PlayerStateNotification.interruptionBegan,
           )
           .timeout(const Duration(seconds: 2));
+      final stoppedEvent = SoLoudController()
+          .soLoudFFI
+          .stateChangedEvents
+          .firstWhere(
+            (event) => event == PlayerStateNotification.stopped,
+          )
+          .timeout(const Duration(seconds: 2));
+      final restartedEvent = SoLoudController()
+          .soLoudFFI
+          .stateChangedEvents
+          .firstWhere(
+            (event) => event == PlayerStateNotification.started,
+          )
+          .timeout(const Duration(seconds: 2));
 
       SoLoudController().soLoudFFI.debugTriggerAudioInterruption(began: true);
       await rapidBeganEvent;
@@ -260,9 +274,9 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
       // End immediately; interruptionStop may still be pending or in flight.
       SoLoudController().soLoudFFI.debugTriggerAudioInterruption(began: false);
 
-      final rapidState = await _waitForDeviceState(
-        AudioDeviceState.started,
-      );
+      await stoppedEvent;
+      await restartedEvent;
+      final rapidState = SoLoud.instance.getAudioDeviceState();
       assert(
         rapidState == AudioDeviceState.started,
         'Rapid interruption cycle $i lost the recovery start: $rapidState',

@@ -1217,6 +1217,7 @@ bool Player::requestDeviceLifecycle(DeviceLifecycleRequest request)
                 // The interruption stop retains priority, but the recovery
                 // start must run after it completes if the interruption has
                 // ended.
+                mIdleStopRequestedAfterImmediateOperation = false;
                 mStartRequestedAfterInterruptionStop = true;
                 return true;
             }
@@ -1358,9 +1359,6 @@ void Player::pauseEngineScheduler()
                         // The interruption has ended. Run the recovery start
                         // now that the higher-priority stop has completed.
                         mStartRequestedAfterInterruptionStop = false;
-
-                        // A start supersedes deferred idle work.
-                        mIdleStopRequestedAfterImmediateOperation = false;
                         mPendingDeviceRequest =
                             DeviceLifecycleRequest::start;
                         ++mDeviceRequestGeneration;
