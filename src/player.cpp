@@ -904,26 +904,22 @@ void Player::evaluateAudioDeviceIdle()
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
         mInterruptionActive.load(std::memory_order_acquire))
+    {
         return;
+    }
 #ifdef __EMSCRIPTEN__
     // The mixer invokes the inactive callback only after releasing SoLoud's
     // audio mutex, so this count is safe even for scheduled/natural endings.
-    if (soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
+    if (soloud.getActiveVoiceCount() == 0 &&
+        mIdleTimeoutMs.load(std::memory_order_acquire) >= 0)
         soloud.pause();
 #else
-    {
-        // Serialize the count-and-request decision with start requests. If a
-        // play/unpause is already registered it prevents the idle request; if
-        // it registers immediately after this check, its newer start request
-        // supersedes this one.
-        std::lock_guard<std::mutex> lock(mPauseMutex);
-        if (!mPauseThreadRunning || mStopPauseThread ||
-            soloud.getActiveVoiceCount() != 0)
-            return;
-        mPendingDeviceRequest = DeviceLifecycleRequest::idleStop;
-        ++mDeviceRequestGeneration;
-    }
-    mPauseCv.notify_one();
+    // Do not inspect SoLoud voice state on the FFI caller thread.
+    //
+    // The lifecycle scheduler performs the authoritative active-voice check
+    // after the configured timeout and immediately before stopping the
+    // device.
+    requestDeviceLifecycle(DeviceLifecycleRequest::idleStop);
 #endif
 }
 
@@ -1048,9 +1044,8 @@ void Player::setAudioDeviceIdleTimeout(int64_t timeoutMs)
     }
     else
     {
-        // A finite timeout (including zero) takes effect immediately if the
-        // engine is already idle. The helper makes the count-and-request
-        // decision atomic with respect to a concurrent play/unpause.
+        // Queue an idle-stop request immediately. The scheduler applies the
+        // timeout and performs the authoritative active-voice check.
         evaluateAudioDeviceIdle();
     }
 }

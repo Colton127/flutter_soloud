@@ -432,8 +432,9 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     final int timeoutMs = timeout == null
         ? -1
         : (timeout.inMilliseconds < 0 ? 0 : timeout.inMilliseconds);
-    // Cheap native call (atomic store; any device start is posted to the
-    // background scheduler thread), so call it directly on the UI isolate.
+    // The native call stores the policy and posts any required lifecycle
+    // request. It does not start/stop the device or inspect SoLoud voice state
+    // inline.
     _setAudioDeviceIdleTimeout(timeoutMs);
   }
 
