@@ -747,6 +747,12 @@ private:
   DeviceLifecycleRequest mImmediateDeviceRequestInFlight =
       DeviceLifecycleRequest::none;
   bool mIdleStopRequestedAfterImmediateOperation = false;
+  // Protected by mPauseMutex.
+  //
+  // Records that playback recovery requested a start while an interruption
+  // stop was pending or in flight. The start must run after the interruption
+  // stop completes, provided the interruption has ended.
+  bool mStartRequestedAfterInterruptionStop = false;
   bool mStopPauseThread = false;
   // False before initialization is complete and from the first step of
   // shutdown onward. Lifecycle entry points use this to reject work that

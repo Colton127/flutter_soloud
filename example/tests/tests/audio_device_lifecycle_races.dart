@@ -242,6 +242,39 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     );
     output.writeln('Active interruption recovery preserves voice state: OK');
 
+    // End an interruption immediately after its begin notification. The
+    // recovery start may arrive while interruptionStop is still pending or in
+    // flight and must not be discarded.
+    for (var i = 0; i < 20; i++) {
+      final rapidBeganEvent = SoLoudController()
+          .soLoudFFI
+          .stateChangedEvents
+          .firstWhere(
+            (event) => event == PlayerStateNotification.interruptionBegan,
+          )
+          .timeout(const Duration(seconds: 2));
+
+      SoLoudController().soLoudFFI.debugTriggerAudioInterruption(began: true);
+      await rapidBeganEvent;
+
+      // End immediately; interruptionStop may still be pending or in flight.
+      SoLoudController().soLoudFFI.debugTriggerAudioInterruption(began: false);
+
+      final rapidState = await _waitForDeviceState(
+        AudioDeviceState.started,
+      );
+      assert(
+        rapidState == AudioDeviceState.started,
+        'Rapid interruption cycle $i lost the recovery start: $rapidState',
+      );
+      assert(
+        SoLoud.instance.getIsValidVoiceHandle(handle) &&
+            !SoLoud.instance.getPause(handle),
+        'Rapid interruption cycle $i changed the active voice.',
+      );
+    }
+    output.writeln('Rapid interruption recovery (20x): OK');
+
     // Idle finite policy remains stopped after interruption recovery.
     SoLoud.instance.setPause(handle, true);
     SoLoud.instance.setAudioDeviceIdleTimeout(Duration.zero);
@@ -337,8 +370,7 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
         'Async cycle $i failed to deinit.',
       );
       assert(
-        SoLoud.instance.getAudioDeviceState() ==
-            AudioDeviceState.uninitialized,
+        SoLoud.instance.getAudioDeviceState() == AudioDeviceState.uninitialized,
         'Async cycle $i left the backend initialized.',
       );
     }
