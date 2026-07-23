@@ -5,6 +5,7 @@
 #include "soloud/include/soloud_internal.h"
 #include "soloud_thread.h"
 #include "waveform/waveform.h"
+#include "dart_callback_lifecycle.h"
 
 #ifndef SOLOUD_COMMON_H
 #include "soloud_common.h"
@@ -18,7 +19,10 @@
 #include <map>
 #include <memory.h>
 #include <memory>
+#include <mutex>
 #include <stdio.h>
+
+std::mutex dart_callback_invocation_mutex;
 
 #ifdef __cplusplus
 extern "C" {
@@ -133,20 +137,22 @@ FFI_PLUGIN_EXPORT void voiceEndedCallback(unsigned int *handle) {
   sendToWorker("voiceEndedCallback", *handle);
 #endif
 
-  // The `dartVoiceEndedCallback` is not set on Web.
-  // Snapshot the atomic pointer so it can't be nulled between check and call.
-  auto voiceEndedCb = dartVoiceEndedCallback.load();
-  if (voiceEndedCb == nullptr)
-    return;
   // So, if the handle was already found before (henche the handle is not
   // found), the callback to Dart has been already called. If this is the fist
   // time this handle is found, the callback to Dart must be called.
   if (!isHandleFound)
     return;
+
+#ifndef __EMSCRIPTEN__
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  auto voiceEndedCb = dartVoiceEndedCallback.load(std::memory_order_acquire);
+  if (voiceEndedCb == nullptr)
+    return;
   // [n] pointer must be deleted in Dart.
   unsigned int *n = (unsigned int *)malloc(sizeof(unsigned int));
   *n = *handle;
   voiceEndedCb(n);
+#endif
 }
 
 /// Requests a device-idle evaluation after SoLoud stops or pauses a voice.
@@ -159,7 +165,8 @@ FFI_PLUGIN_EXPORT void voiceInactiveCallback() {
     /// The callback to monitor when a file is loaded.
     void fileLoadedCallback(enum PlayerErrors error, char *completeFileName, unsigned int *hash, uint64_t counter)
     {
-        auto fileLoadedCb = dartFileLoadedCallback.load();
+        std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+        auto fileLoadedCb = dartFileLoadedCallback.load(std::memory_order_acquire);
         if (fileLoadedCb == nullptr)
             return;
         // [e,name,n] pointers must be deleted on Dart.
@@ -174,7 +181,8 @@ FFI_PLUGIN_EXPORT void voiceInactiveCallback() {
     }
 
 void stateChangedCallback(unsigned int state) {
-  auto stateChangedCb = dartStateChangedCallback.load();
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  auto stateChangedCb = dartStateChangedCallback.load(std::memory_order_acquire);
   if (stateChangedCb == nullptr) return;
   PlayerStateEvents *type = (PlayerStateEvents *)malloc(sizeof(PlayerStateEvents));
   *type = (PlayerStateEvents)state;
@@ -187,18 +195,20 @@ FFI_PLUGIN_EXPORT void
 setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
                      dartFileLoadedCallback_t file_loaded_callback,
                      dartStateChangedCallback_t state_changed_callback) {
-  dartVoiceEndedCallback.store(voice_ended_callback);
-  dartFileLoadedCallback.store(file_loaded_callback);
-  dartStateChangedCallback.store(state_changed_callback);
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  dartVoiceEndedCallback.store(voice_ended_callback, std::memory_order_release);
+  dartFileLoadedCallback.store(file_loaded_callback, std::memory_order_release);
+  dartStateChangedCallback.store(state_changed_callback, std::memory_order_release);
 }
 
 FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
   std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
 
-  dartVoiceEndedCallback.store(nullptr);
-  dartFileLoadedCallback.store(nullptr);
-  dartStateChangedCallback.store(nullptr);
+  dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
+  dartFileLoadedCallback.store(nullptr, std::memory_order_release);
+  dartStateChangedCallback.store(nullptr, std::memory_order_release);
 
   if (player.get() != nullptr) {
     player.get()->clearDartCallbackRegistrations();
@@ -406,9 +416,10 @@ FFI_PLUGIN_EXPORT void dispose() {
   // Make every native-to-Dart bridge inert before Player::dispose() stops
   // voices and destroys sources. Dart keeps its NativeCallables alive until
   // this off-isolate native teardown has completed.
-  dartVoiceEndedCallback = nullptr;
-  dartFileLoadedCallback = nullptr;
-  dartStateChangedCallback = nullptr;
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
+  dartFileLoadedCallback.store(nullptr, std::memory_order_release);
+  dartStateChangedCallback.store(nullptr, std::memory_order_release);
   if (player.get() == nullptr)
     return;
   player.get()->dispose();
@@ -418,6 +429,16 @@ FFI_PLUGIN_EXPORT void dispose() {
   analyzer.reset();
   analyzer = std::make_unique<Analyzer>(256);
 }
+
+#if defined(__ANDROID__)
+#include <jni.h>
+
+extern "C" JNIEXPORT void JNICALL
+Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeClearDartCallbackRegistrations(
+    JNIEnv *, jclass) {
+  clearDartCallbackRegistrations();
+}
+#endif
 
 FFI_PLUGIN_EXPORT int isInited() {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
