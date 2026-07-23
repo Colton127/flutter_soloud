@@ -201,12 +201,14 @@ public:
   /// @brief Switch pause state for an already loaded sound identified by
   /// [handle].
   /// @param handle the sound handle
-  void pauseSwitch(unsigned int handle);
+  /// @return [noError], [backendNotInited], or [soundHandleNotFound].
+  PlayerErrors pauseSwitch(unsigned int handle);
 
   /// @brief Pause or unpause already loaded sound identified by [handle].
   /// @param handle the sound handle.
   /// @param pause whether this sound should be paused or not.
-  void setPause(unsigned int handle, bool pause);
+  /// @return [noError], [backendNotInited], or [soundHandleNotFound].
+  PlayerErrors setPause(unsigned int handle, bool pause);
 
   /// @brief Schedule a deferred pause of the audio device. If no voices
   /// remain active after a short delay, the engine is paused. Requests are
@@ -316,7 +318,8 @@ public:
 
   /// @brief Stop already loaded sound identified by [handle] and clear it.
   /// @param handle handle of the sound.
-  void stop(unsigned int handle);
+  /// @return [noError], [backendNotInited], or [soundHandleNotFound].
+  PlayerErrors stop(unsigned int handle);
 
   /// @brief Remove the unique [handle] form the list of internal sounds.
   /// @param handle handle of the sound.
@@ -752,6 +755,7 @@ private:
   std::atomic<int64_t> mIdleTimeoutMs;
 
   void pauseEngineScheduler();
+  void applyPauseState(unsigned int handle, bool pause);
   PlayerErrors performAudioDeviceStart();
   PlayerErrors performAudioDeviceStop(bool explicitRequest);
   void invalidatePendingDeviceRequest();

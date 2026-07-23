@@ -851,27 +851,51 @@ void Player::setWaveformSuperwave(unsigned int soundHash, bool superwave)
     static_cast<Basicwave *>(s->sound.get())->setSuperWave(superwave);
 }
 
-void Player::pauseSwitch(unsigned int handle)
-{
-    setPause(handle, !soloud.getPause(handle));
-}
-
-void Player::setPause(unsigned int handle, bool pause)
+void Player::applyPauseState(unsigned int handle, bool pause)
 {
     soloud.setPause(handle, pause);
 
     if (!pause)
     {
-        // Mutate the voice first. Only a handle that is still valid after the
-        // mutation is allowed to request device startup.
-        if (isValidHandle(handle))
-            resumeEngine();
+        // Preserve the current behavior: unpausing queues device startup on
+        // the lifecycle scheduler instead of starting the device inline.
+        resumeEngine();
         return;
     }
 
-    // When pausing, check if there are any remaining active voices. If no
-    // voices are active, the scheduler applies the configured idle timeout.
     evaluateAudioDeviceIdle();
+}
+
+PlayerErrors Player::setPause(unsigned int handle, bool pause)
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    {
+        return PlayerErrors::backendNotInited;
+    }
+
+    if (!isValidHandle(handle))
+        return PlayerErrors::soundHandleNotFound;
+
+    applyPauseState(handle, pause);
+    return PlayerErrors::noError;
+}
+
+PlayerErrors Player::pauseSwitch(unsigned int handle)
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    {
+        return PlayerErrors::backendNotInited;
+    }
+
+    if (!isValidHandle(handle))
+        return PlayerErrors::soundHandleNotFound;
+
+    const bool pause = !soloud.getPause(handle);
+    applyPauseState(handle, pause);
+
+    return PlayerErrors::noError;
 }
 
 void Player::evaluateAudioDeviceIdle()
@@ -1410,13 +1434,21 @@ PlayerErrors Player::play(
     return PlayerErrors::noError;
 }
 
-void Player::stop(unsigned int handle)
+PlayerErrors Player::stop(unsigned int handle)
 {
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    {
+        return PlayerErrors::backendNotInited;
+    }
+
+    if (!isValidHandle(handle))
+        return PlayerErrors::soundHandleNotFound;
+
     soloud.stop(handle);
-    // After stopping, check if there are any remaining active voices.
-    // If no voices are active, pause the audio device to allow the OS
-    // to properly manage the audio session.
     evaluateAudioDeviceIdle();
+
+    return PlayerErrors::noError;
 }
 
 void Player::removeHandle(unsigned int handle)

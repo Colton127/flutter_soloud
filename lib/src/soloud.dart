@@ -1770,7 +1770,12 @@ interface class SoLoud {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
-    _controller.soLoudFFI.pauseSwitch(handle);
+
+    final error = _controller.soLoudFFI.pauseSwitch(handle);
+    if (error != PlayerErrors.noError) {
+      _logPlayerError(error, from: 'pauseSwitch()');
+      throw SoLoudCppException.fromPlayerError(error);
+    }
   }
 
   /// Pause or unpause a currently playing sound identified by [handle].
@@ -1780,7 +1785,16 @@ interface class SoLoud {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
     }
-    _controller.soLoudFFI.setPause(handle, pause ? 1 : 0);
+
+    final error = _controller.soLoudFFI.setPause(
+      handle,
+      pause ? 1 : 0,
+    );
+
+    if (error != PlayerErrors.noError) {
+      _logPlayerError(error, from: 'setPause()');
+      throw SoLoudCppException.fromPlayerError(error);
+    }
   }
 
   /// Gets the pause state of a currently playing sound identified by [handle].
@@ -1862,7 +1876,19 @@ interface class SoLoud {
       );
       completer.complete();
     } else {
-      _controller.soLoudFFI.stop(handle);
+      final error = _controller.soLoudFFI.stop(handle);
+
+      if (error == PlayerErrors.soundHandleNotFound) {
+        // The handle ended between the Dart validity check and native stop.
+        // stop() remains idempotent.
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+      } else if (error != PlayerErrors.noError) {
+        voiceEndedCompleters.remove(handle);
+        _logPlayerError(error, from: 'stop()');
+        throw SoLoudCppException.fromPlayerError(error);
+      }
     }
 
     return completer.future

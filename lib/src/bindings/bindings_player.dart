@@ -330,14 +330,14 @@ abstract class FlutterSoLoud {
   ///
   /// [handle] the sound handle.
   @mustBeOverridden
-  void pauseSwitch(SoundHandle handle);
+  PlayerErrors pauseSwitch(SoundHandle handle);
 
   /// Pause or unpause already loaded sound identified by [handle].
   ///
   /// [handle] the sound handle.
   /// [pause] the new state.
   @mustBeOverridden
-  void setPause(SoundHandle handle, int pause);
+  PlayerErrors setPause(SoundHandle handle, int pause);
 
   /// Gets the pause state.
   ///
@@ -402,7 +402,7 @@ abstract class FlutterSoLoud {
   ///
   /// [handle] the sound handle.
   @mustBeOverridden
-  void stop(SoundHandle handle);
+  PlayerErrors stop(SoundHandle handle);
 
   /// Stop all handles of the already loaded sound identified
   /// by [soundHash] and dispose it.

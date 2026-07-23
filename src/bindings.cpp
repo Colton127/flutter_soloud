@@ -823,22 +823,22 @@ FFI_PLUGIN_EXPORT enum PlayerErrors speechText(char *textToSpeech,
 /// Switch pause state for an already loaded sound identified by [handle]
 ///
 /// [handle] the sound handle
-FFI_PLUGIN_EXPORT void pauseSwitch(unsigned int handle) {
-  if (player.get() == nullptr || !player.get()->isInited() ||
-      !player.get()->isValidHandle(handle))
-    return;
-  player.get()->pauseSwitch(handle);
+FFI_PLUGIN_EXPORT enum PlayerErrors pauseSwitch(unsigned int handle) {
+  if (player.get() == nullptr)
+    return PlayerErrors::backendNotInited;
+
+  return player.get()->pauseSwitch(handle);
 }
 
 /// Pause or unpause already loaded sound identified by [handle]
 ///
 /// [handle] the sound handle
 /// [pause] the sound handle
-FFI_PLUGIN_EXPORT void setPause(unsigned int handle, bool pause) {
-  if (player.get() == nullptr || !player.get()->isInited() ||
-      !player.get()->isValidHandle(handle))
-    return;
-  player.get()->setPause(handle, pause);
+FFI_PLUGIN_EXPORT enum PlayerErrors setPause(unsigned int handle, bool pause) {
+  if (player.get() == nullptr)
+    return PlayerErrors::backendNotInited;
+
+  return player.get()->setPause(handle, pause);
 }
 
 /// Gets the pause state
@@ -920,11 +920,19 @@ FFI_PLUGIN_EXPORT enum PlayerErrors play(unsigned int soundHash, unsigned int bu
 /// Stop already loaded sound identified by [handle] and clear it
 ///
 /// [handle]
-FFI_PLUGIN_EXPORT void stop(unsigned int handle) {
-  if (player.get() == nullptr || !player.get()->isInited())
-    return;
-  player.get()->stop(handle);
+FFI_PLUGIN_EXPORT enum PlayerErrors stop(unsigned int handle) {
+  if (player.get() == nullptr)
+    return PlayerErrors::backendNotInited;
+
+  const PlayerErrors result = player.get()->stop(handle);
+  if (result != PlayerErrors::noError)
+    return result;
+
+  // Preserve the existing fallback. voiceEndedCallback() is idempotent when
+  // SoLoud has already removed the handle and emitted the callback.
   voiceEndedCallback(&handle);
+
+  return PlayerErrors::noError;
 }
 
 /// Stop all handles of the already loaded sound identified by [hash] and
