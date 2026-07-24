@@ -473,13 +473,13 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  void pauseSwitch(SoundHandle handle) {
-    return wasmPauseSwitch(handle.id);
+  PlayerErrors pauseSwitch(SoundHandle handle) {
+    return PlayerErrors.values[wasmPauseSwitch(handle.id)];
   }
 
   @override
-  void setPause(SoundHandle handle, int pause) {
-    return wasmSetPause(handle.id, pause);
+  PlayerErrors setPause(SoundHandle handle, int pause) {
+    return PlayerErrors.values[wasmSetPause(handle.id, pause)];
   }
 
   @override
@@ -536,8 +536,8 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  void stop(SoundHandle handle) {
-    return wasmStop(handle.id);
+  PlayerErrors stop(SoundHandle handle) {
+    return PlayerErrors.values[wasmStop(handle.id)];
   }
 
   @override

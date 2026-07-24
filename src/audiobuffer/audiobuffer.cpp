@@ -11,6 +11,7 @@
 
 #include "../soloud_common.h"
 #include "audiobuffer.h"
+#include "../dart_callback_lifecycle.h"
 #include "metadata_ffi.h"
 
 #ifdef __EMSCRIPTEN__
@@ -457,11 +458,9 @@ void BufferStream::checkBuffering(unsigned int afterAddingBytesCount) {
 }
 
 void BufferStream::callOnMetadataCallback(AudioMetadata &metadata) {
-  auto metadataCb = mOnMetadataCallback.load();
-  if (metadataCb != nullptr) {
-    AudioMetadataFFI ffi = this->convertMetadataToFFI(metadata);
-    // metadata.debug();
 #ifdef __EMSCRIPTEN__
+  AudioMetadataFFI ffi = this->convertMetadataToFFI(metadata);
+    // metadata.debug();
     // Call the Dart callback stored on globalThis, if it exists.
     // The `dartOnMetadataCallback_$hash` function is created in
     // `setBufferStream()` in `bindings_player_web.dart` and it's
@@ -478,15 +477,17 @@ void BufferStream::callOnMetadataCallback(AudioMetadata &metadata) {
         },
         &ffi, mParent->soundHash);
 #else
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  auto metadataCb = mOnMetadataCallback.load(std::memory_order_acquire);
+  if (metadataCb != nullptr) {
+    const AudioMetadataFFI ffi = this->convertMetadataToFFI(metadata);
     metadataCb(ffi);
-#endif
   }
+#endif
 }
 
 void BufferStream::callOnBufferingCallback(bool isBuffering,
                                            unsigned int handle, double time) {
-  auto bufferingCb = mOnBufferingCallback.load();
-  if (bufferingCb != nullptr) {
 #ifdef __EMSCRIPTEN__
     // Call the Dart callback stored on globalThis, if it exists.
     // The `dartOnBufferingCallback_$hash` function is created in
@@ -506,15 +507,17 @@ void BufferStream::callOnBufferingCallback(bool isBuffering,
         },
         isBuffering, handle, time, mParent->soundHash);
 #else
+  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  auto bufferingCb = mOnBufferingCallback.load(std::memory_order_acquire);
+  if (bufferingCb != nullptr)
     bufferingCb(isBuffering, handle, time);
 #endif
-  }
   mIsBuffering = isBuffering;
 }
 
 void BufferStream::clearDartCallbacks() {
-  mOnBufferingCallback.store(nullptr);
-  mOnMetadataCallback.store(nullptr);
+  mOnBufferingCallback.store(nullptr, std::memory_order_release);
+  mOnMetadataCallback.store(nullptr, std::memory_order_release);
 }
 
 BufferingType BufferStream::getBufferingType() { return mBuffer.bufferingType; }

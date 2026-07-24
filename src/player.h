@@ -201,12 +201,14 @@ public:
   /// @brief Switch pause state for an already loaded sound identified by
   /// [handle].
   /// @param handle the sound handle
-  void pauseSwitch(unsigned int handle);
+  /// @return [noError], [backendNotInited], or [soundHandleNotFound].
+  PlayerErrors pauseSwitch(unsigned int handle);
 
   /// @brief Pause or unpause already loaded sound identified by [handle].
   /// @param handle the sound handle.
   /// @param pause whether this sound should be paused or not.
-  void setPause(unsigned int handle, bool pause);
+  /// @return [noError], [backendNotInited], or [soundHandleNotFound].
+  PlayerErrors setPause(unsigned int handle, bool pause);
 
   /// @brief Schedule a deferred pause of the audio device. If no voices
   /// remain active after a short delay, the engine is paused. Requests are
@@ -316,7 +318,8 @@ public:
 
   /// @brief Stop already loaded sound identified by [handle] and clear it.
   /// @param handle handle of the sound.
-  void stop(unsigned int handle);
+  /// @return [noError], [backendNotInited], or [soundHandleNotFound].
+  PlayerErrors stop(unsigned int handle);
 
   /// @brief Remove the unique [handle] form the list of internal sounds.
   /// @param handle handle of the sound.
@@ -726,13 +729,30 @@ private:
     interruptionStop,
     idleStop,
   };
-  // The pending request and generation are protected by mPauseMutex. Each new
-  // request replaces the older intent and advances the generation, allowing a
+  // The pending request and generation are protected by mPauseMutex. Requests
+  // normally replace older intent and advance the generation, allowing a
   // delayed idle stop to detect that it has become stale without maintaining a
-  // command queue.
+  // command queue. Immediate requests have priority over idle work.
   DeviceLifecycleRequest mPendingDeviceRequest =
       DeviceLifecycleRequest::none;
   uint64_t mDeviceRequestGeneration = 0;
+  // Protected by mPauseMutex.
+  //
+  // mImmediateDeviceRequestInFlight identifies a start/interruption operation
+  // that has been dequeued but has not completed.
+  //
+  // mIdleStopRequestedAfterImmediateOperation records idle policy work that
+  // arrived after an immediate operation was already pending or in flight.
+  // Such idle work must not invalidate the immediate operation.
+  DeviceLifecycleRequest mImmediateDeviceRequestInFlight =
+      DeviceLifecycleRequest::none;
+  bool mIdleStopRequestedAfterImmediateOperation = false;
+  // Protected by mPauseMutex.
+  //
+  // Records that playback recovery requested a start while an interruption
+  // stop was pending or in flight. The start must run after the interruption
+  // stop completes, provided the interruption has ended.
+  bool mStartRequestedAfterInterruptionStop = false;
   bool mStopPauseThread = false;
   // False before initialization is complete and from the first step of
   // shutdown onward. Lifecycle entry points use this to reject work that
@@ -752,6 +772,7 @@ private:
   std::atomic<int64_t> mIdleTimeoutMs;
 
   void pauseEngineScheduler();
+  void applyPauseState(unsigned int handle, bool pause);
   PlayerErrors performAudioDeviceStart();
   PlayerErrors performAudioDeviceStop(bool explicitRequest);
   void invalidatePendingDeviceRequest();

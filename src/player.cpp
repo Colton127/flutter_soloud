@@ -196,6 +196,8 @@ void Player::dispose() {
     // Unregister callbacks before stopping voices. In particular, keep stale
     // Dart callback pointers from being used while teardown destroys sources.
     clearDartCallbackRegistrations();
+    setVoiceEndedCallback(nullptr);
+    setStateChangedCallback(nullptr);
     setVoiceInactiveCallback(nullptr);
 
     // Player::dispose() is the sole owner of native sound destruction during
@@ -849,27 +851,51 @@ void Player::setWaveformSuperwave(unsigned int soundHash, bool superwave)
     static_cast<Basicwave *>(s->sound.get())->setSuperWave(superwave);
 }
 
-void Player::pauseSwitch(unsigned int handle)
-{
-    setPause(handle, !soloud.getPause(handle));
-}
-
-void Player::setPause(unsigned int handle, bool pause)
+void Player::applyPauseState(unsigned int handle, bool pause)
 {
     soloud.setPause(handle, pause);
 
     if (!pause)
     {
-        // Mutate the voice first. Only a handle that is still valid after the
-        // mutation is allowed to request device startup.
-        if (isValidHandle(handle))
-            resumeEngine();
+        // Preserve the current behavior: unpausing queues device startup on
+        // the lifecycle scheduler instead of starting the device inline.
+        resumeEngine();
         return;
     }
 
-    // When pausing, check if there are any remaining active voices. If no
-    // voices are active, the scheduler applies the configured idle timeout.
     evaluateAudioDeviceIdle();
+}
+
+PlayerErrors Player::setPause(unsigned int handle, bool pause)
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    {
+        return PlayerErrors::backendNotInited;
+    }
+
+    if (!isValidHandle(handle))
+        return PlayerErrors::soundHandleNotFound;
+
+    applyPauseState(handle, pause);
+    return PlayerErrors::noError;
+}
+
+PlayerErrors Player::pauseSwitch(unsigned int handle)
+{
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    {
+        return PlayerErrors::backendNotInited;
+    }
+
+    if (!isValidHandle(handle))
+        return PlayerErrors::soundHandleNotFound;
+
+    const bool pause = !soloud.getPause(handle);
+    applyPauseState(handle, pause);
+
+    return PlayerErrors::noError;
 }
 
 void Player::evaluateAudioDeviceIdle()
@@ -878,26 +904,22 @@ void Player::evaluateAudioDeviceIdle()
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
         mInterruptionActive.load(std::memory_order_acquire))
+    {
         return;
+    }
 #ifdef __EMSCRIPTEN__
     // The mixer invokes the inactive callback only after releasing SoLoud's
     // audio mutex, so this count is safe even for scheduled/natural endings.
-    if (soloud.getActiveVoiceCount() == 0 && mIdleTimeoutMs.load() >= 0)
+    if (soloud.getActiveVoiceCount() == 0 &&
+        mIdleTimeoutMs.load(std::memory_order_acquire) >= 0)
         soloud.pause();
 #else
-    {
-        // Serialize the count-and-request decision with start requests. If a
-        // play/unpause is already registered it prevents the idle request; if
-        // it registers immediately after this check, its newer start request
-        // supersedes this one.
-        std::lock_guard<std::mutex> lock(mPauseMutex);
-        if (!mPauseThreadRunning || mStopPauseThread ||
-            soloud.getActiveVoiceCount() != 0)
-            return;
-        mPendingDeviceRequest = DeviceLifecycleRequest::idleStop;
-        ++mDeviceRequestGeneration;
-    }
-    mPauseCv.notify_one();
+    // Do not inspect SoLoud voice state on the FFI caller thread.
+    //
+    // The lifecycle scheduler performs the authoritative active-voice check
+    // after the configured timeout and immediately before stopping the
+    // device.
+    requestDeviceLifecycle(DeviceLifecycleRequest::idleStop);
 #endif
 }
 
@@ -1022,9 +1044,8 @@ void Player::setAudioDeviceIdleTimeout(int64_t timeoutMs)
     }
     else
     {
-        // A finite timeout (including zero) takes effect immediately if the
-        // engine is already idle. The helper makes the count-and-request
-        // decision atomic with respect to a concurrent play/unpause.
+        // Queue an idle-stop request immediately. The scheduler applies the
+        // timeout and performs the authoritative active-voice check.
         evaluateAudioDeviceIdle();
     }
 }
@@ -1068,6 +1089,8 @@ void Player::invalidatePendingDeviceRequest()
     {
         std::lock_guard<std::mutex> lock(mPauseMutex);
         mPendingDeviceRequest = DeviceLifecycleRequest::none;
+        mIdleStopRequestedAfterImmediateOperation = false;
+        mStartRequestedAfterInterruptionStop = false;
         ++mDeviceRequestGeneration;
     }
     mPauseCv.notify_one();
@@ -1148,14 +1171,85 @@ bool Player::requestDeviceLifecycle(DeviceLifecycleRequest request)
     (void)request;
     return false;
 #else
+    bool shouldNotify = false;
+
     {
         std::lock_guard<std::mutex> lock(mPauseMutex);
+
         if (!mPauseThreadRunning || mStopPauseThread)
             return false;
-        mPendingDeviceRequest = request;
-        ++mDeviceRequestGeneration;
+
+        const bool immediatePending =
+            mPendingDeviceRequest == DeviceLifecycleRequest::start ||
+            mPendingDeviceRequest ==
+                DeviceLifecycleRequest::interruptionStop;
+
+        const bool immediateInFlight =
+            mImmediateDeviceRequestInFlight == DeviceLifecycleRequest::start ||
+            mImmediateDeviceRequestInFlight ==
+                DeviceLifecycleRequest::interruptionStop;
+
+        switch (request)
+        {
+        case DeviceLifecycleRequest::idleStop:
+            if (immediatePending || immediateInFlight)
+            {
+                // Do not replace the immediate operation or advance the
+                // generation that validates it. Run a fresh idle timeout
+                // after the immediate operation completes.
+                mIdleStopRequestedAfterImmediateOperation = true;
+                return true;
+            }
+
+            // A newer idle request restarts an existing idle deadline.
+            mPendingDeviceRequest = DeviceLifecycleRequest::idleStop;
+            ++mDeviceRequestGeneration;
+            shouldNotify = true;
+            break;
+
+        case DeviceLifecycleRequest::start:
+            // An OS interruption stop has higher priority than startup.
+            if (mPendingDeviceRequest ==
+                    DeviceLifecycleRequest::interruptionStop ||
+                mImmediateDeviceRequestInFlight ==
+                    DeviceLifecycleRequest::interruptionStop)
+            {
+                // The interruption stop retains priority, but the recovery
+                // start must run after it completes if the interruption has
+                // ended.
+                mIdleStopRequestedAfterImmediateOperation = false;
+                mStartRequestedAfterInterruptionStop = true;
+                return true;
+            }
+
+            // Playback startup supersedes all older idle work.
+            mStartRequestedAfterInterruptionStop = false;
+            mIdleStopRequestedAfterImmediateOperation = false;
+            mPendingDeviceRequest = DeviceLifecycleRequest::start;
+            ++mDeviceRequestGeneration;
+            shouldNotify = true;
+            break;
+
+        case DeviceLifecycleRequest::interruptionStop:
+            // Highest-priority operation.
+            // A new interruption supersedes any recovery start from an older
+            // interruption cycle.
+            mStartRequestedAfterInterruptionStop = false;
+            mIdleStopRequestedAfterImmediateOperation = false;
+            mPendingDeviceRequest =
+                DeviceLifecycleRequest::interruptionStop;
+            ++mDeviceRequestGeneration;
+            shouldNotify = true;
+            break;
+
+        case DeviceLifecycleRequest::none:
+            return false;
+        }
     }
-    mPauseCv.notify_one();
+
+    if (shouldNotify)
+        mPauseCv.notify_one();
+
     return true;
 #endif
 }
@@ -1168,6 +1262,9 @@ void Player::startPauseEngineScheduler()
         return;
     mStopPauseThread = false;
     mPendingDeviceRequest = DeviceLifecycleRequest::none;
+    mImmediateDeviceRequestInFlight = DeviceLifecycleRequest::none;
+    mIdleStopRequestedAfterImmediateOperation = false;
+    mStartRequestedAfterInterruptionStop = false;
     ++mDeviceRequestGeneration;
     mPauseThread = std::thread(&Player::pauseEngineScheduler, this);
     mPauseThreadRunning = true;
@@ -1183,6 +1280,8 @@ void Player::stopPauseEngineScheduler()
             return;
         mStopPauseThread = true;
         mPendingDeviceRequest = DeviceLifecycleRequest::none;
+        mIdleStopRequestedAfterImmediateOperation = false;
+        mStartRequestedAfterInterruptionStop = false;
         ++mDeviceRequestGeneration;
     }
     mPauseCv.notify_all();
@@ -1192,6 +1291,7 @@ void Player::stopPauseEngineScheduler()
     {
         std::lock_guard<std::mutex> lock(mPauseMutex);
         mPauseThreadRunning = false;
+        mImmediateDeviceRequestInFlight = DeviceLifecycleRequest::none;
     }
 #endif
 }
@@ -1212,15 +1312,18 @@ void Player::pauseEngineScheduler()
         const uint64_t requestGeneration = mDeviceRequestGeneration;
         mPendingDeviceRequest = DeviceLifecycleRequest::none;
 
-        // Starts and interruption stops are performed immediately. Any newer
-        // request arriving while the backend call is in progress receives a
-        // newer generation and is handled on the next iteration.
+        // Starts and interruption stops are performed immediately. Mark the
+        // operation in flight before releasing mPauseMutex so idle requests
+        // cannot replace or invalidate it while the backend call is running.
         if (request == DeviceLifecycleRequest::start ||
             request == DeviceLifecycleRequest::interruptionStop)
         {
+            mImmediateDeviceRequestInFlight = request;
             lock.unlock();
+
             std::lock_guard<std::mutex> operationLock(
                 mDeviceLifecycleOperationMutex);
+
             if (isDeviceRequestCurrent(requestGeneration))
             {
                 if (request == DeviceLifecycleRequest::start)
@@ -1228,6 +1331,70 @@ void Player::pauseEngineScheduler()
                 else
                     performAudioDeviceStop(true);
             }
+
+            bool shouldNotify = false;
+
+            {
+                std::lock_guard<std::mutex> pauseLock(mPauseMutex);
+
+                mImmediateDeviceRequestInFlight =
+                    DeviceLifecycleRequest::none;
+
+                if (mStopPauseThread)
+                {
+                    mStartRequestedAfterInterruptionStop = false;
+                    mIdleStopRequestedAfterImmediateOperation = false;
+                }
+                else
+                {
+                    const bool interruptionStopPending =
+                        mPendingDeviceRequest ==
+                        DeviceLifecycleRequest::interruptionStop;
+
+                    if (request == DeviceLifecycleRequest::interruptionStop &&
+                        mStartRequestedAfterInterruptionStop &&
+                        !mInterruptionActive.load(std::memory_order_acquire) &&
+                        !interruptionStopPending)
+                    {
+                        // The interruption has ended. Run the recovery start
+                        // now that the higher-priority stop has completed.
+                        mStartRequestedAfterInterruptionStop = false;
+                        mPendingDeviceRequest =
+                            DeviceLifecycleRequest::start;
+                        ++mDeviceRequestGeneration;
+                        shouldNotify = true;
+                    }
+                    else if (mIdleStopRequestedAfterImmediateOperation)
+                    {
+                        const bool anotherImmediatePending =
+                            mPendingDeviceRequest ==
+                                DeviceLifecycleRequest::start ||
+                            mPendingDeviceRequest ==
+                                DeviceLifecycleRequest::interruptionStop;
+
+                        if (!anotherImmediatePending)
+                        {
+                            mIdleStopRequestedAfterImmediateOperation = false;
+
+                            if (mPendingDeviceRequest !=
+                                DeviceLifecycleRequest::idleStop)
+                            {
+                                mPendingDeviceRequest =
+                                    DeviceLifecycleRequest::idleStop;
+                                ++mDeviceRequestGeneration;
+                            }
+
+                            shouldNotify = true;
+                        }
+                        // Otherwise leave the deferred flag set. It must run
+                        // after the newer immediate operation completes.
+                    }
+                }
+            }
+
+            if (shouldNotify)
+                mPauseCv.notify_one();
+
             continue;
         }
 
@@ -1408,13 +1575,21 @@ PlayerErrors Player::play(
     return PlayerErrors::noError;
 }
 
-void Player::stop(unsigned int handle)
+PlayerErrors Player::stop(unsigned int handle)
 {
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+    {
+        return PlayerErrors::backendNotInited;
+    }
+
+    if (!isValidHandle(handle))
+        return PlayerErrors::soundHandleNotFound;
+
     soloud.stop(handle);
-    // After stopping, check if there are any remaining active voices.
-    // If no voices are active, pause the audio device to allow the OS
-    // to properly manage the audio session.
     evaluateAudioDeviceIdle();
+
+    return PlayerErrors::noError;
 }
 
 void Player::removeHandle(unsigned int handle)
@@ -1573,11 +1748,6 @@ void Player::disposeAllSound()
 
 void Player::clearDartCallbackRegistrations()
 {
-    // The voice-inactive callback is native lifecycle support, not a Dart
-    // callback, and must remain registered across a Dart hot restart.
-    setVoiceEndedCallback(nullptr);
-    setStateChangedCallback(nullptr);
-
     std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
     for (auto &sound : sounds)
     {
