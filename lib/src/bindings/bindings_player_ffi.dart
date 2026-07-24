@@ -246,9 +246,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   void disposeNativeCallables() {
-    // Native clearing is a synchronous barrier. It returns only after any
-    // callback trampoline invocation already in progress has completed.
-    clearDartCallbackRegistrations();
     _disposeAllBufferStreamCallbacks();
     nativeVoiceEndedCallable?.close();
     nativeVoiceEndedCallable = null;
