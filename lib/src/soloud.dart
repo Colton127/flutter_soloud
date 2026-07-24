@@ -630,11 +630,9 @@ interface class SoLoud {
   void deinit() {
     _log.finest('deinit() called');
     _predeinit();
-    try {
-      _controller.soLoudFFI.deinit();
-    } finally {
-      _postdeinit();
-    }
+
+    _controller.soLoudFFI.deinit();
+    _postdeinit();
   }
 
   /// Like [deinit], but runs the blocking native teardown (audio device
@@ -664,11 +662,8 @@ interface class SoLoud {
   }
 
   Future<void> _deinitNativeAsync() async {
-    try {
-      await _controller.soLoudFFI.deinitAsync();
-    } finally {
-      _postdeinit();
-    }
+    await _controller.soLoudFFI.deinitAsync();
+    _postdeinit();
   }
 
   /// Marks the Dart side unavailable before native teardown begins.
@@ -1786,10 +1781,7 @@ interface class SoLoud {
       throw const SoLoudNotInitializedException();
     }
 
-    final error = _controller.soLoudFFI.setPause(
-      handle,
-      pause ? 1 : 0,
-    );
+    final error = _controller.soLoudFFI.setPause(handle, pause ? 1 : 0);
 
     if (error != PlayerErrors.noError) {
       _logPlayerError(error, from: 'setPause()');
