@@ -15,6 +15,10 @@
 #include <emscripten/emscripten.h>
 #endif
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
+
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -466,8 +470,6 @@ FFI_PLUGIN_EXPORT void dispose() {
 }
 
 #if defined(__ANDROID__)
-#include <jni.h>
-
 extern "C" JNIEXPORT jboolean JNICALL
 Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeClearDartCallbackRegistrationsForEngine(
     JNIEnv *, jclass, jlong engine_id) {
