@@ -82,7 +82,9 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
       SoLoud.instance.setAudioDeviceIdleTimeout(raceTimeout);
       state = await _waitForDeviceState(AudioDeviceState.started);
       assert(
-        state == AudioDeviceState.started && SoLoud.instance.getIsValidVoiceHandle(raceHandle) && !SoLoud.instance.getPause(raceHandle),
+        state == AudioDeviceState.started &&
+            SoLoud.instance.getIsValidVoiceHandle(raceHandle) &&
+            !SoLoud.instance.getPause(raceHandle),
         'Start/idle race iteration $i lost active playback: $state',
       );
       await Future<void>.delayed(
@@ -101,7 +103,8 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
       );
     }
     await SoLoud.instance.stop(raceHandle);
-    output.writeln('Start followed by idle update preserves playback (10x): OK');
+    output
+        .writeln('Start followed by idle update preserves playback (10x): OK');
 
     // Explicit prewarming while idle must apply a fresh timeout afterward.
     SoLoud.instance.setAudioDeviceIdleTimeout(raceTimeout);
@@ -139,8 +142,10 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     // start Future. The later stop must determine the final state.
     SoLoud.instance.setAudioDeviceIdleTimeout(const Duration(seconds: 5));
     final orderedStart = SoLoud.instance.startAudioDevice();
-    final startObservationDeadline = DateTime.now().add(const Duration(seconds: 1));
-    while (SoLoud.instance.getAudioDeviceState() == AudioDeviceState.stopped && DateTime.now().isBefore(startObservationDeadline)) {
+    final startObservationDeadline =
+        DateTime.now().add(const Duration(seconds: 1));
+    while (SoLoud.instance.getAudioDeviceState() == AudioDeviceState.stopped &&
+        DateTime.now().isBefore(startObservationDeadline)) {
       await Future<void>.delayed(Duration.zero);
     }
     assert(
@@ -169,7 +174,8 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
       );
       final settledState = SoLoud.instance.getAudioDeviceState();
       assert(
-        settledState == AudioDeviceState.started || settledState == AudioDeviceState.stopped,
+        settledState == AudioDeviceState.started ||
+            settledState == AudioDeviceState.stopped,
         'Concurrent start/stop left transitional state: $settledState',
       );
       await SoLoud.instance.startAudioDevice();
@@ -222,7 +228,8 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
       'Interruption did not stop device.',
     );
     assert(
-      SoLoud.instance.getIsValidVoiceHandle(handle) && !SoLoud.instance.getPause(handle),
+      SoLoud.instance.getIsValidVoiceHandle(handle) &&
+          !SoLoud.instance.getPause(handle),
       'Interruption begin mutated or invalidated the active voice.',
     );
 
@@ -282,7 +289,8 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
         'Rapid interruption cycle $i lost the recovery start: $rapidState',
       );
       assert(
-        SoLoud.instance.getIsValidVoiceHandle(handle) && !SoLoud.instance.getPause(handle),
+        SoLoud.instance.getIsValidVoiceHandle(handle) &&
+            !SoLoud.instance.getPause(handle),
         'Rapid interruption cycle $i changed the active voice.',
       );
     }
@@ -345,7 +353,8 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     await _waitForDeviceState(AudioDeviceState.stopped);
     SoLoud.instance.setAudioDeviceIdleTimeout(const Duration(seconds: 5));
     final activeOperation = _captureError(SoLoud.instance.startAudioDevice());
-    final activeTeardown = SoLoud.instance.deinitAsync().timeout(const Duration(seconds: 5));
+    final activeTeardown =
+        SoLoud.instance.deinitAsync().timeout(const Duration(seconds: 5));
     final operationError = await activeOperation;
     await activeTeardown;
     assert(

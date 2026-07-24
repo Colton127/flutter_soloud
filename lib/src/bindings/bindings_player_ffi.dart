@@ -31,9 +31,10 @@ import 'package:meta/meta.dart';
 /// Only [address] (a sendable int) crosses the isolate boundary; the pointer is
 /// reconstructed here and the same process-global device is operated on.
 int _invokeDeviceLifecycle(int address) {
-  final fn = ffi.Pointer<ffi.NativeFunction<ffi.UnsignedInt Function()>>
-      .fromAddress(address)
-      .asFunction<int Function()>();
+  final fn =
+      ffi.Pointer<ffi.NativeFunction<ffi.UnsignedInt Function()>>.fromAddress(
+        address,
+      ).asFunction<int Function()>();
   return fn();
 }
 
@@ -96,9 +97,9 @@ int _invokeInitEngine(
 /// teardown (device uninit) then executes off the UI isolate instead of
 /// stalling it. Only [address] (a sendable int) crosses the isolate boundary.
 void _invokeVoidNative(int address) {
-  ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>>
-      .fromAddress(address)
-      .asFunction<void Function()>()();
+  ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>>.fromAddress(
+    address,
+  ).asFunction<void Function()>()();
 }
 
 typedef DartVoiceEndedCallbackT =
