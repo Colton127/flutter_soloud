@@ -1,4 +1,5 @@
 #### 4.0.13 (20 Jul 2026)
+- fix: Android hot restart now clears stale Dart callback registrations. Hot restart replaces the isolate without detaching plugins, so the registered `NativeCallable`s silently went stale
 - Android: the plugin now does no native work at app startup. Plugin registration and `onAttachedToEngine` are pure Java bookkeeping; the native library is loaded lazily, only when an engine-lifecycle hook actually has to call into it. Previously a static initializer pulled the whole library onto the main thread during app launch even for apps that never played a sound, and a load failure there crashed plugin registration
 - fix: Waveform audio sources do not match engine sample rate #501. Thanks to @Colton127
 - Android now stops the audio device when idle (no active voices) like every other platform, releasing the audioserver `AudioMix` partial wakelock #250; use `setAudioDeviceIdleTimeout()` to keep it running
