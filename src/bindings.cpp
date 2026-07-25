@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <stdio.h>
+#include <thread>
 
 std::mutex dart_callback_invocation_mutex;
 
@@ -38,6 +39,11 @@ constexpr int64_t kNoDartCallbackOwnerEngineId = -1;
 
 // Protected by dart_callback_invocation_mutex.
 int64_t dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+
+// Advances on every prepareEngineInit(). A teardown queued when a FlutterEngine
+// detached captures this and aborts if a replacement engine initialized while
+// the worker was waiting, so a late teardown can never kill a live engine.
+std::atomic<uint64_t> engineInitGeneration{0};
 }
 
 #ifdef __cplusplus
@@ -316,6 +322,9 @@ FFI_PLUGIN_EXPORT bool areXiphLibsAvailable() {
 /// Returns [PlayerErrors.noError] if success.
 FFI_PLUGIN_EXPORT void prepareEngineInit() {
   engine_shutdown_requested.store(false, std::memory_order_release);
+  // Invalidate any teardown queued by a previous engine's detach so it cannot
+  // dispose the engine this initialization is about to create.
+  engineInitGeneration.fetch_add(1, std::memory_order_acq_rel);
 }
 
 FFI_PLUGIN_EXPORT void requestEngineShutdown() {
@@ -480,13 +489,8 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 /// Must be called when there is no more need of the player or when closing the
 /// app
 ///
-FFI_PLUGIN_EXPORT void dispose() {
-  // Preserve request ordering for asynchronous Dart init/deinit workers.
-  engine_shutdown_requested.store(true, std::memory_order_release);
-
-  std::lock_guard<std::mutex> guard(init_deinit_mutex);
-  std::lock_guard<std::mutex> guard_load(loadMutex);
-
+/// Teardown body. The caller must hold init_deinit_mutex and loadMutex.
+static void disposeLocked() {
   // Wait for any Dart callback currently executing, then make every bridge
   // inert. Do not retain the callback mutex while stopping devices, joining
   // threads, destroying sources, or resetting Player.
@@ -507,11 +511,78 @@ FFI_PLUGIN_EXPORT void dispose() {
   analyzer = std::make_unique<Analyzer>(256);
 }
 
+FFI_PLUGIN_EXPORT void dispose() {
+  // Preserve request ordering for asynchronous Dart init/deinit workers.
+  engine_shutdown_requested.store(true, std::memory_order_release);
+
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
+  std::lock_guard<std::mutex> guard_load(loadMutex);
+
+  disposeLocked();
+}
+
+/// Tear the engine down because its owning FlutterEngine is being destroyed
+/// while the process keeps running (the audio_service / add-to-app case).
+///
+/// Without this the native engine stays initialized with a live output device
+/// and a running scheduler after the last Dart code that could drive it is
+/// gone. Returns false when a different engine owns the current registration.
+///
+/// The blocking teardown is handed to a detached worker: this is invoked from
+/// the Android platform thread, which must never wait on a device operation.
+FFI_PLUGIN_EXPORT bool requestEngineTeardownForEngine(int64_t engine_id) {
+  {
+    std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+
+    // An unowned registration is accepted: Dart may already have deinited
+    // cleanly, or this engine never registered callbacks at all. A registration
+    // owned by a *different* engine must be left alone.
+    if (dartCallbackOwnerEngineId != engine_id &&
+        dartCallbackOwnerEngineId != kNoDartCallbackOwnerEngineId)
+      return false;
+
+    clearDartCallbackPointersLocked();
+  }
+
+  // Reject an initialization worker that has not entered native code yet.
+  engine_shutdown_requested.store(true, std::memory_order_release);
+  const uint64_t generation =
+      engineInitGeneration.load(std::memory_order_acquire);
+
+  try {
+    std::thread([generation]() {
+      std::lock_guard<std::mutex> guard(init_deinit_mutex);
+      std::lock_guard<std::mutex> guard_load(loadMutex);
+
+      // A replacement engine initialized while this worker was waiting for the
+      // mutex. Its engine is live and must not be torn down.
+      if (engineInitGeneration.load(std::memory_order_acquire) != generation)
+        return;
+
+      disposeLocked();
+    }).detach();
+  } catch (...) {
+    // Thread creation failed. The bridges are already inert, and the next
+    // init() still recovers by deiniting the stale engine itself.
+    return false;
+  }
+
+  return true;
+}
+
 #if defined(__ANDROID__)
 extern "C" JNIEXPORT jboolean JNICALL
 Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeClearDartCallbackRegistrationsForEngine(
     JNIEnv *, jclass, jlong engine_id) {
   return clearDartCallbackRegistrationsForEngine(static_cast<int64_t>(engine_id))
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeRequestEngineTeardownForEngine(
+    JNIEnv *, jclass, jlong engine_id) {
+  return requestEngineTeardownForEngine(static_cast<int64_t>(engine_id))
              ? JNI_TRUE
              : JNI_FALSE;
 }
