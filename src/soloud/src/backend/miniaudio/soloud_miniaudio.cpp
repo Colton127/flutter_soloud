@@ -85,6 +85,19 @@ namespace SoLoud
     ma_context context;
     std::atomic<bool> gDeviceStopped{true};
 
+    // Monotonic count of frames the device data callback has finished
+    // delivering to the OS. It is the engine's heartbeat: if the device claims
+    // to be started but this stops advancing, the audio callback is no longer
+    // completing -- a wedged mixer, a stranded lock, or a backend that died
+    // without telling anyone.
+    //
+    // Deliberately a process-global atomic rather than a member of Soloud or
+    // Player: reading it must never touch a mutex or a pointer that teardown
+    // can swap, because the whole point is to remain answerable when the engine
+    // is stuck. It intentionally survives deinit()/init() cycles -- only
+    // changes over time are meaningful, never the absolute value.
+    std::atomic<unsigned long long> gRenderedFrames{0};
+
     // Every operation that can initialize, start, stop, uninitialize, or
     // replace gDevice passes through this mutex. It is recursive because some
     // miniaudio backends can deliver notifications inline from an operation.
@@ -261,6 +274,11 @@ namespace SoLoud
         first_call = false;
         SoLoud::Soloud *soloud = (SoLoud::Soloud *)pDevice->pUserData;
         soloud->mix((float *)pOutput, frameCount);
+
+        // Advanced only after mix() returns, so a mixer that blocks or
+        // deadlocks stops the counter instead of appearing to make progress.
+        // This is the engine's liveness signal; see miniaudio_getRenderedFrameCount().
+        gRenderedFrames.fetch_add(frameCount, std::memory_order_relaxed);
     }
 
     static void soloud_miniaudio_deinit(SoLoud::Soloud *aSoloud)
@@ -434,6 +452,14 @@ namespace SoLoud
         if (!gDeviceInitialized.load(std::memory_order_acquire))
             return ma_device_state_uninitialized;
         return (unsigned int)ma_device_get_state(&gDevice);
+    }
+
+    // Lock-free read of the heartbeat. Takes no mutex and dereferences no
+    // pointer that teardown can swap, so it stays answerable even when every
+    // other engine call would block.
+    unsigned long long miniaudio_getRenderedFrameCount()
+    {
+        return gRenderedFrames.load(std::memory_order_relaxed);
     }
 
     result miniaudio_init(SoLoud::Soloud *aSoloud, unsigned int aFlags, unsigned int aSamplerate, unsigned int aBuffer, unsigned int aChannels, void *pPlaybackInfos_id)

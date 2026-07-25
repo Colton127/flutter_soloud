@@ -477,3 +477,29 @@ enum BufferingType {
   /// Release the data in the buffer while playing it.
   released,
 }
+
+/// Whether the audio engine is actually producing audio, as observed from
+/// outside it. Reported by `SoLoud.monitorEngineHealth`.
+///
+/// This is deliberately not derived from `SoLoud.isInitialized` or from any
+/// state the engine reports about itself: a deadlocked engine still says it is
+/// initialized, still returns valid handles, and still reports its device as
+/// started. Health is judged only by whether audio frames are still being
+/// rendered.
+enum AudioEngineHealth {
+  /// Frames are being rendered. Audio is flowing.
+  healthy,
+
+  /// The output device is not running, which is the expected state when
+  /// nothing is playing — after the idle timeout, after `stopAudioDevice`,
+  /// during an OS interruption, or before `init`. Not a fault.
+  idle,
+
+  /// The device reports itself as started but no frames have been rendered for
+  /// the configured threshold.
+  ///
+  /// The engine is wedged or the backend died without reporting it. Playback
+  /// will not recover on its own, and calls into the engine may block
+  /// indefinitely, so prefer tearing down and reinitializing over retrying.
+  stalled,
+}

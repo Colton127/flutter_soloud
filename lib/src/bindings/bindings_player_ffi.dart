@@ -488,6 +488,21 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   late final _getAudioDeviceState = _getAudioDeviceStatePtr
       .asFunction<int Function()>();
 
+  @override
+  int getAudioFramesRendered() {
+    // A relaxed atomic load. Deliberately called directly on the UI isolate:
+    // it must stay answerable when the engine is wedged, which is exactly when
+    // dispatching to a worker would be useless.
+    return _getAudioFramesRendered();
+  }
+
+  late final _getAudioFramesRenderedPtr =
+      _lookup<ffi.NativeFunction<ffi.Uint64 Function()>>(
+        'getAudioFramesRendered',
+      );
+  late final _getAudioFramesRendered = _getAudioFramesRenderedPtr
+      .asFunction<int Function()>();
+
   /// Test-only interruption injection through the native notification path.
   void debugTriggerAudioInterruption({required bool began}) {
     _debugTriggerAudioInterruption(began ? 1 : 0);
