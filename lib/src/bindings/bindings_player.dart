@@ -147,6 +147,14 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   AudioDeviceState getAudioDeviceState();
 
+  /// Monotonic count of audio frames the output device callback has finished
+  /// rendering, or `-1` where no heartbeat is available (web).
+  ///
+  /// Lock-free, so it keeps answering while every other engine call would
+  /// block. Survives deinit()/init(); only its change over time is meaningful.
+  @mustBeOverridden
+  int getAudioFramesRendered();
+
   /// Change the playback device.
   ///
   /// [deviceId] the device ID. -1 for default OS output device.

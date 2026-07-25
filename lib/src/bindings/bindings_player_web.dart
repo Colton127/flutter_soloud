@@ -175,6 +175,15 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     return AudioDeviceState.fromValue(wasmGetAudioDeviceState());
   }
 
+  @override
+  int getAudioFramesRendered() {
+    // No heartbeat on web. The wasm module is a prebuilt asset, so it has no
+    // such export, and the failure this detects — an audio callback wedged
+    // behind a stranded native lock — does not exist in the single-threaded
+    // AudioContext build. `-1` tells callers not to infer a stall from it.
+    return -1;
+  }
+
   /// Test-only no-op. Browser AudioContext interruptions are not driven by
   /// miniaudio notifications.
   void debugTriggerAudioInterruption({required bool began}) {}
