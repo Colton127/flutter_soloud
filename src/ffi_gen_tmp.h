@@ -144,3 +144,8 @@ FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice();
 /// Get the current state of the audio output device. Returns
 /// audioDeviceUninitialized if the engine is not initialized.
 FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState();
+
+/// Monotonic count of audio frames the output device callback has finished
+/// rendering. Lock-free, so it keeps answering while the engine is wedged.
+/// Survives deinit()/init(); only its change over time is meaningful.
+FFI_PLUGIN_EXPORT uint64_t getAudioFramesRendered();

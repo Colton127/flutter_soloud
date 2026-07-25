@@ -462,6 +462,21 @@ FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
   return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
 }
 
+/// Monotonic count of audio frames the output device callback has finished
+/// rendering. The engine's heartbeat.
+///
+/// Like getAudioDeviceState() this takes no lock and touches no pointer that
+/// teardown can swap, so it keeps answering while every other engine call would
+/// block. That is the entire point: a wedged mixer, a stranded audio mutex or a
+/// backend that died silently all show up here as a device reporting
+/// [audioDeviceStarted] whose frame count has stopped advancing.
+///
+/// The counter survives deinit()/init() cycles. Only its change over time is
+/// meaningful; the absolute value is not.
+FFI_PLUGIN_EXPORT uint64_t getAudioFramesRendered() {
+  return (uint64_t)SoLoud::miniaudio_getRenderedFrameCount();
+}
+
 /// Test-only hook that sends an interruption through miniaudio's normal
 /// notification callback. This is intentionally absent from the public API.
 FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began) {

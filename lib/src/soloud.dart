@@ -4,6 +4,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_soloud/src/audio_engine_health_tracker.dart';
 import 'package:flutter_soloud/src/audio_source.dart';
 import 'package:flutter_soloud/src/bindings/bindings_player.dart';
 import 'package:flutter_soloud/src/bindings/native_metadata_ffi.dart'
@@ -610,6 +611,78 @@ interface class SoLoud {
   /// including before the engine is initialized.
   AudioDeviceState getAudioDeviceState() {
     return _controller.soLoudFFI.getAudioDeviceState();
+  }
+
+  /// Monotonic count of audio frames the output device has finished rendering,
+  /// or `-1` on web where no heartbeat is available.
+  ///
+  /// This is the engine's heartbeat. It is a lock-free read that takes no mutex
+  /// and touches nothing teardown can swap, so unlike every other engine call
+  /// it keeps answering even when the engine is wedged — which is precisely
+  /// when you need an answer.
+  ///
+  /// Only the change over time is meaningful. The counter survives
+  /// [deinit]/[init] cycles and its absolute value means nothing. Most callers
+  /// want [monitorEngineHealth] rather than this; use it directly for
+  /// telemetry, or to attach a frame count to a crash report.
+  int getAudioFramesRendered() {
+    return _controller.soLoudFFI.getAudioFramesRendered();
+  }
+
+  /// Watches whether the engine is actually producing audio, and emits
+  /// [AudioEngineHealth] whenever that changes.
+  ///
+  /// Every other way of asking "is the engine alive?" lies when it matters.
+  /// [isInitialized] stays `true` for a deadlocked engine, [play] keeps
+  /// returning valid handles, and [getAudioDeviceState] keeps reporting
+  /// [AudioDeviceState.started] — while no audio is produced and the next
+  /// synchronous call may block forever. This compares the device's own claim
+  /// against [getAudioFramesRendered], so a stall is detected from outside the
+  /// engine rather than reported by it.
+  ///
+  /// Emits [AudioEngineHealth.stalled] when the device claims to be started but
+  /// no frames have been rendered for [stallThreshold]. Treat that as
+  /// unrecoverable: tear down and reinitialize rather than retrying, and expect
+  /// calls into the engine to be able to block.
+  ///
+  /// A stopped device is [AudioEngineHealth.idle], never a stall — so the
+  /// automatic idle timeout, [stopAudioDevice], and OS interruptions do not
+  /// raise false alarms.
+  ///
+  /// Each call returns an independent single-subscription stream that starts
+  /// polling when listened to and stops when cancelled. Polling is two atomic
+  /// reads, so [interval] can be short; [stallThreshold] must exceed it.
+  ///
+  /// On web this only ever reports [AudioEngineHealth.healthy] or
+  /// [AudioEngineHealth.idle], since there is no heartbeat to compare against.
+  ///
+  /// ```dart
+  /// _healthSub = SoLoud.instance.monitorEngineHealth().listen((health) {
+  ///   if (health == AudioEngineHealth.stalled) {
+  ///     unawaited(_recoverEngine()); // report, then deinit + init
+  ///   }
+  /// });
+  /// ```
+  Stream<AudioEngineHealth> monitorEngineHealth({
+    Duration interval = const Duration(seconds: 1),
+    Duration stallThreshold = const Duration(seconds: 3),
+  }) {
+    assert(
+      stallThreshold > interval,
+      'stallThreshold ($stallThreshold) must be longer than interval '
+      '($interval), otherwise a single missed poll reads as a stall.',
+    );
+
+    final tracker = AudioEngineHealthTracker(stallThreshold: stallThreshold);
+
+    return Stream<AudioEngineHealth>.periodic(
+      interval,
+      (_) => tracker.evaluate(
+        state: getAudioDeviceState(),
+        framesRendered: getAudioFramesRendered(),
+        now: DateTime.now(),
+      ),
+    ).distinct();
   }
 
   /// Lists all OS available playback devices.
