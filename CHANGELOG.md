@@ -1,4 +1,6 @@
 #### 4.0.13 (20 Jul 2026)
+- Android: destroying a `FlutterEngine` while the process keeps running (foreground-service apps such as `audio_service`) now tears the native engine down instead of leaving an initialized engine and a running output device with no Dart left to drive them. The blocking part runs on a native worker thread, and a teardown is abandoned if a replacement engine initializes first
+- fix: detaching a `FlutterEngine` on Android no longer blocks the platform thread on the engine-teardown mutex, which could ANR if a device operation was in flight
 - fix: Android hot restart now clears stale Dart callback registrations. Hot restart replaces the isolate without detaching plugins, so the registered `NativeCallable`s silently went stale
 - Android: the plugin now does no native work at app startup. Plugin registration and `onAttachedToEngine` are pure Java bookkeeping; the native library is loaded lazily, only when an engine-lifecycle hook actually has to call into it. Previously a static initializer pulled the whole library onto the main thread during app launch even for apps that never played a sound, and a load failure there crashed plugin registration
 - fix: Waveform audio sources do not match engine sample rate #501. Thanks to @Colton127
