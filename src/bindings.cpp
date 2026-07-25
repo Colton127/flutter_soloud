@@ -252,6 +252,34 @@ static void clearDartCallbackRegistrationsLocked() {
   clearPlayerDartCallbackRegistrationsLocked();
 }
 
+/// Clear the per-BufferStream Dart callbacks once init_deinit_mutex becomes
+/// available, without making the caller wait for it.
+///
+/// Used when the caller runs on a thread that must not block (the Android
+/// platform thread) and the mutex is currently held by an unrelated operation
+/// such as loadFile() or initEngine(). The worker captures the initialization
+/// generation and gives up if a new engine has initialized meanwhile, so it can
+/// never erase callbacks that a replacement engine has just registered.
+static void queuePlayerDartCallbackClear() {
+  const uint64_t generation =
+      engineInitGeneration.load(std::memory_order_acquire);
+
+  try {
+    std::thread([generation]() {
+      std::lock_guard<std::mutex> guard(init_deinit_mutex);
+
+      if (engineInitGeneration.load(std::memory_order_acquire) != generation)
+        return;
+
+      clearPlayerDartCallbackRegistrationsLocked();
+    }).detach();
+  } catch (...) {
+    // Best effort. The global bridges are already inert, which is what stops
+    // native code invoking a dead callable; a teardown or a later init()
+    // still clears the BufferStream callbacks.
+  }
+}
+
 FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
   std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
@@ -283,15 +311,26 @@ clearDartCallbackRegistrationsForEngine(int64_t engine_id) {
   }
 
   // The BufferStream callbacks live inside Player, so reaching them needs
-  // init_deinit_mutex. If it is already held, a dispose() is in flight and
-  // Player::dispose() clears them itself, so skipping is safe. Doing this
-  // outside dart_callback_invocation_mutex also keeps the lock order
-  // consistent with disposeSound(), which holds sounds_mutex across
+  // init_deinit_mutex, which owns the `player` unique_ptr that dispose()
+  // resets. Doing this outside dart_callback_invocation_mutex also keeps the
+  // lock order consistent with disposeSound(), which holds sounds_mutex across
   // soloud.stop() and reaches voiceEndedCallback().
-  std::unique_lock<std::mutex> guard_init(init_deinit_mutex, std::try_to_lock);
-  if (guard_init.owns_lock())
-    clearPlayerDartCallbackRegistrationsLocked();
+  //
+  // Take the fast path when the mutex happens to be free, but never treat a
+  // failed try_lock as "someone else will handle it": init_deinit_mutex is held
+  // by loadFile(), loadMem(), initEngine(), changeDevice(), the device
+  // start/stop calls and even isInited() — none of which clear these
+  // callbacks. Hand the work to a worker that can afford to wait instead.
+  {
+    std::unique_lock<std::mutex> guard_init(init_deinit_mutex,
+                                            std::try_to_lock);
+    if (guard_init.owns_lock()) {
+      clearPlayerDartCallbackRegistrationsLocked();
+      return true;
+    }
+  }
 
+  queuePlayerDartCallbackClear();
   return true;
 }
 
