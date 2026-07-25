@@ -171,11 +171,24 @@ namespace SoLoud
 		soloudResultFunction mBackendPauseFunc;
 		soloudResultFunction mBackendResumeFunc;
 
-		// Set the callback to call when a voice is ended/stopped
-		void (*_voiceEndedCallback)(unsigned int*) = nullptr;
+		// Set the callback to call when a voice is ended/stopped.
+		//
+		// stopVoice_internal() runs with the audio mutex held, so it must not
+		// call out to the embedder directly: an embedder callback that crashes,
+		// stalls, or blocks (for example a Dart NativeCallable whose isolate has
+		// gone away) would strand the audio mutex and wedge every later SoLoud
+		// call, including deinit(). Ended voices are queued instead and
+		// dispatched by unlockAudioMutex_internal() once the mutex is released.
+		std::atomic<void (*)(unsigned int*)> _voiceEndedCallback{nullptr};
 		void setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int*)) {
-			_voiceEndedCallback = voiceEndedCallback;
+			_voiceEndedCallback.store(voiceEndedCallback,
+				std::memory_order_release);
 		}
+
+		// Handles of voices that ended while the audio mutex was held, pending
+		// dispatch. Both members are only touched with the audio mutex held.
+		unsigned int mEndedVoiceQueue[VOICE_COUNT];
+		unsigned int mEndedVoiceCount = 0;
 
 		// Called after a mix cycle in which a voice stopped or became paused.
 		// The callback runs after the audio mutex has been released.
@@ -545,6 +558,10 @@ namespace SoLoud
 		void lockAudioMutex_internal();
 		// Unlock audio thread mutex.
 		void unlockAudioMutex_internal();
+		// Slow path of unlockAudioMutex_internal(): drains mEndedVoiceQueue.
+		// Kept out of line so the common (empty queue) path does not carry the
+		// snapshot buffer in its stack frame.
+		void unlockAudioMutexAndDispatchEndedVoices_internal();
 
 		// Max. number of active voices. Busses and tickable inaudibles also count against this.
 		unsigned int mMaxActiveVoices;
