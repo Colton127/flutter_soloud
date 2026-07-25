@@ -119,7 +119,8 @@ abstract class FlutterSoLoud {
   /// possible once idle. A positive [timeout] keeps it running for that long
   /// after going idle. Any play/unpause before the deadline cancels the pending
   /// stop. Defaults to 500 ms. Can be called any time. No effect on web (the
-  /// device is always kept running there).
+  /// device is always kept running there) nor on Android below API 26, whose
+  /// OpenSL ES backend can block indefinitely on a device stop.
   @mustBeOverridden
   void setAudioDeviceIdleTimeout(Duration? timeout);
 

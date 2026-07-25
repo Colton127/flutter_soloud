@@ -2483,8 +2483,13 @@ interface class SoLoud {
   ///
   /// Defaults to 500 ms. Can be called any time, before or after [init] (the
   /// setting persists across [deinit]/[init] cycles). A negative [timeout] is
-  /// treated the same as [Duration.zero]. No effect on Web, where the device
-  /// is always kept running.
+  /// treated the same as [Duration.zero].
+  ///
+  /// No effect on Web, where the device is always kept running, nor on Android
+  /// devices below API 26. Those run on the OpenSL ES backend, whose device
+  /// stop can block indefinitely, so the automatic idle-stop is suppressed
+  /// there and the device keeps rendering silence. Android API 26+ uses AAudio
+  /// and honours the timeout. [stopAudioDevice] is unaffected on all platforms.
   void setAudioDeviceIdleTimeout(Duration? timeout) {
     _controller.soLoudFFI.setAudioDeviceIdleTimeout(timeout);
   }

@@ -219,15 +219,31 @@ setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
   dartCallbackOwnerEngineId = owner_engine_id;
 }
 
-static void clearDartCallbackRegistrationsLocked() {
+/// Make the three process-global Dart bridges inert.
+///
+/// The caller must hold dart_callback_invocation_mutex. This performs no
+/// blocking work, so it stays safe to run on a platform/UI thread.
+static void clearDartCallbackPointersLocked() {
   dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
   dartFileLoadedCallback.store(nullptr, std::memory_order_release);
   dartStateChangedCallback.store(nullptr, std::memory_order_release);
   dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+}
 
+/// Additionally clear the per-BufferStream Dart callbacks.
+///
+/// The caller must hold init_deinit_mutex, which owns the `player` unique_ptr
+/// that dispose() resets. BufferStream::clearDartCallbacks() is a pair of
+/// atomic stores, so it does not need dart_callback_invocation_mutex.
+static void clearPlayerDartCallbackRegistrationsLocked() {
   if (player.get() != nullptr) {
     player.get()->clearDartCallbackRegistrations();
   }
+}
+
+static void clearDartCallbackRegistrationsLocked() {
+  clearDartCallbackPointersLocked();
+  clearPlayerDartCallbackRegistrationsLocked();
 }
 
 FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
@@ -238,16 +254,38 @@ FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
   clearDartCallbackRegistrationsLocked();
 }
 
+/// Invalidate the Dart bridges owned by [engine_id] when its FlutterEngine is
+/// detached. Returns false when a different engine owns the current
+/// registration, so a detaching engine never clears another one's callbacks.
+///
+/// This runs on the Android platform (UI) thread, so unlike
+/// clearDartCallbackRegistrations() it must never wait behind a device
+/// operation. init_deinit_mutex is held for the whole of dispose(), which joins
+/// the lifecycle scheduler and can therefore inherit a stalled
+/// ma_device_stop(); blocking on it here would ANR the app at engine teardown.
+/// Only dart_callback_invocation_mutex is taken unconditionally — it is never
+/// held across a device operation.
 FFI_PLUGIN_EXPORT bool
 clearDartCallbackRegistrationsForEngine(int64_t engine_id) {
-  std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
-  std::lock_guard<std::mutex> guard_load(loadMutex);
-  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  {
+    std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
 
-  if (dartCallbackOwnerEngineId != engine_id)
-    return false;
+    if (dartCallbackOwnerEngineId != engine_id)
+      return false;
 
-  clearDartCallbackRegistrationsLocked();
+    clearDartCallbackPointersLocked();
+  }
+
+  // The BufferStream callbacks live inside Player, so reaching them needs
+  // init_deinit_mutex. If it is already held, a dispose() is in flight and
+  // Player::dispose() clears them itself, so skipping is safe. Doing this
+  // outside dart_callback_invocation_mutex also keeps the lock order
+  // consistent with disposeSound(), which holds sounds_mutex across
+  // soloud.stop() and reaches voiceEndedCallback().
+  std::unique_lock<std::mutex> guard_init(init_deinit_mutex, std::try_to_lock);
+  if (guard_init.owns_lock())
+    clearPlayerDartCallbackRegistrationsLocked();
+
   return true;
 }
 
@@ -338,7 +376,9 @@ FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed) {
 /// was stopped. [timeoutMs] == 0 stops the device as soon as possible once
 /// idle. [timeoutMs] > 0 keeps it running for that many milliseconds after
 /// going idle. Any play/unpause before the deadline cancels the pending stop.
-/// The default is 500. Can be called any time.
+/// The default is 500. Can be called any time. The automatic idle-stop is
+/// suppressed on Android's OpenSL ES backend (API < 26), whose device stop can
+/// block indefinitely; see miniaudio_idleStopWouldBlockIndefinitely().
 FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs) {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() != nullptr)
