@@ -22,11 +22,18 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin;
  */
 public final class FlutterSoloudPlugin implements FlutterPlugin {
     /**
-     * Guarded by the class monitor. The library is loaded on first attach
-     * rather than from a static initializer: a static block would force the
-     * whole native library to load on the main thread at app start even for
-     * apps that never play audio, and would turn a load failure into an
-     * unrecoverable plugin-registration crash.
+     * Guarded by the class monitor.
+     *
+     * <p>The native library is loaded lazily, at the first point one of the
+     * hooks below actually needs to call into it -- never from a static
+     * initializer and never from {@link #onAttachedToEngine}. Both of those run
+     * at engine startup (GeneratedPluginRegistrant instantiates and attaches
+     * every plugin), which would drag the whole multi-megabyte library onto the
+     * main thread during app launch even for an app that never plays a sound.
+     *
+     * <p>By the time a hook fires, an app that uses SoLoud has already loaded
+     * the same library from Dart via {@code DynamicLibrary.open}, so
+     * {@code System.loadLibrary} is a refcount bump rather than a real load.
      */
     private static boolean nativeLibraryLoadAttempted = false;
     private static boolean nativeLibraryLoaded = false;
@@ -68,8 +75,11 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
     public void onAttachedToEngine(
         @NonNull FlutterPluginBinding binding
     ) {
-        ensureNativeLibraryLoaded();
-
+        // Deliberately does no native work. This runs during app launch for
+        // every app that depends on the plugin, whether or not it ever uses
+        // SoLoud, so it must stay pure Java bookkeeping: read the engine id and
+        // register a listener. Nothing here loads the native library, opens a
+        // device, or starts a thread.
         final FlutterEngine engine = binding.getFlutterEngine();
         flutterEngine = engine;
         engineId = engine.getEngineId();
@@ -118,7 +128,7 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
 
     private void clearDartCallbackRegistrations() {
         final Long id = engineId;
-        if (id == null || !nativeLibraryLoaded) {
+        if (id == null || !ensureNativeLibraryLoaded()) {
             return;
         }
         nativeClearDartCallbackRegistrationsForEngine(id);
@@ -132,10 +142,14 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
      */
     private void requestEngineTeardown() {
         final Long id = engineId;
-        if (id == null || teardownRequested || !nativeLibraryLoaded) {
+        if (id == null || teardownRequested) {
             return;
         }
         teardownRequested = true;
+
+        if (!ensureNativeLibraryLoaded()) {
+            return;
+        }
         nativeRequestEngineTeardownForEngine(id);
     }
 }
