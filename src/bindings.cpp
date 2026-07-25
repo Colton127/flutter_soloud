@@ -376,9 +376,7 @@ FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed) {
 /// was stopped. [timeoutMs] == 0 stops the device as soon as possible once
 /// idle. [timeoutMs] > 0 keeps it running for that many milliseconds after
 /// going idle. Any play/unpause before the deadline cancels the pending stop.
-/// The default is 500. Can be called any time. The automatic idle-stop is
-/// suppressed on Android's OpenSL ES backend (API < 26), whose device stop can
-/// block indefinitely; see miniaudio_idleStopWouldBlockIndefinitely().
+/// The default is 500. Can be called any time.
 FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs) {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   if (player.get() != nullptr)

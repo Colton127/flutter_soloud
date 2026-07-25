@@ -41242,16 +41242,71 @@ static ma_result ma_device_drain__opensl(ma_device* pDevice, ma_device_type devi
         pDevice->opensl.isDrainingPlayback = MA_TRUE;
     }
 
-    for (;;) {
-        SLAndroidSimpleBufferQueueState state;
+    /*
+    ###### flutter_soloud local patch (miniaudio 0.11.25) ######
 
-        MA_OPENSL_BUFFERQUEUE(pBufferQueue)->GetState(pBufferQueue, &state);
-        if (state.count == 0) {
-            break;
+    Upstream loops here until the buffer queue reports empty, with no timeout
+    and no iteration cap. If the OpenSL callback thread stops servicing the
+    queue -- audioserver hiccup, route change, device disconnect -- `state.count`
+    never reaches zero and ma_device_stop() never returns. That is the hang
+    behind #333, and flutter_soloud calls ma_device_stop() on every idle timeout
+    to release the audioserver AudioMix partial wakelock, so it must not be able
+    to hang. miniaudio itself disabled the equivalent stop inside
+    ma_device_uninit() for the same reason (see its "can result in a deadlock"
+    comment there).
+
+    Bound the wait instead. The queue can only legitimately hold `periods`
+    buffers of `periodSizeInFrames`, so allow twice that duration (clamped to a
+    sane floor/ceiling) and then give up. Bailing out is safe: both callers in
+    ma_device_stop__opensl() immediately follow this with
+    SetPlayState(SL_PLAYSTATE_STOPPED) and Clear() on the same queue, so the
+    worst case is discarding a few milliseconds of tail audio that Clear() was
+    going to discard anyway.
+
+    Keep this patch when updating miniaudio.h -- grep for "flutter_soloud local
+    patch".
+    */
+    {
+        ma_uint32 periodSizeInFrames;
+        ma_uint32 periods;
+        ma_uint32 sampleRate;
+        ma_uint32 maxWaitMs;
+        ma_uint32 waitedMs = 0;
+
+        if (pDevice->type == ma_device_type_capture) {
+            periodSizeInFrames = pDevice->capture.internalPeriodSizeInFrames;
+            periods            = pDevice->capture.internalPeriods;
+            sampleRate         = pDevice->capture.internalSampleRate;
+        } else {
+            periodSizeInFrames = pDevice->playback.internalPeriodSizeInFrames;
+            periods            = pDevice->playback.internalPeriods;
+            sampleRate         = pDevice->playback.internalSampleRate;
         }
 
-        ma_sleep(10);
+        maxWaitMs = 0;
+        if (sampleRate > 0) {
+            maxWaitMs = (ma_uint32)(((ma_uint64)periodSizeInFrames * periods * 2000) / sampleRate);
+        }
+        if (maxWaitMs < 200)  { maxWaitMs = 200;  }   /* Floor: tolerate a slow but healthy drain. */
+        if (maxWaitMs > 1000) { maxWaitMs = 1000; }   /* Ceiling: never hang the caller. */
+
+        for (;;) {
+            SLAndroidSimpleBufferQueueState state;
+
+            MA_OPENSL_BUFFERQUEUE(pBufferQueue)->GetState(pBufferQueue, &state);
+            if (state.count == 0) {
+                break;
+            }
+
+            if (waitedMs >= maxWaitMs) {
+                break;  /* Stalled queue. SetPlayState()/Clear() below still run. */
+            }
+
+            ma_sleep(10);
+            waitedMs += 10;
+        }
     }
+    /* ###### end flutter_soloud local patch ###### */
 
     if (pDevice->type == ma_device_type_capture) {
         pDevice->opensl.isDrainingCapture  = MA_FALSE;

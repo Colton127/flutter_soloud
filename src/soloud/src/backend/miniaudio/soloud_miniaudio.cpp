@@ -324,35 +324,6 @@ namespace SoLoud
 #endif
     }
 
-    // True when the automatic idle-pause must not call ma_device_stop() on the
-    // backend currently in use.
-    //
-    // OpenSL|ES (Android below API 26, where AAudio is unavailable) drains its
-    // buffer queue in ma_device_drain__opensl() using an unbounded
-    // `for (;;) { ...; ma_sleep(10); }` loop with no timeout and no iteration
-    // cap. If the OpenSL callback thread stalls — audioserver hiccup, route
-    // change, device disconnect — `state.count` never reaches zero and the call
-    // never returns (issue #333). miniaudio itself disabled the equivalent stop
-    // inside ma_device_uninit() for the same reason (see the `#if 0` and its
-    // "can result in a deadlock" comment in miniaudio.h).
-    //
-    // The idle-pause is a frequent, automatic, best-effort operation, so on that
-    // backend keep the historical behaviour of leaving the device running:
-    // soloud->mix() renders silence when no voices are active. AAudio bounds its
-    // stop with a 5 second AAudioStream_waitForStateChange() timeout and is safe
-    // to stop, so API 26+ still releases the audioserver partial wakelock while
-    // idle. Explicit stopAudioDevice() and OS interruption stops are rare and
-    // caller-driven, so they remain unconditional.
-    static bool miniaudio_idleStopWouldBlockIndefinitely()
-    {
-#if defined(__ANDROID__)
-        return gDevice.pContext != NULL &&
-               gDevice.pContext->backend == ma_backend_opensl;
-#else
-        return false;
-#endif
-    }
-
     // Pause the audio device: stops the CoreAudio AudioUnit (or platform equivalent)
     // without uninitialising it. This is the correct way to "pause" on iOS/macOS —
     // it tells the OS the app has nothing to render, which preserves AVAudioSession
@@ -360,12 +331,6 @@ namespace SoLoud
     result soloud_miniaudio_pause(SoLoud::Soloud *aSoloud)
     {
         std::lock_guard<std::recursive_mutex> operationLock(gDeviceOperationMutex);
-
-        if (miniaudio_idleStopWouldBlockIndefinitely())
-        {
-            (void)aSoloud;
-            return 0;
-        }
 
         if (ma_device_get_state(&gDevice) == ma_device_state_started)
         {
