@@ -1,9 +1,12 @@
 package flutter.soloud.flutter_soloud;
 
+import android.util.Log;
 import androidx.annotation.NonNull;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 
 public final class FlutterSoloudPlugin implements FlutterPlugin {
+    private static final String TAG = "FlutterSoloudPlugin";
+
     /**
      * Guarded by the class monitor.
      *
@@ -17,8 +20,8 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
      * <p>By the time a hook fires, an app that uses SoLoud has already loaded
      * the same library from Dart via {@code DynamicLibrary.open}, so
      * {@code System.loadLibrary} is a refcount bump rather than a real load.
+     * Successful loads are cached; failed loads can be retried by a later hook.
      */
-    private static boolean nativeLibraryLoadAttempted = false;
     private static boolean nativeLibraryLoaded = false;
 
     private static native boolean
@@ -27,19 +30,20 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
     private Long engineId;
 
     private static synchronized boolean ensureNativeLibraryLoaded() {
-        if (!nativeLibraryLoadAttempted) {
-            nativeLibraryLoadAttempted = true;
-            try {
-                System.loadLibrary("flutter_soloud_plugin");
-                nativeLibraryLoaded = true;
-            } catch (UnsatisfiedLinkError error) {
-                // Never fail plugin registration over this. The FFI layer opens
-                // the same library from Dart and surfaces the error there, where
-                // it is catchable and actionable.
-                nativeLibraryLoaded = false;
-            }
+        if (nativeLibraryLoaded) {
+            return true;
         }
-        return nativeLibraryLoaded;
+
+        try {
+            System.loadLibrary("flutter_soloud_plugin");
+            nativeLibraryLoaded = true;
+            return true;
+        } catch (UnsatisfiedLinkError error) {
+            // Never fail engine teardown over this. The FFI layer opens the
+            // same library from Dart and surfaces the error there, where it is
+            // catchable and actionable.
+            return false;
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -63,6 +67,15 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         if (detachedEngineId == null || !ensureNativeLibraryLoaded()) {
             return;
         }
-        nativeClearDartCallbackRegistrationsForEngine(detachedEngineId);
+
+        try {
+            nativeClearDartCallbackRegistrationsForEngine(detachedEngineId);
+        } catch (UnsatisfiedLinkError error) {
+            Log.w(
+                TAG,
+                "Unable to clear Dart callback registrations during engine teardown",
+                error
+            );
+        }
     }
 }
