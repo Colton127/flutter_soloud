@@ -659,22 +659,27 @@ FFI_PLUGIN_EXPORT bool requestEngineTeardownForEngine(int64_t engine_id) {
   if (engine_id == kNoEngineId)
     return false;
 
+  // Retire this engine's callables first, whatever the lifecycle decision
+  // below turns out to be, and gated on callback ownership rather than the
+  // lifecycle claim. The isolate that created them is going away and invoking
+  // one afterwards is undefined behaviour, so this must not be conditional on
+  // also being allowed to dispose the engine.
+  //
+  // It is load-bearing that this runs before the early return: since the
+  // teardown hook replaced the plain clear on the Java detach path, this is the
+  // only thing that clears callables when a FlutterEngine is destroyed. An
+  // engine can legitimately own the callables without owning the lifecycle
+  // claim -- its initialization worker can win the mutex after a later engine
+  // has already claimed -- and gating the clear on the claim left that engine's
+  // callables live after its isolate died.
+  clearDartCallbackRegistrationsForEngine(engine_id);
+
   // A different engine has claimed the native engine, so it is live and owns
   // its own teardown. An unclaimed engine means Dart already deinited cleanly,
   // leaving nothing to dispose.
   EngineLifecycleClaim claim;
   if (!tryBeginEngineTeardown(engine_id, &claim))
     return false;
-
-  {
-    std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
-
-    // Clearing the callable pointers stays gated on callback ownership: this
-    // engine owns the lifecycle, but only the engine that registered the
-    // callables may null them. They are already null when unregistered.
-    if (dartCallbackOwnerEngineId == engine_id)
-      clearDartCallbackPointersLocked();
-  }
 
   try {
     std::thread([claim]() {
