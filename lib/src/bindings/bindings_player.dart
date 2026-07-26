@@ -11,6 +11,27 @@ import 'package:flutter_soloud/src/sound_handle.dart';
 import 'package:flutter_soloud/src/sound_hash.dart';
 import 'package:meta/meta.dart';
 
+/// Test-only parking points on the native engine-lifecycle path.
+///
+/// Must stay in the same order as `EngineLifecycleBarrier` in `bindings.cpp`:
+/// the index is what crosses the FFI boundary.
+enum EngineLifecycleBarrier {
+  /// Nothing armed. Arming this releases anything currently parked.
+  none,
+
+  /// Before the initialization worker takes the native init mutex.
+  beforeInitLock,
+
+  /// After native initialization succeeded, before its ownership recheck.
+  afterInitSucceeded,
+
+  /// Before Dart callback registration validates its lease.
+  beforeCallbackRegistration,
+
+  /// Before an ownership-scoped teardown takes the native init mutex.
+  beforeDisposeLock,
+}
+
 /// Callback set in `setBufferStream` for the `onBuffering` closure.
 typedef OnBufferingCallbackTFunction =
     void Function(bool isBuffering, int handle, double time);

@@ -20,6 +20,7 @@
 #endif
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <memory.h>
@@ -99,9 +100,65 @@ bool engineLifecycleClaimIsCurrent(const EngineLifecycleClaim &claim) {
          engineInitGeneration == claim.generation;
 }
 
+bool engineLifecycleClaimIsCurrent(int64_t engine_id, uint64_t lease) {
+  return engineLifecycleClaimIsCurrent(
+      EngineLifecycleClaim{engine_id, lease});
+}
+
 void releaseEngineLifecycleClaim() {
   std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
   nativeInitOwnerEngineId = kNoEngineId;
+}
+
+/// Test-only barriers on the engine-lifecycle path. Intentionally absent from
+/// the public API, and inert unless a test arms one.
+///
+/// The interleavings that matter here are between an engine's *initialization
+/// worker* and another engine's lifecycle calls, and they are not reachable
+/// from Dart: the worker is inside Isolate.run and the window that matters is
+/// while it holds init_deinit_mutex. Arming a barrier parks the worker at a
+/// chosen point so a test can drive the other engine deterministically instead
+/// of hoping the scheduler cooperates.
+enum EngineLifecycleBarrier {
+  barrierNone = 0,
+  /// Before initEngineOwned() takes init_deinit_mutex.
+  barrierBeforeInitLock = 1,
+  /// After Player::init() succeeded, before the post-init claim revalidation.
+  barrierAfterInitSucceeded = 2,
+  /// Before setDartEventCallback() validates its lease.
+  barrierBeforeCallbackRegistration = 3,
+  /// Before disposeForEngine() takes init_deinit_mutex.
+  barrierBeforeDisposeLock = 4,
+};
+
+std::mutex engine_barrier_mutex;
+std::condition_variable engine_barrier_cv;
+int armedEngineBarrier = barrierNone;
+bool engineBarrierReached = false;
+
+/// Blocks while [barrier] is the armed one, until a test releases it.
+void engineLifecycleBarrier(int barrier) {
+  std::unique_lock<std::mutex> lock(engine_barrier_mutex);
+  if (armedEngineBarrier != barrier)
+    return;
+
+  engineBarrierReached = true;
+  engine_barrier_cv.notify_all();
+  engine_barrier_cv.wait(
+      lock, [barrier] { return armedEngineBarrier != barrier; });
+}
+
+/// Release the claim only when it is still the one being torn down.
+///
+/// An unconditional release lets a stale operation strip a live engine's
+/// ownership: a queued deinit worker that disposes an engine which has since
+/// been replaced would leave the replacement initialized but unowned, and an
+/// unowned engine can never be torn down when *its* FlutterEngine is destroyed.
+void releaseEngineLifecycleClaimIf(const EngineLifecycleClaim &claim) {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+  if (nativeInitOwnerEngineId == claim.ownerEngineId &&
+      engineInitGeneration == claim.generation)
+    nativeInitOwnerEngineId = kNoEngineId;
 }
 }
 
@@ -276,7 +333,18 @@ FFI_PLUGIN_EXPORT void
 setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
                      dartFileLoadedCallback_t file_loaded_callback,
                      dartStateChangedCallback_t state_changed_callback,
-                     int64_t owner_engine_id) {
+                     int64_t owner_engine_id, uint64_t lease) {
+  engineLifecycleBarrier(barrierBeforeCallbackRegistration);
+
+  // Registration is refused once the lease has moved on. These pointers are
+  // process-global, so an engine whose initialization was superseded while it
+  // was away in Dart would otherwise overwrite the callables of the engine that
+  // replaced it -- silently, and with the replacement still believing its own
+  // registration is live.
+  if (owner_engine_id != kNoEngineId &&
+      !engineLifecycleClaimIsCurrent(owner_engine_id, lease))
+    return;
+
   std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
   dartVoiceEndedCallback.store(voice_ended_callback, std::memory_order_release);
   dartFileLoadedCallback.store(file_loaded_callback, std::memory_order_release);
@@ -410,17 +478,18 @@ FFI_PLUGIN_EXPORT bool areXiphLibsAvailable() {
 #endif
 }
 
-/// Initialize the player. Must be called before any other player functions.
+/// Claim the native engine for a FlutterEngine ahead of initializing it.
 ///
-/// [sampleRate] the sample rate. Usually is 22050, 44100 (CD quality) or 48000.
-/// [bufferSize] the audio buffer size. Usually is 2048, but can be also 512
-/// when low latency is needed for example in games. [channels] 1=mono,
-/// 2=stereo, 4=quad, 6=5.1, 8=7.1.
-///
-/// Returns [PlayerErrors.noError] if success.
 /// [owner_engine_id] is the FlutterEngine that will own the engine this
 /// initialization creates, or -1 on platforms with no engine-lifecycle hooks.
-FFI_PLUGIN_EXPORT void prepareEngineInit(int64_t owner_engine_id) {
+///
+/// Returns a lease for the claim it takes. The caller must pass that lease back
+/// to initEngineOwned(), setDartEventCallback() and disposeForEngine(), each of
+/// which refuses to act once the lease is no longer current. Ordering between
+/// prepareEngineInit() calls does not order the initialization workers that
+/// follow them, so without the lease a worker cannot tell whether it is still
+/// the initialization the engine is waiting for.
+FFI_PLUGIN_EXPORT uint64_t prepareEngineInit(int64_t owner_engine_id) {
   std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
   // Lowered under the same mutex that publishes the claim, so a teardown for
   // the previous engine cannot raise it again after this point. See
@@ -435,17 +504,62 @@ FFI_PLUGIN_EXPORT void prepareEngineInit(int64_t owner_engine_id) {
   // Invalidate any teardown queued by a previous engine's detach so it cannot
   // dispose the engine this initialization is about to create.
   ++engineInitGeneration;
+  return engineInitGeneration;
 }
 
-FFI_PLUGIN_EXPORT void requestEngineShutdown() {
+/// Ask an initialization worker that has not entered native code yet to abort.
+///
+/// Scoped to a lease so a stale request cannot cancel a newer engine's
+/// initialization. [engine_id] of -1 skips the check, for callers with no
+/// engine lifecycle (web, and the legacy dispose() entry point).
+FFI_PLUGIN_EXPORT void requestEngineShutdown(int64_t engine_id,
+                                             uint64_t lease) {
+  if (engine_id != kNoEngineId &&
+      !engineLifecycleClaimIsCurrent(engine_id, lease))
+    return;
+
   engine_shutdown_requested.store(true, std::memory_order_release);
 }
 
-FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
-                                               unsigned int sampleRate,
-                                               unsigned int bufferSize,
-                                               unsigned int channels,
-                                               unsigned int lowLatency) {
+/// Tear down a Player built by an initialization that turned out to be stale.
+///
+/// Deliberately touches neither the lifecycle claim nor callback ownership:
+/// both now belong to whichever engine superseded this one, and the only thing
+/// this operation created is the Player itself.
+static void disposeStalePlayerLocked() {
+  if (player.get() == nullptr)
+    return;
+
+  player->dispose();
+  player.reset();
+  player = std::make_unique<Player>();
+  analyzer.reset();
+  analyzer = std::make_unique<Analyzer>(256);
+}
+
+/// Initialize the player. Must be called before any other player functions.
+///
+/// [sampleRate] the sample rate. Usually is 22050, 44100 (CD quality) or 48000.
+/// [bufferSize] the audio buffer size. Usually is 2048, but can be also 512
+/// when low latency is needed for example in games. [channels] 1=mono,
+/// 2=stereo, 4=quad, 6=5.1, 8=7.1.
+///
+/// [engine_id] and [lease] are the claim taken by prepareEngineInit().
+/// [engine_id] of -1 skips ownership validation entirely, which is what the
+/// legacy initEngine() entry point below passes.
+///
+/// Returns [PlayerErrors.noError] if success.
+FFI_PLUGIN_EXPORT enum PlayerErrors initEngineOwned(int64_t engine_id,
+                                                    uint64_t lease,
+                                                    int deviceID,
+                                                    unsigned int sampleRate,
+                                                    unsigned int bufferSize,
+                                                    unsigned int channels,
+                                                    unsigned int lowLatency) {
+  const bool validateOwnership = engine_id != kNoEngineId;
+
+  engineLifecycleBarrier(barrierBeforeInitLock);
+
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
 
@@ -453,6 +567,13 @@ FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
   // worker. In that case dispose() has already completed as a no-op, so the
   // delayed init must not recreate the engine afterward.
   if (engine_shutdown_requested.load(std::memory_order_acquire))
+    return backendNotInited;
+
+  // Calling prepareEngineInit() first does not win the race to this mutex.
+  // Another engine can have claimed in the meantime, in which case this
+  // initialization is stale and must not build over the top of it.
+  if (validateOwnership &&
+      !engineLifecycleClaimIsCurrent(engine_id, lease))
     return backendNotInited;
 
   if (player.get() == nullptr)
@@ -465,6 +586,20 @@ FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
   if (res != noError)
     return res;
 
+  engineLifecycleBarrier(barrierAfterInitSucceeded);
+
+  // Re-checked after the fact: Player::init() opens the audio device, which
+  // blocks for seconds on Android, and nothing stops another engine claiming
+  // while it runs. Dispose what this stale initialization just built rather
+  // than leaving an orphaned device and scheduler running with no owner. This
+  // happens before init_deinit_mutex is released, so the replacement engine's
+  // own initialization cannot observe the half-built state.
+  if (validateOwnership &&
+      !engineLifecycleClaimIsCurrent(engine_id, lease)) {
+    disposeStalePlayerLocked();
+    return backendNotInited;
+  }
+
   // Set window size for filters
   const int windowSize = (player.get()->soloud.getBackendBufferSize() /
                           player.get()->soloud.getBackendChannels()) -
@@ -475,8 +610,20 @@ FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
   player.get()->setVoiceEndedCallback(voiceEndedCallback);
   player.get()->setVoiceInactiveCallback(voiceInactiveCallback);
 
-        return PlayerErrors::noError;
-    }
+  return PlayerErrors::noError;
+}
+
+/// Ownership-unaware initialization, kept for callers with no FlutterEngine
+/// lifecycle. The web build binds this exported symbol directly from the
+/// prebuilt wasm, so its signature must not change.
+FFI_PLUGIN_EXPORT enum PlayerErrors initEngine(int deviceID,
+                                               unsigned int sampleRate,
+                                               unsigned int bufferSize,
+                                               unsigned int channels,
+                                               unsigned int lowLatency) {
+  return initEngineOwned(kNoEngineId, 0, deviceID, sampleRate, bufferSize,
+                         channels, lowLatency);
+}
 
 /// Android only: choose whether SoLoud tags the AAudio stream's
 /// usage/contentType (media/music) or leaves them unset so the app can manage
@@ -532,6 +679,22 @@ FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
   // query never waits behind an initialization or lifecycle API call.
   return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
 }
+/// Arms [barrier], or disarms with `barrierNone`, releasing anything parked.
+FFI_PLUGIN_EXPORT void debugArmEngineLifecycleBarrier(int barrier) {
+  {
+    std::lock_guard<std::mutex> lock(engine_barrier_mutex);
+    armedEngineBarrier = barrier;
+    engineBarrierReached = false;
+  }
+  engine_barrier_cv.notify_all();
+}
+
+/// True once something has parked on the armed barrier.
+FFI_PLUGIN_EXPORT bool debugEngineLifecycleBarrierReached() {
+  std::lock_guard<std::mutex> lock(engine_barrier_mutex);
+  return engineBarrierReached;
+}
+
 /// Test-only hook that sends an interruption through miniaudio's normal
 /// notification callback. This is intentionally absent from the public API.
 FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began) {
@@ -599,7 +762,13 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 /// app
 ///
 /// Teardown body. The caller must hold init_deinit_mutex and loadMutex.
-static void disposeLocked() {
+///
+/// [ownedClaim] is the claim this teardown is entitled to retire, or nullptr
+/// for an unscoped teardown that retires whatever claim is current. A scoped
+/// caller must not strip a claim that has moved on: doing so would leave the
+/// engine that took it initialized but unowned, and an unowned engine can never
+/// be torn down when its own FlutterEngine is destroyed.
+static void disposeLocked(const EngineLifecycleClaim *ownedClaim) {
   // Wait for any Dart callback currently executing, then make every bridge
   // inert. Do not retain the callback mutex while stopping devices, joining
   // threads, destroying sources, or resetting Player.
@@ -612,7 +781,10 @@ static void disposeLocked() {
   // Nothing is left for a FlutterEngine to own. A detach arriving after this
   // finds no claim and correctly declines to tear anything down; the next
   // prepareEngineInit() takes a fresh claim.
-  releaseEngineLifecycleClaim();
+  if (ownedClaim == nullptr)
+    releaseEngineLifecycleClaim();
+  else
+    releaseEngineLifecycleClaimIf(*ownedClaim);
 
   if (player.get() == nullptr)
     return;
@@ -625,6 +797,9 @@ static void disposeLocked() {
   analyzer = std::make_unique<Analyzer>(256);
 }
 
+/// Ownership-unaware teardown, kept for callers with no FlutterEngine
+/// lifecycle. The web build binds this exported symbol directly from the
+/// prebuilt wasm, so its signature must not change.
 FFI_PLUGIN_EXPORT void dispose() {
   // Preserve request ordering for asynchronous Dart init/deinit workers.
   engine_shutdown_requested.store(true, std::memory_order_release);
@@ -632,7 +807,32 @@ FFI_PLUGIN_EXPORT void dispose() {
   std::lock_guard<std::mutex> guard(init_deinit_mutex);
   std::lock_guard<std::mutex> guard_load(loadMutex);
 
-  disposeLocked();
+  disposeLocked(nullptr);
+}
+
+/// Ordinary Dart teardown, scoped to the claim taken by prepareEngineInit().
+///
+/// Returns false when the lease has moved on, leaving the newer engine alone.
+/// Without this an engine's queued deinit worker could reach init_deinit_mutex
+/// after a replacement had initialized and dispose the replacement's engine.
+FFI_PLUGIN_EXPORT bool disposeForEngine(int64_t engine_id, uint64_t lease) {
+  if (engine_id == kNoEngineId) {
+    dispose();
+    return true;
+  }
+
+  const EngineLifecycleClaim claim{engine_id, lease};
+
+  engineLifecycleBarrier(barrierBeforeDisposeLock);
+
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
+  std::lock_guard<std::mutex> guard_load(loadMutex);
+
+  if (!engineLifecycleClaimIsCurrent(claim))
+    return false;
+
+  disposeLocked(&claim);
+  return true;
 }
 
 /// Tear the engine down because its owning FlutterEngine is being destroyed
@@ -691,7 +891,7 @@ FFI_PLUGIN_EXPORT bool requestEngineTeardownForEngine(int64_t engine_id) {
       if (!engineLifecycleClaimIsCurrent(claim))
         return;
 
-      disposeLocked();
+      disposeLocked(&claim);
     }).detach();
   } catch (...) {
     // Thread creation failed. The bridges are already inert, and the next
