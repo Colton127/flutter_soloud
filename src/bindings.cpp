@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <stdio.h>
+#include <thread>
 
 std::mutex dart_callback_invocation_mutex;
 
@@ -33,11 +34,75 @@ std::mutex dart_callback_invocation_mutex;
 // never be held while joining the lifecycle scheduler, starting or stopping
 // the audio device, disposing Player, or destroying native audio sources.
 
-namespace {
-constexpr int64_t kNoDartCallbackOwnerEngineId = -1;
+// Defined below with the other C-linkage globals. Declared here so the engine
+// lifecycle helpers can raise it while holding engine_lifecycle_mutex.
+extern "C" std::atomic<bool> engine_shutdown_requested;
 
-// Protected by dart_callback_invocation_mutex.
-int64_t dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+namespace {
+constexpr int64_t kNoEngineId = -1;
+
+// Protected by dart_callback_invocation_mutex. Decides only whose *callable
+// pointers* may be cleared -- never whether the engine may be torn down. It is
+// unset for the whole of an initialization, because Dart registers callbacks
+// only after initEngine() has returned.
+int64_t dartCallbackOwnerEngineId = kNoEngineId;
+
+// Which FlutterEngine currently claims the native engine, and a counter
+// advanced by every prepareEngineInit(). Claimed at the *start* of an
+// initialization rather than when callbacks register, so the engine has a
+// lifecycle owner during the whole init -- including the long window where
+// initEngine() has opened the device but Dart has not registered callbacks yet.
+//
+// Both fields are read and written together, so they are guarded by a mutex
+// rather than made individually atomic: a teardown must observe a consistent
+// (owner, generation) pair, and no interleaving of two atomic loads gives that.
+// This is a leaf lock -- never held while acquiring another lock or performing
+// any blocking work.
+std::mutex engine_lifecycle_mutex;
+int64_t nativeInitOwnerEngineId = kNoEngineId;
+uint64_t engineInitGeneration = 0;
+
+struct EngineLifecycleClaim {
+  int64_t ownerEngineId;
+  uint64_t generation;
+};
+
+EngineLifecycleClaim currentEngineLifecycleClaim() {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+  return EngineLifecycleClaim{nativeInitOwnerEngineId, engineInitGeneration};
+}
+
+/// Accept a teardown for [engine_id] and capture the claim it is tearing down.
+///
+/// Verifying the claim and raising engine_shutdown_requested in one critical
+/// section is what stops a detaching engine cancelling a *replacement* engine's
+/// initialization. prepareEngineInit() lowers that flag and re-claims under the
+/// same mutex, so the two can no longer interleave as: teardown reads the old
+/// claim, replacement re-claims and lowers the flag, teardown raises it again,
+/// and the replacement's initEngine() then refuses to initialize.
+bool tryBeginEngineTeardown(int64_t engine_id, EngineLifecycleClaim *out) {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+
+  if (nativeInitOwnerEngineId != engine_id)
+    return false;
+
+  *out = EngineLifecycleClaim{nativeInitOwnerEngineId, engineInitGeneration};
+  // Rejects an initialization worker of this same engine that has not entered
+  // native code yet.
+  engine_shutdown_requested.store(true, std::memory_order_release);
+  return true;
+}
+
+bool engineLifecycleClaimIsCurrent(const EngineLifecycleClaim &claim) {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+  return nativeInitOwnerEngineId == claim.ownerEngineId &&
+         engineInitGeneration == claim.generation;
+}
+
+void releaseEngineLifecycleClaim() {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+  nativeInitOwnerEngineId = kNoEngineId;
+}
 }
 
 #ifdef __cplusplus
@@ -219,14 +284,58 @@ setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
   dartCallbackOwnerEngineId = owner_engine_id;
 }
 
-static void clearDartCallbackRegistrationsLocked() {
+/// Make the three process-global Dart bridges inert.
+///
+/// The caller must hold dart_callback_invocation_mutex. This performs no
+/// blocking work, so it stays safe to run on a platform/UI thread.
+static void clearDartCallbackPointersLocked() {
   dartVoiceEndedCallback.store(nullptr, std::memory_order_release);
   dartFileLoadedCallback.store(nullptr, std::memory_order_release);
   dartStateChangedCallback.store(nullptr, std::memory_order_release);
-  dartCallbackOwnerEngineId = kNoDartCallbackOwnerEngineId;
+  dartCallbackOwnerEngineId = kNoEngineId;
+}
 
+/// Additionally clear the per-BufferStream Dart callbacks.
+///
+/// The caller must hold init_deinit_mutex, which owns the `player` unique_ptr
+/// that dispose() resets. BufferStream::clearDartCallbacks() is a pair of
+/// atomic stores, so it does not need dart_callback_invocation_mutex.
+static void clearPlayerDartCallbackRegistrationsLocked() {
   if (player.get() != nullptr) {
     player.get()->clearDartCallbackRegistrations();
+  }
+}
+
+static void clearDartCallbackRegistrationsLocked() {
+  clearDartCallbackPointersLocked();
+  clearPlayerDartCallbackRegistrationsLocked();
+}
+
+/// Clear the per-BufferStream Dart callbacks once init_deinit_mutex becomes
+/// available, without making the caller wait for it.
+///
+/// Used when the caller runs on a thread that must not block (the Android
+/// platform thread) and the mutex is currently held by an unrelated operation
+/// such as loadFile() or initEngine(). The worker captures the engine lifecycle
+/// claim and gives up if a new engine has claimed the native engine meanwhile,
+/// so it can never erase callbacks that a replacement engine has just
+/// registered.
+static void queuePlayerDartCallbackClear() {
+  const EngineLifecycleClaim claim = currentEngineLifecycleClaim();
+
+  try {
+    std::thread([claim]() {
+      std::lock_guard<std::mutex> guard(init_deinit_mutex);
+
+      if (!engineLifecycleClaimIsCurrent(claim))
+        return;
+
+      clearPlayerDartCallbackRegistrationsLocked();
+    }).detach();
+  } catch (...) {
+    // Best effort. The global bridges are already inert, which is what stops
+    // native code invoking a dead callable; a teardown or a later init()
+    // still clears the BufferStream callbacks.
   }
 }
 
@@ -238,16 +347,49 @@ FFI_PLUGIN_EXPORT void clearDartCallbackRegistrations() {
   clearDartCallbackRegistrationsLocked();
 }
 
+/// Invalidate the Dart bridges owned by [engine_id] when its FlutterEngine is
+/// detached. Returns false when a different engine owns the current
+/// registration, so a detaching engine never clears another one's callbacks.
+///
+/// This runs on the Android platform (UI) thread, so unlike
+/// clearDartCallbackRegistrations() it must never wait behind a device
+/// operation. init_deinit_mutex is held for the whole of dispose(), which joins
+/// the lifecycle scheduler and can therefore inherit a stalled
+/// ma_device_stop(); blocking on it here would ANR the app at engine teardown.
+/// Only dart_callback_invocation_mutex is taken unconditionally — it is never
+/// held across a device operation.
 FFI_PLUGIN_EXPORT bool
 clearDartCallbackRegistrationsForEngine(int64_t engine_id) {
-  std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
-  std::lock_guard<std::mutex> guard_load(loadMutex);
-  std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
+  {
+    std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
 
-  if (dartCallbackOwnerEngineId != engine_id)
-    return false;
+    if (dartCallbackOwnerEngineId != engine_id)
+      return false;
 
-  clearDartCallbackRegistrationsLocked();
+    clearDartCallbackPointersLocked();
+  }
+
+  // The BufferStream callbacks live inside Player, so reaching them needs
+  // init_deinit_mutex, which owns the `player` unique_ptr that dispose()
+  // resets. Doing this outside dart_callback_invocation_mutex also keeps the
+  // lock order consistent with disposeSound(), which holds sounds_mutex across
+  // soloud.stop() and reaches voiceEndedCallback().
+  //
+  // Take the fast path when the mutex happens to be free, but never treat a
+  // failed try_lock as "someone else will handle it": init_deinit_mutex is held
+  // by loadFile(), loadMem(), initEngine(), changeDevice(), the device
+  // start/stop calls and even isInited() — none of which clear these
+  // callbacks. Hand the work to a worker that can afford to wait instead.
+  {
+    std::unique_lock<std::mutex> guard_init(init_deinit_mutex,
+                                            std::try_to_lock);
+    if (guard_init.owns_lock()) {
+      clearPlayerDartCallbackRegistrationsLocked();
+      return true;
+    }
+  }
+
+  queuePlayerDartCallbackClear();
   return true;
 }
 
@@ -276,8 +418,23 @@ FFI_PLUGIN_EXPORT bool areXiphLibsAvailable() {
 /// 2=stereo, 4=quad, 6=5.1, 8=7.1.
 ///
 /// Returns [PlayerErrors.noError] if success.
-FFI_PLUGIN_EXPORT void prepareEngineInit() {
+/// [owner_engine_id] is the FlutterEngine that will own the engine this
+/// initialization creates, or -1 on platforms with no engine-lifecycle hooks.
+FFI_PLUGIN_EXPORT void prepareEngineInit(int64_t owner_engine_id) {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+  // Lowered under the same mutex that publishes the claim, so a teardown for
+  // the previous engine cannot raise it again after this point. See
+  // tryBeginEngineTeardown().
   engine_shutdown_requested.store(false, std::memory_order_release);
+  // Claim the native engine for this FlutterEngine now, before initEngine()
+  // runs. Ownership must not wait for callback registration: initEngine()
+  // opens the audio device and can take seconds on Android, and Dart registers
+  // callbacks only after it returns. An engine destroyed during that window
+  // still has to be able to tear down what it just built.
+  nativeInitOwnerEngineId = owner_engine_id;
+  // Invalidate any teardown queued by a previous engine's detach so it cannot
+  // dispose the engine this initialization is about to create.
+  ++engineInitGeneration;
 }
 
 FFI_PLUGIN_EXPORT void requestEngineShutdown() {
@@ -375,7 +532,6 @@ FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState() {
   // query never waits behind an initialization or lifecycle API call.
   return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
 }
-
 /// Test-only hook that sends an interruption through miniaudio's normal
 /// notification callback. This is intentionally absent from the public API.
 FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began) {
@@ -442,13 +598,8 @@ FFI_PLUGIN_EXPORT void freeListPlaybackDevices(char **devicesName,
 /// Must be called when there is no more need of the player or when closing the
 /// app
 ///
-FFI_PLUGIN_EXPORT void dispose() {
-  // Preserve request ordering for asynchronous Dart init/deinit workers.
-  engine_shutdown_requested.store(true, std::memory_order_release);
-
-  std::lock_guard<std::mutex> guard(init_deinit_mutex);
-  std::lock_guard<std::mutex> guard_load(loadMutex);
-
+/// Teardown body. The caller must hold init_deinit_mutex and loadMutex.
+static void disposeLocked() {
   // Wait for any Dart callback currently executing, then make every bridge
   // inert. Do not retain the callback mutex while stopping devices, joining
   // threads, destroying sources, or resetting Player.
@@ -457,6 +608,11 @@ FFI_PLUGIN_EXPORT void dispose() {
         dart_callback_invocation_mutex);
     clearDartCallbackRegistrationsLocked();
   }
+
+  // Nothing is left for a FlutterEngine to own. A detach arriving after this
+  // finds no claim and correctly declines to tear anything down; the next
+  // prepareEngineInit() takes a fresh claim.
+  releaseEngineLifecycleClaim();
 
   if (player.get() == nullptr)
     return;
@@ -469,11 +625,96 @@ FFI_PLUGIN_EXPORT void dispose() {
   analyzer = std::make_unique<Analyzer>(256);
 }
 
+FFI_PLUGIN_EXPORT void dispose() {
+  // Preserve request ordering for asynchronous Dart init/deinit workers.
+  engine_shutdown_requested.store(true, std::memory_order_release);
+
+  std::lock_guard<std::mutex> guard(init_deinit_mutex);
+  std::lock_guard<std::mutex> guard_load(loadMutex);
+
+  disposeLocked();
+}
+
+/// Tear the engine down because its owning FlutterEngine is being destroyed
+/// while the process keeps running (the audio_service / add-to-app case).
+///
+/// Without this the native engine stays initialized with a live output device
+/// and a running scheduler after the last Dart code that could drive it is
+/// gone. Returns false unless [engine_id] still owns the native engine.
+///
+/// Ownership here is the *lifecycle* claim taken by prepareEngineInit(), not
+/// dartCallbackOwnerEngineId. Gating on callback ownership would be wrong in
+/// both directions: it is unset for the whole of an initialization -- so an
+/// engine destroyed after initEngine() opened the device but before Dart
+/// registered callbacks could not tear down what it had just built -- and it
+/// still names the *previous* engine once a replacement has called
+/// prepareEngineInit(), so a detaching engine would be accepted and would then
+/// capture the replacement's already-bumped generation and dispose a live
+/// engine. The generation cannot rescue either case: it is bumped when an
+/// initialization starts, which is before this teardown reads it.
+///
+/// The blocking teardown is handed to a detached worker: this is invoked from
+/// the Android platform thread, which must never wait on a device operation.
+FFI_PLUGIN_EXPORT bool requestEngineTeardownForEngine(int64_t engine_id) {
+  if (engine_id == kNoEngineId)
+    return false;
+
+  // Retire this engine's callables first, whatever the lifecycle decision
+  // below turns out to be, and gated on callback ownership rather than the
+  // lifecycle claim. The isolate that created them is going away and invoking
+  // one afterwards is undefined behaviour, so this must not be conditional on
+  // also being allowed to dispose the engine.
+  //
+  // It is load-bearing that this runs before the early return: since the
+  // teardown hook replaced the plain clear on the Java detach path, this is the
+  // only thing that clears callables when a FlutterEngine is destroyed. An
+  // engine can legitimately own the callables without owning the lifecycle
+  // claim -- its initialization worker can win the mutex after a later engine
+  // has already claimed -- and gating the clear on the claim left that engine's
+  // callables live after its isolate died.
+  clearDartCallbackRegistrationsForEngine(engine_id);
+
+  // A different engine has claimed the native engine, so it is live and owns
+  // its own teardown. An unclaimed engine means Dart already deinited cleanly,
+  // leaving nothing to dispose.
+  EngineLifecycleClaim claim;
+  if (!tryBeginEngineTeardown(engine_id, &claim))
+    return false;
+
+  try {
+    std::thread([claim]() {
+      std::lock_guard<std::mutex> guard(init_deinit_mutex);
+      std::lock_guard<std::mutex> guard_load(loadMutex);
+
+      // A replacement engine claimed the native engine while this worker was
+      // waiting for the mutex. Its engine is live and must not be torn down.
+      if (!engineLifecycleClaimIsCurrent(claim))
+        return;
+
+      disposeLocked();
+    }).detach();
+  } catch (...) {
+    // Thread creation failed. The bridges are already inert, and the next
+    // init() still recovers by deiniting the stale engine itself.
+    return false;
+  }
+
+  return true;
+}
+
 #if defined(__ANDROID__)
 extern "C" JNIEXPORT jboolean JNICALL
 Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeClearDartCallbackRegistrationsForEngine(
     JNIEnv *, jclass, jlong engine_id) {
   return clearDartCallbackRegistrationsForEngine(static_cast<int64_t>(engine_id))
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_flutter_soloud_flutter_1soloud_FlutterSoloudPlugin_nativeRequestEngineTeardownForEngine(
+    JNIEnv *, jclass, jlong engine_id) {
+  return requestEngineTeardownForEngine(static_cast<int64_t>(engine_id))
              ? JNI_TRUE
              : JNI_FALSE;
 }

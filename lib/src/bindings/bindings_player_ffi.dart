@@ -395,12 +395,21 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       >('initEngine');
 
   @override
-  void prepareEngineInit() => _prepareEngineInit();
+  void prepareEngineInit() {
+    // Claims the native engine for this FlutterEngine for the whole of the
+    // initialization that follows, so an engine destroyed mid-init can still
+    // tear down what it built. Read the same way as in
+    // [setDartEventCallbacks]; -1 on platforms that expose no engine id, which
+    // are also the platforms with no engine-lifecycle hooks to act on it.
+    _prepareEngineInit(ui.PlatformDispatcher.instance.engineId ?? -1);
+  }
 
   late final _prepareEngineInitPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function()>>('prepareEngineInit');
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
+        'prepareEngineInit',
+      );
   late final _prepareEngineInit = _prepareEngineInitPtr
-      .asFunction<void Function()>();
+      .asFunction<void Function(int)>();
 
   @override
   void requestEngineShutdown() => _requestEngineShutdown();

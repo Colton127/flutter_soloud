@@ -1078,6 +1078,31 @@ PlayerErrors Player::performAudioDeviceStart()
     // Use the normal resume hook so iOS reactivates AVAudioSession before the
     // Audio Unit is restarted.
     SoLoud::result result = soloud.resume();
+    if (result == SoLoud::SO_NO_ERROR)
+        return noError;
+
+    // The start failed. Rebuild the device and try once more before giving up.
+    //
+    // The backend keeps the stream open across an idle stop, so a device that
+    // has been stopped for a while can be holding a stream the OS has since
+    // invalidated. On Android this is the common case: AAudio only reports a
+    // disconnect through the error callback of a *running* stream, so a stream
+    // that is torn down while stopped -- a route change, or the framework
+    // reclaiming resources from a backgrounded app -- is never rerouted, and
+    // the staleness only surfaces here, as AAudioStream_requestStart failing.
+    //
+    // Replacing the device recreates the stream against the current default
+    // output. Voices, loaded sources and filters all live in SoLoud rather than
+    // in the device, so playback resumes where it left off.
+    //
+    // Callers hold mDeviceLifecycleOperationMutex, so this cannot interleave
+    // with another device operation. One retry only: if a freshly built device
+    // will not start either, the failure is not staleness.
+    const SoLoud::result rebuilt = soloud.miniaudio_changeDevice(nullptr);
+    if (rebuilt != SoLoud::SO_NO_ERROR)
+        return unknownError;
+
+    result = soloud.resume();
     if (result != SoLoud::SO_NO_ERROR)
         return unknownError;
     return noError;
@@ -1139,8 +1164,24 @@ PlayerErrors Player::startAudioDevice()
     {
         std::lock_guard<std::mutex> operationLock(
             mDeviceLifecycleOperationMutex);
-        if (mInterruptionActive.load(std::memory_order_acquire))
-            return noError;
+
+        // An explicit start is an authoritative request from the app, so it
+        // clears the interruption latch rather than being suppressed by it.
+        //
+        // Returning noError here without touching the device made this API
+        // able to report success while leaving the device stopped, and the
+        // latch can be stuck: iOS does not reliably deliver
+        // AVAudioSessionInterruptionTypeEnded -- notably when the interruption
+        // ends while the app is backgrounded or suspended -- and the flag is
+        // otherwise only cleared by init()/deinit(). Once missed, every later
+        // start was a silent no-op for the lifetime of the engine.
+        //
+        // If an interruption really is still in force the OS refuses to
+        // activate the session and the start below fails, which surfaces a real
+        // error instead of a false success. A genuine new interruption arriving
+        // afterwards sets the flag again through the normal callback.
+        mInterruptionActive.store(false, std::memory_order_release);
+
         // Cancel a stale delayed idle stop before prewarming the device.
         invalidatePendingDeviceRequest();
         result = performAudioDeviceStart();

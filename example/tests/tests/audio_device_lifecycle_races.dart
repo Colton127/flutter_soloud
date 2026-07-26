@@ -333,6 +333,34 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
     );
     output.writeln('Idle/keep-alive interruption policies: OK');
 
+    // An interruption whose "ended" notification never arrives must not wedge
+    // the device permanently. iOS does not reliably deliver
+    // AVAudioSessionInterruptionTypeEnded -- notably when the interruption ends
+    // while the app is backgrounded -- and the interruption flag is otherwise
+    // only cleared by init()/deinit(). While it was latched, startAudioDevice()
+    // returned success without touching the device, so the app saw a healthy
+    // API and silence. An explicit start is authoritative and must recover.
+    SoLoud.instance.setAudioDeviceIdleTimeout(null);
+    state = await _waitForDeviceState(AudioDeviceState.started);
+    assert(
+      state == AudioDeviceState.started,
+      'Keep-alive did not start device before the missed-end check.',
+    );
+    SoLoudController().soLoudFFI.debugTriggerAudioInterruption(began: true);
+    state = await _waitForDeviceState(AudioDeviceState.stopped);
+    assert(
+      state == AudioDeviceState.stopped,
+      'Interruption did not stop device before the missed-end check.',
+    );
+    // Deliberately no matching `began: false`: that is the dropped one.
+    await SoLoud.instance.startAudioDevice();
+    state = await _waitForDeviceState(AudioDeviceState.started);
+    assert(
+      state == AudioDeviceState.started,
+      'Explicit start did not recover from a missed interruption end.',
+    );
+    output.writeln('Explicit start recovers a missed interruption end: OK');
+
     await SoLoud.instance.stop(handle);
     await SoLoud.instance.disposeSource(waveform);
 
