@@ -5,6 +5,21 @@ import androidx.annotation.Nullable;
 import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 
+/**
+ * Keeps flutter_soloud's process-global native state in step with the lifetime
+ * of the FlutterEngine that owns it.
+ *
+ * <p>The native engine (the SoLoud player, its output device, its lifecycle
+ * scheduler and the registered Dart callback pointers) lives for the whole
+ * process, while the Dart isolate that drives it belongs to a single
+ * FlutterEngine. When an engine goes away but the process keeps running --
+ * routine for a foreground-service audio app, e.g. audio_service -- native code
+ * would otherwise keep calling into NativeCallables whose isolate is gone
+ * (undefined behaviour) and keep an output device running with nothing left to
+ * control it. Only the embedder can observe that transition: Dart's
+ * {@code detached} lifecycle state is not guaranteed to arrive first, and there
+ * is no reliable root-isolate exit hook.
+ */
 public final class FlutterSoloudPlugin implements FlutterPlugin {
     /**
      * Guarded by the class monitor.
@@ -26,9 +41,18 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
     private static native boolean
         nativeClearDartCallbackRegistrationsForEngine(long engineId);
 
+    private static native boolean
+        nativeRequestEngineTeardownForEngine(long engineId);
+
     @Nullable private FlutterEngine flutterEngine;
     @Nullable private Long engineId;
     @Nullable private FlutterEngine.EngineLifecycleListener lifecycleListener;
+
+    /**
+     * onEngineWillDestroy() and onDetachedFromEngine() both fire on a real
+     * engine destroy; the teardown must only be requested once.
+     */
+    private boolean teardownRequested = false;
 
     private static synchronized boolean ensureNativeLibraryLoaded() {
         if (!nativeLibraryLoadAttempted) {
@@ -54,10 +78,12 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         // Deliberately does no native work. This runs during app launch for
         // every app that depends on the plugin, whether or not it ever uses
         // SoLoud, so it must stay pure Java bookkeeping: read the engine id and
-        // register a listener.
+        // register a listener. Nothing here loads the native library, opens a
+        // device, or starts a thread.
         final FlutterEngine engine = binding.getFlutterEngine();
         flutterEngine = engine;
         engineId = engine.getEngineId();
+        teardownRequested = false;
 
         lifecycleListener = new FlutterEngine.EngineLifecycleListener() {
             @Override
@@ -72,9 +98,9 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
 
             @Override
             public void onEngineWillDestroy() {
-                // Fires just before the plugin registry is destroyed, while the
-                // engine is still valid.
-                clearDartCallbackRegistrations();
+                // Fires just before the plugin registry is destroyed. The engine
+                // is still valid here, so this is the earliest safe point.
+                requestEngineTeardown();
             }
         };
         engine.addEngineLifecycleListener(lifecycleListener);
@@ -91,7 +117,9 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
             engine.removeEngineLifecycleListener(listener);
         }
 
-        clearDartCallbackRegistrations();
+        // Requested here too: onEngineWillDestroy() is not reached on every
+        // detach path, and requestEngineTeardown() is idempotent.
+        requestEngineTeardown();
 
         flutterEngine = null;
         engineId = null;
@@ -104,5 +132,24 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
             return;
         }
         nativeClearDartCallbackRegistrationsForEngine(id);
+    }
+
+    /**
+     * Drops the Dart bridges and asks native code to tear the engine down. The
+     * blocking part of the teardown (stopping the device, joining the lifecycle
+     * scheduler) runs on a native worker thread, so this returns promptly and
+     * never blocks the platform thread.
+     */
+    private void requestEngineTeardown() {
+        final Long id = engineId;
+        if (id == null || teardownRequested) {
+            return;
+        }
+        teardownRequested = true;
+
+        if (!ensureNativeLibraryLoaded()) {
+            return;
+        }
+        nativeRequestEngineTeardownForEngine(id);
     }
 }
