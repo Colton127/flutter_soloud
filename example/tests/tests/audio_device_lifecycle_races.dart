@@ -283,7 +283,7 @@ Future<StringBuffer> testAudioDeviceLifecycleRaces() async {
 
       await stoppedEvent;
       await restartedEvent;
-      final rapidState = SoLoud.instance.getAudioDeviceState();
+      final rapidState = await _waitForDeviceState(AudioDeviceState.started);
       assert(
         rapidState == AudioDeviceState.started,
         'Rapid interruption cycle $i lost the recovery start: $rapidState',
