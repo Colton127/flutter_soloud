@@ -68,8 +68,6 @@ int _invokeChangeDevice(int address, int deviceId) {
 /// same process-global engine is initialized.
 int _invokeInitEngine(
   int address,
-  int engineId,
-  int lease,
   int deviceId,
   int sampleRate,
   int bufferSize,
@@ -80,8 +78,6 @@ int _invokeInitEngine(
       ffi.Pointer<
             ffi.NativeFunction<
               ffi.Int32 Function(
-                ffi.Int64,
-                ffi.Uint64,
                 ffi.Int,
                 ffi.UnsignedInt,
                 ffi.UnsignedInt,
@@ -90,24 +86,20 @@ int _invokeInitEngine(
               )
             >
           >.fromAddress(address)
-          .asFunction<int Function(int, int, int, int, int, int, int)>();
-  return fn(
-    engineId,
-    lease,
-    deviceId,
-    sampleRate,
-    bufferSize,
-    channels,
-    lowLatency,
-  );
+          .asFunction<int Function(int, int, int, int, int)>();
+  return fn(deviceId, sampleRate, bufferSize, channels, lowLatency);
 }
 
-/// Calls `disposeForEngine(engineId, lease)` from a worker isolate.
-bool _invokeDisposeForEngine(int address, int engineId, int lease) {
-  return ffi
-      .Pointer<ffi.NativeFunction<ffi.Bool Function(ffi.Int64, ffi.Uint64)>>
-      .fromAddress(address)
-      .asFunction<bool Function(int, int)>()(engineId, lease);
+/// Rebuilds a `void Function()` native function from its raw pointer [address]
+/// and invokes it.
+///
+/// Top-level so it can run inside an [Isolate.run] worker: the blocking native
+/// teardown (device uninit) then executes off the UI isolate instead of
+/// stalling it. Only [address] (a sendable int) crosses the isolate boundary.
+void _invokeVoidNative(int address) {
+  ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>>.fromAddress(
+    address,
+  ).asFunction<void Function()>()();
 }
 
 typedef DartVoiceEndedCallbackT =
@@ -294,47 +286,31 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
           _stateChangedCallback,
         );
 
-    // The lease is validated natively: registration is refused if this
-    // initialization was superseded while Dart was away, so a stale engine
-    // cannot overwrite the callables of the engine that replaced it.
-    final accepted = _setDartEventCallback(
+    _setDartEventCallback(
       nativeVoiceEndedCallable!.nativeFunction,
       nativeFileLoadedCallable!.nativeFunction,
       nativeStateChangedCallable!.nativeFunction,
       engineId ?? -1,
-      _claimedLease,
     );
-
-    if (!accepted) {
-      // Native code holds no reference to these, so close them here rather than
-      // leaking three NativeCallables per superseded initialization. Throwing
-      // is what stops the caller reporting itself as initialized: the
-      // process-global engine now belongs to another FlutterEngine, and this
-      // isolate has no callbacks registered against it.
-      disposeNativeCallables();
-      throw const SoLoudInitializationSupersededException();
-    }
   }
 
   late final _setDartEventCallbackPtr =
       _lookup<
         ffi.NativeFunction<
-          ffi.Bool Function(
+          ffi.Void Function(
             DartVoiceEndedCallbackT,
             DartFileLoadedCallbackT,
             DartStateChangedCallbackT,
             ffi.Int64,
-            ffi.Uint64,
           )
         >
       >('setDartEventCallback');
   late final _setDartEventCallback = _setDartEventCallbackPtr
       .asFunction<
-        bool Function(
+        void Function(
           DartVoiceEndedCallbackT,
           DartFileLoadedCallbackT,
           DartStateChangedCallbackT,
-          int,
           int,
         )
       >();
@@ -389,19 +365,12 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     // tripping the ANR watchdog — see #481). Only the raw function pointer
     // address and the primitive arguments (all sendable ints) are captured; the
     // pointer is rebuilt and called inside the worker.
-    final address = _initEngineOwnedPtr.address;
+    final address = _initEnginePtr.address;
     final channelCount = channels.count;
     final lowLatencyInt = lowLatency ? 1 : 0;
-    // Captured before the worker is dispatched. The worker validates them
-    // against the current claim, so an initialization superseded while it was
-    // queued is refused instead of building over the engine that replaced it.
-    final engineId = _claimedEngineId;
-    final lease = _claimedLease;
     final ret = await Isolate.run(
       () => _invokeInitEngine(
         address,
-        engineId,
-        lease,
         deviceId,
         sampleRate,
         bufferSize,
@@ -412,12 +381,10 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     return PlayerErrors.values[ret];
   }
 
-  late final _initEngineOwnedPtr =
+  late final _initEnginePtr =
       _lookup<
         ffi.NativeFunction<
           ffi.Int32 Function(
-            ffi.Int64,
-            ffi.Uint64,
             ffi.Int,
             ffi.UnsignedInt,
             ffi.UnsignedInt,
@@ -425,17 +392,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
             ffi.UnsignedInt,
           )
         >
-      >('initEngineOwned');
-
-  /// The engine id and lease returned by the most recent [prepareEngineInit].
-  ///
-  /// Held here rather than threaded through `SoLoud` because this binding is
-  /// already one-per-isolate, and an isolate belongs to exactly one
-  /// FlutterEngine — so these *are* this engine's claim. Every later call in
-  /// the initialization hands them back to native code, which refuses to act on
-  /// a lease that is no longer current.
-  int _claimedEngineId = -1;
-  int _claimedLease = 0;
+      >('initEngine');
 
   @override
   void prepareEngineInit() {
@@ -444,31 +401,23 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     // tear down what it built. Read the same way as in
     // [setDartEventCallbacks]; -1 on platforms that expose no engine id, which
     // are also the platforms with no engine-lifecycle hooks to act on it.
-    _claimedEngineId = ui.PlatformDispatcher.instance.engineId ?? -1;
-    _claimedLease = _prepareEngineInit(_claimedEngineId);
+    _prepareEngineInit(ui.PlatformDispatcher.instance.engineId ?? -1);
   }
 
   late final _prepareEngineInitPtr =
-      _lookup<ffi.NativeFunction<ffi.Uint64 Function(ffi.Int64)>>(
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
         'prepareEngineInit',
       );
   late final _prepareEngineInit = _prepareEngineInitPtr
-      .asFunction<int Function(int)>();
+      .asFunction<void Function(int)>();
 
   @override
-  void requestEngineShutdown() {
-    // A refusal means another FlutterEngine has claimed the native engine, so
-    // there is nothing of ours left to cancel. The teardown that follows is
-    // scoped to the same lease and will be refused for the same reason.
-    _requestEngineShutdown(_claimedEngineId, _claimedLease);
-  }
+  void requestEngineShutdown() => _requestEngineShutdown();
 
   late final _requestEngineShutdownPtr =
-      _lookup<ffi.NativeFunction<ffi.Bool Function(ffi.Int64, ffi.Uint64)>>(
-        'requestEngineShutdown',
-      );
+      _lookup<ffi.NativeFunction<ffi.Void Function()>>('requestEngineShutdown');
   late final _requestEngineShutdown = _requestEngineShutdownPtr
-      .asFunction<bool Function(int, int)>();
+      .asFunction<void Function()>();
 
   @override
   void setAndroidAAudioAttributes(bool managed) {
@@ -559,34 +508,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       );
   late final _debugTriggerAudioInterruption = _debugTriggerAudioInterruptionPtr
       .asFunction<void Function(int)>();
-
-  /// Test-only: park the next thread reaching [barrier] until it is disarmed.
-  ///
-  /// The engine-lifecycle interleavings that matter happen inside the
-  /// initialization worker while it holds the native init mutex, which no
-  /// amount of Dart-side sequencing can reach. Pass
-  /// [EngineLifecycleBarrier.none] to release whatever is parked.
-  void debugArmEngineLifecycleBarrier(EngineLifecycleBarrier barrier) {
-    _debugArmEngineLifecycleBarrier(barrier.index);
-  }
-
-  late final _debugArmEngineLifecycleBarrierPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int)>>(
-        'debugArmEngineLifecycleBarrier',
-      );
-  late final _debugArmEngineLifecycleBarrier =
-      _debugArmEngineLifecycleBarrierPtr.asFunction<void Function(int)>();
-
-  /// Test-only: whether something has parked on the armed barrier.
-  bool debugEngineLifecycleBarrierReached() =>
-      _debugEngineLifecycleBarrierReached();
-
-  late final _debugEngineLifecycleBarrierReachedPtr =
-      _lookup<ffi.NativeFunction<ffi.Bool Function()>>(
-        'debugEngineLifecycleBarrierReached',
-      );
-  late final _debugEngineLifecycleBarrierReached =
-      _debugEngineLifecycleBarrierReachedPtr.asFunction<bool Function()>();
 
   @override
   Future<PlayerErrors> changeDevice(int deviceId) async {
@@ -695,33 +616,23 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   void deinit() {
-    _disposeForEngine(_claimedEngineId, _claimedLease);
+    return _dispose();
   }
 
   @override
   Future<void> deinitAsync() async {
     // Run the blocking native teardown (device uninit) off the UI isolate so
-    // it does not freeze the app. Only the raw function pointer address and the
-    // claim (all sendable ints) are captured; the pointer is rebuilt and called
-    // in the worker.
-    //
-    // The claim is what stops this worker disposing somebody else's engine: it
-    // can reach init_deinit_mutex after a replacement engine has initialized,
-    // and native code refuses a teardown whose lease has moved on.
-    final address = _disposeForEnginePtr.address;
-    final engineId = _claimedEngineId;
-    final lease = _claimedLease;
-    await Isolate.run(
-      () => _invokeDisposeForEngine(address, engineId, lease),
-    );
+    // it does not freeze the app. Only the raw function pointer address (a
+    // sendable int) is captured; the pointer is rebuilt and called in the
+    // worker.
+    final address = _disposePtr.address;
+    await Isolate.run(() => _invokeVoidNative(address));
   }
 
-  late final _disposeForEnginePtr =
-      _lookup<ffi.NativeFunction<ffi.Bool Function(ffi.Int64, ffi.Uint64)>>(
-        'disposeForEngine',
-      );
-  late final _disposeForEngine = _disposeForEnginePtr
-      .asFunction<bool Function(int, int)>();
+  late final _disposePtr = _lookup<ffi.NativeFunction<ffi.Void Function()>>(
+    'dispose',
+  );
+  late final _dispose = _disposePtr.asFunction<void Function()>();
 
   @override
   bool isInited() {

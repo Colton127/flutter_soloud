@@ -179,12 +179,6 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   /// miniaudio notifications.
   void debugTriggerAudioInterruption({required bool began}) {}
 
-  /// No-op: web has no FlutterEngine lifecycle to interleave.
-  void debugArmEngineLifecycleBarrier(EngineLifecycleBarrier barrier) {}
-
-  /// No-op: web has no FlutterEngine lifecycle to interleave.
-  bool debugEngineLifecycleBarrierReached() => false;
-
   @override
   Future<PlayerErrors> changeDevice(int deviceId) async {
     final ret = wasmChangeDevice(deviceId);
