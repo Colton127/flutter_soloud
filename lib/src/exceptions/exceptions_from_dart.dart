@@ -48,6 +48,24 @@ class SoLoudInitializationStoppedByDeinitException extends SoLoudDartException {
   String get description => 'SoLoud.deinit() was called during initialization.';
 }
 
+/// An exception that is thrown when another `FlutterEngine` claimed the native
+/// engine while this initialization was in progress.
+///
+/// The native engine is process-global while the isolate driving it belongs to
+/// a single `FlutterEngine`. When a second engine starts initializing, the
+/// first one's initialization is superseded: native code refuses its callback
+/// registration rather than let it overwrite the live engine's callables, and
+/// this is thrown so the superseded isolate does not go on believing it is
+/// initialized. Only reachable in multi-engine setups such as add-to-app.
+class SoLoudInitializationSupersededException extends SoLoudDartException {
+  /// Creates a new [SoLoudInitializationSupersededException].
+  const SoLoudInitializationSupersededException([super.message]);
+
+  @override
+  String get description =>
+      'Another FlutterEngine claimed the native engine during initialization.';
+}
+
 /// An exception that is thrown when the temporary folder fails to be created
 /// or opened.
 class SoLoudTemporaryFolderFailedException extends SoLoudDartException {

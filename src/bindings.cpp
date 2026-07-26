@@ -57,8 +57,13 @@ int64_t dartCallbackOwnerEngineId = kNoEngineId;
 // Both fields are read and written together, so they are guarded by a mutex
 // rather than made individually atomic: a teardown must observe a consistent
 // (owner, generation) pair, and no interleaving of two atomic loads gives that.
-// This is a leaf lock -- never held while acquiring another lock or performing
-// any blocking work.
+//
+// Lock ordering: this may be held while acquiring
+// dart_callback_invocation_mutex, and never the reverse -- setDartEventCallback()
+// is the only place that nests them, because validating the lease and
+// publishing the callable pointers has to be one critical section. It is never
+// held while acquiring init_deinit_mutex or loadMutex, and never across a
+// device operation, a thread join, or any other blocking work.
 std::mutex engine_lifecycle_mutex;
 int64_t nativeInitOwnerEngineId = kNoEngineId;
 uint64_t engineInitGeneration = 0;
@@ -329,7 +334,13 @@ void stateChangedCallback(unsigned int state) {
 
 /// Set a Dart functions to call when an event occurs.
 ///
-FFI_PLUGIN_EXPORT void
+/// Returns false when [lease] is no longer the current claim, meaning this
+/// initialization has been superseded and the callables were not published.
+/// The caller must treat that as a failed initialization: the pointers it
+/// created are unreferenced by native code and must be closed, and it must not
+/// report itself as initialized -- the process-global engine now belongs to
+/// somebody else.
+FFI_PLUGIN_EXPORT bool
 setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
                      dartFileLoadedCallback_t file_loaded_callback,
                      dartStateChangedCallback_t state_changed_callback,
@@ -341,15 +352,24 @@ setDartEventCallback(dartVoiceEndedCallback_t voice_ended_callback,
   // was away in Dart would otherwise overwrite the callables of the engine that
   // replaced it -- silently, and with the replacement still believing its own
   // registration is live.
+  //
+  // Validation and publication are one critical section. Releasing the
+  // lifecycle mutex in between leaves the same race the check exists to close:
+  // a replacement can claim after the lease is found current but before these
+  // pointers are stored, and the stale engine wins anyway.
+  std::lock_guard<std::mutex> lifecycleGuard(engine_lifecycle_mutex);
+
   if (owner_engine_id != kNoEngineId &&
-      !engineLifecycleClaimIsCurrent(owner_engine_id, lease))
-    return;
+      (nativeInitOwnerEngineId != owner_engine_id ||
+       engineInitGeneration != lease))
+    return false;
 
   std::lock_guard<std::mutex> callbackGuard(dart_callback_invocation_mutex);
   dartVoiceEndedCallback.store(voice_ended_callback, std::memory_order_release);
   dartFileLoadedCallback.store(file_loaded_callback, std::memory_order_release);
   dartStateChangedCallback.store(state_changed_callback, std::memory_order_release);
   dartCallbackOwnerEngineId = owner_engine_id;
+  return true;
 }
 
 /// Make the three process-global Dart bridges inert.
@@ -512,13 +532,23 @@ FFI_PLUGIN_EXPORT uint64_t prepareEngineInit(int64_t owner_engine_id) {
 /// Scoped to a lease so a stale request cannot cancel a newer engine's
 /// initialization. [engine_id] of -1 skips the check, for callers with no
 /// engine lifecycle (web, and the legacy dispose() entry point).
-FFI_PLUGIN_EXPORT void requestEngineShutdown(int64_t engine_id,
+///
+/// Validating and raising the flag must be one critical section, for the same
+/// reason as in tryBeginEngineTeardown(): a replacement engine's
+/// prepareEngineInit() lowers the flag and re-claims under this mutex, so a
+/// check that releases it first can be overtaken and then cancel the
+/// replacement's initialization. Returns whether the request was accepted.
+FFI_PLUGIN_EXPORT bool requestEngineShutdown(int64_t engine_id,
                                              uint64_t lease) {
+  std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+
   if (engine_id != kNoEngineId &&
-      !engineLifecycleClaimIsCurrent(engine_id, lease))
-    return;
+      (nativeInitOwnerEngineId != engine_id ||
+       engineInitGeneration != lease))
+    return false;
 
   engine_shutdown_requested.store(true, std::memory_order_release);
+  return true;
 }
 
 /// Tear down a Player built by an initialization that turned out to be stale.

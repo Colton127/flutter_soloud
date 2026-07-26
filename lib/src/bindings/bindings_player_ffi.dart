@@ -297,19 +297,29 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     // The lease is validated natively: registration is refused if this
     // initialization was superseded while Dart was away, so a stale engine
     // cannot overwrite the callables of the engine that replaced it.
-    _setDartEventCallback(
+    final accepted = _setDartEventCallback(
       nativeVoiceEndedCallable!.nativeFunction,
       nativeFileLoadedCallable!.nativeFunction,
       nativeStateChangedCallable!.nativeFunction,
       engineId ?? -1,
       _claimedLease,
     );
+
+    if (!accepted) {
+      // Native code holds no reference to these, so close them here rather than
+      // leaking three NativeCallables per superseded initialization. Throwing
+      // is what stops the caller reporting itself as initialized: the
+      // process-global engine now belongs to another FlutterEngine, and this
+      // isolate has no callbacks registered against it.
+      disposeNativeCallables();
+      throw const SoLoudInitializationSupersededException();
+    }
   }
 
   late final _setDartEventCallbackPtr =
       _lookup<
         ffi.NativeFunction<
-          ffi.Void Function(
+          ffi.Bool Function(
             DartVoiceEndedCallbackT,
             DartFileLoadedCallbackT,
             DartStateChangedCallbackT,
@@ -320,7 +330,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       >('setDartEventCallback');
   late final _setDartEventCallback = _setDartEventCallbackPtr
       .asFunction<
-        void Function(
+        bool Function(
           DartVoiceEndedCallbackT,
           DartFileLoadedCallbackT,
           DartStateChangedCallbackT,
@@ -446,15 +456,19 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       .asFunction<int Function(int)>();
 
   @override
-  void requestEngineShutdown() =>
-      _requestEngineShutdown(_claimedEngineId, _claimedLease);
+  void requestEngineShutdown() {
+    // A refusal means another FlutterEngine has claimed the native engine, so
+    // there is nothing of ours left to cancel. The teardown that follows is
+    // scoped to the same lease and will be refused for the same reason.
+    _requestEngineShutdown(_claimedEngineId, _claimedLease);
+  }
 
   late final _requestEngineShutdownPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.Uint64)>>(
+      _lookup<ffi.NativeFunction<ffi.Bool Function(ffi.Int64, ffi.Uint64)>>(
         'requestEngineShutdown',
       );
   late final _requestEngineShutdown = _requestEngineShutdownPtr
-      .asFunction<void Function(int, int)>();
+      .asFunction<bool Function(int, int)>();
 
   @override
   void setAndroidAAudioAttributes(bool managed) {
