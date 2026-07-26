@@ -158,14 +158,22 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         if (id == null || teardownRequested) {
             return;
         }
-        teardownRequested = true;
 
+        // Marked as requested only once native code has accepted it. Setting it
+        // up front would make a failed library load, a failed JNI call, or a
+        // native worker that could not be spawned terminal: onDetachedFromEngine()
+        // is the retry for a hook that ran too early or hit a load that can still
+        // succeed later, and it would have found the flag already set.
+        //
+        // A native `false` is not always retryable -- it also means another
+        // engine owns the native engine, or nothing is claimed -- but retrying
+        // those costs one rejected call and keeps the recoverable cases working.
         if (!ensureNativeLibraryLoaded()) {
             return;
         }
 
         try {
-            nativeRequestEngineTeardownForEngine(id);
+            teardownRequested = nativeRequestEngineTeardownForEngine(id);
         } catch (UnsatisfiedLinkError error) {
             Log.w(
                 TAG,
