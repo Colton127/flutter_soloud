@@ -2367,7 +2367,7 @@ namespace SoLoud
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
 
-		if (mEndedVoiceCount != 0)
+		if (mEndedVoiceCount != 0 && !mDispatchingEndedVoices)
 		{
 			unlockAudioMutexAndDispatchEndedVoices_internal();
 			return;
@@ -2389,37 +2389,77 @@ namespace SoLoud
 	// The pending handles are copied out and the queue cleared *before* the
 	// unlock, so another thread that acquires the mutex and queues more work
 	// cannot corrupt this dispatch or have its own work consumed here.
+	//
+	// Voices that end while the batch is being dispatched -- a callback stopping
+	// another voice, or another thread stopping one meanwhile -- are picked up by
+	// the loop below instead of by a nested dispatch, which keeps delivery in
+	// queue order and keeps this frame's snapshot buffer the only one on the
+	// stack no matter how many times the embedder re-enters.
 	void Soloud::unlockAudioMutexAndDispatchEndedVoices_internal()
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+		SOLOUD_ASSERT(!mDispatchingEndedVoices);
 
 		unsigned int endedVoices[VOICE_COUNT];
-		unsigned int endedVoiceCount = mEndedVoiceCount;
+		unsigned int endedVoiceCount;
 		unsigned int i;
 
-		if (endedVoiceCount > VOICE_COUNT)
-			endedVoiceCount = VOICE_COUNT;
-		for (i = 0; i < endedVoiceCount; i++)
-			endedVoices[i] = mEndedVoiceQueue[i];
-		mEndedVoiceCount = 0;
+		// Claim the drain. Read and written under the mutex only, so a thread
+		// that queues a handle while this one dispatches either sees the guard
+		// still set (and leaves its handle for the loop below, which has not yet
+		// made its final empty-queue check) or sees it cleared (and dispatches
+		// the handle itself). Either way the handle is never stranded.
+		mDispatchingEndedVoices = true;
 
+		for (;;)
+		{
+			endedVoiceCount = mEndedVoiceCount;
+			if (endedVoiceCount > VOICE_COUNT)
+				endedVoiceCount = VOICE_COUNT;
+			for (i = 0; i < endedVoiceCount; i++)
+				endedVoices[i] = mEndedVoiceQueue[i];
+			mEndedVoiceCount = 0;
+
+			mInsideAudioThreadMutex = false;
+			if (mAudioThreadMutex)
+			{
+				Thread::unlockMutex(mAudioThreadMutex);
+			}
+
+			for (i = 0; i < endedVoiceCount; i++)
+			{
+				// Re-read for every handle: teardown on another thread, or the
+				// callback unregistering itself, must suppress the rest of the
+				// batch rather than keep calling a pointer the embedder has
+				// already retired.
+				auto voiceEndedCallback =
+					_voiceEndedCallback.load(std::memory_order_acquire);
+				if (voiceEndedCallback == nullptr)
+					break;
+
+				unsigned int handle = endedVoices[i];
+				voiceEndedCallback(&handle);
+			}
+
+			// Re-acquire to look for handles queued during the dispatch. No
+			// embedder lock is held here -- the callbacks have all returned --
+			// so this cannot reintroduce the lock-order inversion.
+			if (mAudioThreadMutex)
+			{
+				Thread::lockMutex(mAudioThreadMutex);
+			}
+			SOLOUD_ASSERT(!mInsideAudioThreadMutex);
+			mInsideAudioThreadMutex = true;
+
+			if (mEndedVoiceCount == 0)
+				break;
+		}
+
+		mDispatchingEndedVoices = false;
 		mInsideAudioThreadMutex = false;
 		if (mAudioThreadMutex)
 		{
 			Thread::unlockMutex(mAudioThreadMutex);
-		}
-
-		// Read after unlocking so a concurrent setVoiceEndedCallback(nullptr)
-		// during teardown is honoured as early as possible.
-		auto voiceEndedCallback =
-			_voiceEndedCallback.load(std::memory_order_acquire);
-		if (voiceEndedCallback == nullptr)
-			return;
-
-		for (i = 0; i < endedVoiceCount; i++)
-		{
-			unsigned int handle = endedVoices[i];
-			voiceEndedCallback(&handle);
 		}
 	}
 

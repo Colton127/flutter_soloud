@@ -215,6 +215,14 @@ struct CallbackState {
     // Handle the callback re-enters SoLoud with, if any.
     std::atomic<SoLoud::handle> reentryHandle{0};
     std::atomic<int> reentryVoiceCount{-1};
+    // Handle the *first* callback stops, to exercise re-entrant voice
+    // termination. Consumed once.
+    std::atomic<SoLoud::handle> stopOnFirstCallback{0};
+    // If set, the first callback unregisters the callback. Consumed once.
+    std::atomic<bool> unregisterOnFirstCallback{false};
+    // Callback nesting: >1 means a dispatch ran from inside another dispatch.
+    std::atomic<int> depth{0};
+    std::atomic<int> maxDepth{0};
 };
 
 CallbackState* gState = nullptr;
@@ -227,7 +235,19 @@ void recordVoiceEnded(unsigned int* handle) {
     if (state->engine != nullptr && state->engine->mInsideAudioThreadMutex)
         state->sawAudioMutexHeld.store(true);
 
+    const int depth = state->depth.fetch_add(1) + 1;
+    int seenMax = state->maxDepth.load();
+    while (depth > seenMax &&
+           !state->maxDepth.compare_exchange_weak(seenMax, depth)) {
+    }
+
     state->entered.store(true);
+
+    // Record on entry so `handles` reflects invocation order, nesting included.
+    {
+        std::lock_guard<std::mutex> lock(state->handlesMutex);
+        state->handles.push_back(*handle);
+    }
 
     // Take the embedder lock the way flutter_soloud's callback takes
     // sounds_mutex. Under the old code this is where the audio mutex got
@@ -240,6 +260,13 @@ void recordVoiceEnded(unsigned int* handle) {
     // Re-enter SoLoud from inside the callback: every one of these calls takes
     // the audio mutex itself.
     if (state->engine != nullptr) {
+        if (state->unregisterOnFirstCallback.exchange(false))
+            state->engine->setVoiceEndedCallback(nullptr);
+
+        const SoLoud::handle stopTarget = state->stopOnFirstCallback.exchange(0);
+        if (stopTarget != 0)
+            state->engine->stop(stopTarget);
+
         const SoLoud::handle reentry = state->reentryHandle.load();
         if (reentry != 0) {
             state->engine->setVolume(reentry, 0.5f);
@@ -248,10 +275,7 @@ void recordVoiceEnded(unsigned int* handle) {
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(state->handlesMutex);
-        state->handles.push_back(*handle);
-    }
+    state->depth.fetch_sub(1);
 }
 
 // ---- Tests ----------------------------------------------------------------
@@ -388,6 +412,96 @@ void testCallbackCanReenterSoloud() {
     gState = nullptr;
 }
 
+// A callback that terminates another voice queues a handle from inside the
+// dispatch loop. Without the dispatch-in-progress guard the nested unlock
+// starts its own dispatch, so the new handle jumps the rest of the batch
+// (A -> C -> B for a queued [A, B]) and every level stacks another
+// VOICE_COUNT-sized snapshot on the stack.
+void testReentrantStopDoesNotRecurseOrReorder() {
+    std::printf("Test: a callback stopping another voice keeps FIFO order and "
+                "does not recurse\n");
+    Watchdog watchdog(__func__, std::chrono::seconds(10));
+
+    Rig rig;
+    // A second source so stopAudioSource() below queues exactly the first two
+    // voices and leaves the third for the callback to stop.
+    SilenceSource otherSource;
+    CallbackState state;
+    state.engine = &rig.engine;
+    gState = &state;
+    rig.engine.setVoiceEndedCallback(recordVoiceEnded);
+
+    const SoLoud::handle first = rig.startVoice(rig.source);
+    const SoLoud::handle second = rig.startVoice(rig.source);
+    const SoLoud::handle stoppedByCallback = rig.startVoice(otherSource);
+    rig.mix();
+
+    std::vector<SoLoud::handle> batch = {first, second};
+    std::sort(batch.begin(), batch.end(),
+              [](SoLoud::handle a, SoLoud::handle b) {
+                  return (a & 0xfff) < (b & 0xfff);
+              });
+
+    state.stopOnFirstCallback.store(stoppedByCallback);
+    rig.engine.stopAudioSource(rig.source);
+
+    const std::vector<SoLoud::handle> expected = {
+        batch[0], batch[1], stoppedByCallback};
+
+    EXPECT(state.handles.size() == expected.size(),
+           "expected %zu ended handles, got %zu", expected.size(),
+           state.handles.size());
+    if (state.handles.size() == expected.size()) {
+        for (unsigned int i = 0; i < expected.size(); ++i) {
+            EXPECT(state.handles[i] == expected[i],
+                   "ended handle %u was %u, expected %u",
+                   i, state.handles[i], expected[i]);
+        }
+    }
+    EXPECT(state.maxDepth.load() == 1,
+           "dispatch recursed %d levels deep, expected a flat drain",
+           state.maxDepth.load());
+    EXPECT(rig.engine.mEndedVoiceCount == 0,
+           "pending queue not drained, %u entries left",
+           rig.engine.mEndedVoiceCount);
+    EXPECT(!state.sawAudioMutexHeld.load(),
+           "callback ran while the audio mutex was held");
+
+    gState = nullptr;
+}
+
+// Unregistering mid-batch must suppress the handles that have not been
+// delivered yet, otherwise the atomic setter buys nothing during teardown: the
+// dispatcher would keep calling a pointer the embedder has already retired.
+void testUnregisteringMidBatchSuppressesRemainingHandles() {
+    std::printf("Test: clearing the callback mid-batch stops the rest of the "
+                "batch\n");
+    Watchdog watchdog(__func__, std::chrono::seconds(10));
+
+    Rig rig;
+    CallbackState state;
+    state.engine = &rig.engine;
+    gState = &state;
+    rig.engine.setVoiceEndedCallback(recordVoiceEnded);
+
+    constexpr unsigned int kVoices = 4;
+    for (unsigned int i = 0; i < kVoices; ++i)
+        rig.startVoice(rig.source);
+    rig.mix();
+
+    state.unregisterOnFirstCallback.store(true);
+    rig.engine.stopAll();
+
+    EXPECT(state.handles.size() == 1,
+           "expected dispatch to stop after the callback unregistered itself, "
+           "got %zu handles", state.handles.size());
+    EXPECT(rig.engine.mEndedVoiceCount == 0,
+           "pending queue not drained after unregistering, %u entries left",
+           rig.engine.mEndedVoiceCount);
+
+    gState = nullptr;
+}
+
 void testNullCallbackDrainsPendingHandles() {
     std::printf("Test: a null callback drains the queue without dispatching\n");
     Watchdog watchdog(__func__, std::chrono::seconds(10));
@@ -443,26 +557,38 @@ void testLockOrderInversionDoesNotDeadlock() {
 
     std::atomic<bool> soundsMutexHeld{false};
     std::atomic<bool> disposeDone{false};
+    // Both handshakes are hard requirements, not best-effort delays: if either
+    // times out the two lock orders never overlapped and even the pre-fix engine
+    // would sail through, so the test has to fail rather than pass vacuously.
+    // (EXPECT touches non-atomic counters, so the worker records its result and
+    // the assertion happens on the main thread after the join.)
+    std::atomic<bool> sawCallbackEntry{false};
 
     // The "disposer": sounds_mutex -> soloud.stop() -> audio mutex.
     std::thread disposer([&] {
         std::lock_guard<std::recursive_mutex> lock(soundsMutex);
         soundsMutexHeld.store(true);
-        // Give the other thread time to reach the callback while we still hold
-        // the embedder lock; that is the window the old code deadlocked in.
-        waitFor([&] { return state.entered.load(); },
-                std::chrono::milliseconds(500));
+        // Hold the embedder lock until the other thread is inside the callback;
+        // that overlap is the window the old code deadlocked in.
+        sawCallbackEntry.store(waitFor([&] { return state.entered.load(); },
+                                       std::chrono::seconds(2)));
         rig.engine.stop(disposed);
         disposeDone.store(true);
     });
 
     // The "audio side": audio mutex -> voice-ended callback -> sounds_mutex.
-    waitFor([&] { return soundsMutexHeld.load(); },
-            std::chrono::milliseconds(500));
+    const bool disposerReady = waitFor([&] { return soundsMutexHeld.load(); },
+                                       std::chrono::seconds(2));
     rig.engine.stop(ending);
 
     disposer.join();
 
+    EXPECT(disposerReady,
+           "the disposing thread never took the embedder lock, so the two lock "
+           "orders never overlapped");
+    EXPECT(sawCallbackEntry.load(),
+           "the voice-ended callback never ran while the embedder lock was "
+           "held, so the two lock orders never overlapped");
     EXPECT(disposeDone.load(), "the disposing thread never completed");
     EXPECT(state.handles.size() == 2,
            "expected both voices to report ended, got %zu",
@@ -488,6 +614,8 @@ int main() {
     testNaturalEndOfStreamDispatchesOutsideMutex();
     testMultipleEndedVoicesArriveInQueueOrder();
     testCallbackCanReenterSoloud();
+    testReentrantStopDoesNotRecurseOrReorder();
+    testUnregisteringMidBatchSuppressesRemainingHandles();
     testNullCallbackDrainsPendingHandles();
     testLockOrderInversionDoesNotDeadlock();
 

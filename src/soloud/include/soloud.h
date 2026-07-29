@@ -186,9 +186,16 @@ namespace SoLoud
 		}
 
 		// Handles of voices that ended while the audio mutex was held, pending
-		// dispatch. Both members are only touched with the audio mutex held.
+		// dispatch. All three members are only touched with the audio mutex held.
 		unsigned int mEndedVoiceQueue[VOICE_COUNT];
 		unsigned int mEndedVoiceCount = 0;
+		// True while a thread is draining mEndedVoiceQueue. A callback that
+		// stops another voice re-enters SoLoud and would otherwise start a
+		// nested dispatch from inside the current one, delivering the newer
+		// handle ahead of the rest of the batch and stacking another
+		// VOICE_COUNT-sized snapshot per level. With the guard set, the nested
+		// unlock just leaves its handle queued for the running drain loop.
+		bool mDispatchingEndedVoices = false;
 
 		// Set the callback to call when the device receive a state changed
 		void (*_stateChangedCallback)(unsigned int) = nullptr;
