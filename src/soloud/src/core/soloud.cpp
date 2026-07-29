@@ -2366,10 +2366,60 @@ namespace SoLoud
 	void Soloud::unlockAudioMutex_internal()
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+
+		if (mEndedVoiceCount != 0)
+		{
+			unlockAudioMutexAndDispatchEndedVoices_internal();
+			return;
+		}
+
 		mInsideAudioThreadMutex = false;
 		if (mAudioThreadMutex)
 		{
 			Thread::unlockMutex(mAudioThreadMutex);
+		}
+	}
+
+	// Release the audio mutex, then notify the embedder about voices that ended
+	// while it was held. stopVoice_internal() cannot call out directly because it
+	// runs under the mutex, and an embedder callback that takes its own locks
+	// there inverts the lock order (and one that stalls or crashes strands the
+	// mutex), wedging every later SoLoud call, teardown included.
+	//
+	// The pending handles are copied out and the queue cleared *before* the
+	// unlock, so another thread that acquires the mutex and queues more work
+	// cannot corrupt this dispatch or have its own work consumed here.
+	void Soloud::unlockAudioMutexAndDispatchEndedVoices_internal()
+	{
+		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+
+		unsigned int endedVoices[VOICE_COUNT];
+		unsigned int endedVoiceCount = mEndedVoiceCount;
+		unsigned int i;
+
+		if (endedVoiceCount > VOICE_COUNT)
+			endedVoiceCount = VOICE_COUNT;
+		for (i = 0; i < endedVoiceCount; i++)
+			endedVoices[i] = mEndedVoiceQueue[i];
+		mEndedVoiceCount = 0;
+
+		mInsideAudioThreadMutex = false;
+		if (mAudioThreadMutex)
+		{
+			Thread::unlockMutex(mAudioThreadMutex);
+		}
+
+		// Read after unlocking so a concurrent setVoiceEndedCallback(nullptr)
+		// during teardown is honoured as early as possible.
+		auto voiceEndedCallback =
+			_voiceEndedCallback.load(std::memory_order_acquire);
+		if (voiceEndedCallback == nullptr)
+			return;
+
+		for (i = 0; i < endedVoiceCount; i++)
+		{
+			unsigned int handle = endedVoices[i];
+			voiceEndedCallback(&handle);
 		}
 	}
 
