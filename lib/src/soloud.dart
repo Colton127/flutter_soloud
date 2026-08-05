@@ -448,7 +448,9 @@ interface class SoLoud {
       }
     }
 
-    await _throwIfInitializationWasStopped(requestGeneration);
+    if (requestGeneration != _lifecycleGeneration) {
+      await _waitForInitializationTeardownAndThrow();
+    }
     await _initialize(
       initializationGeneration: requestGeneration,
       device: device,
@@ -479,7 +481,9 @@ interface class SoLoud {
       await pendingDeinit;
     }
 
-    await _throwIfInitializationWasStopped(initializationGeneration);
+    if (initializationGeneration != _lifecycleGeneration) {
+      await _waitForInitializationTeardownAndThrow();
+    }
 
     final nativeIsInitialized = _controller.soLoudFFI.isInited();
 
@@ -519,7 +523,9 @@ interface class SoLoud {
       );
       _controller.soLoudFFI.clearDartCallbackRegistrations();
       await _deinitAsync(invalidateInitialization: false);
-      await _throwIfInitializationWasStopped(initializationGeneration);
+      if (initializationGeneration != _lifecycleGeneration) {
+        await _waitForInitializationTeardownAndThrow();
+      }
     }
 
     _controller.soLoudFFI.prepareEngineInit();
@@ -537,7 +543,9 @@ interface class SoLoud {
       channels,
       lowLatency,
     );
-    await _throwIfInitializationWasStopped(initializationGeneration);
+    if (initializationGeneration != _lifecycleGeneration) {
+      await _waitForInitializationTeardownAndThrow();
+    }
     _logPlayerError(error, from: 'initialize() result');
     if (error == PlayerErrors.noError) {
       /// get the visualization flag from the player on C side.
@@ -556,10 +564,14 @@ interface class SoLoud {
         // Register fresh Dart callbacks only after the native player has been
         // reset and re-initialized.
         await _initializeNativeCallbacks();
-        await _throwIfInitializationWasStopped(initializationGeneration);
+        if (initializationGeneration != _lifecycleGeneration) {
+          await _waitForInitializationTeardownAndThrow();
+        }
 
         await _loader.initialize();
-        await _throwIfInitializationWasStopped(initializationGeneration);
+        if (initializationGeneration != _lifecycleGeneration) {
+          await _waitForInitializationTeardownAndThrow();
+        }
         _nativeCallbacksInitialized = true;
       } catch (_) {
         if (_controller.soLoudFFI.isInited()) {
@@ -672,11 +684,7 @@ interface class SoLoud {
     _activeSounds.clear();
   }
 
-  Future<void> _throwIfInitializationWasStopped(int generation) async {
-    if (generation == _lifecycleGeneration) {
-      return;
-    }
-
+  Future<void> _waitForInitializationTeardownAndThrow() async {
     final pendingDeinit = _pendingAsyncDeinit;
     if (pendingDeinit != null) {
       await pendingDeinit;
