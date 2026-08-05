@@ -407,17 +407,12 @@ interface class SoLoud {
     bool lowLatency = true,
     AndroidAAudioAttributes androidAAudioAttributes =
         AndroidAAudioAttributes.mediaMusic,
-  }) async {
+  }) {
+    final requestGeneration = _lifecycleGeneration;
     final previous = _pendingInitialization;
-    if (previous != null) {
-      try {
-        await previous;
-      } catch (_) {
-        // A failed initialization must not permanently block a retry.
-      }
-    }
-
-    final initialization = _initialize(
+    final initialization = _runQueuedInitialization(
+      previous: previous,
+      requestGeneration: requestGeneration,
       device: device,
       automaticCleanup: automaticCleanup,
       sampleRate: sampleRate,
@@ -427,16 +422,47 @@ interface class SoLoud {
       androidAAudioAttributes: androidAAudioAttributes,
     );
     _pendingInitialization = initialization;
-    try {
-      await initialization;
-    } finally {
+    return initialization.whenComplete(() {
       if (identical(_pendingInitialization, initialization)) {
         _pendingInitialization = null;
       }
+    });
+  }
+
+  Future<void> _runQueuedInitialization({
+    required Future<void>? previous,
+    required int requestGeneration,
+    required PlaybackDevice? device,
+    required bool automaticCleanup,
+    required int sampleRate,
+    required int bufferSize,
+    required Channels channels,
+    required bool lowLatency,
+    required AndroidAAudioAttributes androidAAudioAttributes,
+  }) async {
+    if (previous != null) {
+      try {
+        await previous;
+      } catch (_) {
+        // A failed initialization must not permanently block a retry.
+      }
     }
+
+    await _throwIfInitializationWasStopped(requestGeneration);
+    await _initialize(
+      initializationGeneration: requestGeneration,
+      device: device,
+      automaticCleanup: automaticCleanup,
+      sampleRate: sampleRate,
+      bufferSize: bufferSize,
+      channels: channels,
+      lowLatency: lowLatency,
+      androidAAudioAttributes: androidAAudioAttributes,
+    );
   }
 
   Future<void> _initialize({
+    required int initializationGeneration,
     PlaybackDevice? device,
     bool automaticCleanup = false,
     int sampleRate = 44100,
@@ -452,6 +478,8 @@ interface class SoLoud {
     if (pendingDeinit != null) {
       await pendingDeinit;
     }
+
+    await _throwIfInitializationWasStopped(initializationGeneration);
 
     final nativeIsInitialized = _controller.soLoudFFI.isInited();
 
@@ -490,10 +518,10 @@ interface class SoLoud {
         'during the current lifetime of the app.',
       );
       _controller.soLoudFFI.clearDartCallbackRegistrations();
-      await deinitAsync();
+      await _deinitAsync(invalidateInitialization: false);
+      await _throwIfInitializationWasStopped(initializationGeneration);
     }
 
-    final initializationGeneration = _lifecycleGeneration;
     _controller.soLoudFFI.prepareEngineInit();
 
     // Must be set before the engine opens the device so the backend picks it
@@ -596,13 +624,20 @@ interface class SoLoud {
   /// Stops the engine and disposes native resources without blocking the UI
   /// isolate while the native audio device is being stopped.
   Future<void> deinitAsync() async {
+    await _deinitAsync(invalidateInitialization: true);
+  }
+
+  Future<void> _deinitAsync({required bool invalidateInitialization}) async {
     final existing = _pendingAsyncDeinit;
     if (existing != null) {
+      if (invalidateInitialization) {
+        _predeinit();
+      }
       await existing;
       return;
     }
 
-    _predeinit();
+    _predeinit(invalidateInitialization: invalidateInitialization);
     final teardown = _deinitNativeAsync();
     _pendingAsyncDeinit = teardown;
     try {
@@ -614,9 +649,11 @@ interface class SoLoud {
     }
   }
 
-  void _predeinit() {
+  void _predeinit({bool invalidateInitialization = true}) {
     _controller.soLoudFFI.requestEngineShutdown();
-    _lifecycleGeneration++;
+    if (invalidateInitialization) {
+      _lifecycleGeneration++;
+    }
     _nativeCallbacksInitialized = false;
     if (_controller.soLoudFFI.isMixerOutputCaptureRunning()) {
       _controller.soLoudFFI.stopMixerOutputCapture();

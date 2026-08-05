@@ -434,6 +434,12 @@ extern "C"
     // Set the callback for when a voice is ended/stopped
     player.get()->setVoiceEndedCallback(voiceEndedCallback);
 
+    if (engine_shutdown_requested.load(std::memory_order_acquire))
+    {
+      engine_initialized.store(false, std::memory_order_release);
+      return backendNotInited;
+    }
+
     engine_initialized.store(true, std::memory_order_release);
 
     return PlayerErrors::noError;
@@ -522,6 +528,9 @@ extern "C"
     engine_initialized.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> guard(init_deinit_mutex);
     std::lock_guard<std::mutex> guard_load(loadMutex);
+    // An in-flight init may have published readiness before releasing the
+    // lifecycle lock. Reassert shutdown after acquiring it.
+    engine_initialized.store(false, std::memory_order_release);
     if (player.get() == nullptr)
       return;
     player.get()->disposeAllSound();
