@@ -273,6 +273,9 @@ interface class SoLoud {
   /// The single in-flight asynchronous native teardown, if any.
   Future<void>? _pendingAsyncDeinit;
 
+  /// Serializes init calls while preserving reinitialization behavior.
+  Future<void>? _pendingInitialization;
+
   /// The current status of the engine. This is `true` when the engine
   /// has been initialized and is immediately ready.
   ///
@@ -396,6 +399,44 @@ interface class SoLoud {
   /// controls the *focus request* — for correct ducking they should match.)
   /// Ignored when `lowLatency` is true, on non-Android platforms, and on web.
   Future<void> init({
+    PlaybackDevice? device,
+    bool automaticCleanup = false,
+    int sampleRate = 44100,
+    int bufferSize = 2048,
+    Channels channels = Channels.stereo,
+    bool lowLatency = true,
+    AndroidAAudioAttributes androidAAudioAttributes =
+        AndroidAAudioAttributes.mediaMusic,
+  }) async {
+    final previous = _pendingInitialization;
+    if (previous != null) {
+      try {
+        await previous;
+      } catch (_) {
+        // A failed initialization must not permanently block a retry.
+      }
+    }
+
+    final initialization = _initialize(
+      device: device,
+      automaticCleanup: automaticCleanup,
+      sampleRate: sampleRate,
+      bufferSize: bufferSize,
+      channels: channels,
+      lowLatency: lowLatency,
+      androidAAudioAttributes: androidAAudioAttributes,
+    );
+    _pendingInitialization = initialization;
+    try {
+      await initialization;
+    } finally {
+      if (identical(_pendingInitialization, initialization)) {
+        _pendingInitialization = null;
+      }
+    }
+  }
+
+  Future<void> _initialize({
     PlaybackDevice? device,
     bool automaticCleanup = false,
     int sampleRate = 44100,
@@ -588,18 +629,8 @@ interface class SoLoud {
   }
 
   void _postdeinit() {
-    // Stop the engine first: natively this stops all sounds, clears the
-    // Dart callback registrations and stops the audio device, joining the
-    // audio thread. Closing the NativeCallable trampolines before this
-    // point races with the audio thread invoking them (voices ending from
-    // the mixing thread) and crashes with "Callback invoked after it has
-    // been deleted".
-    _controller.soLoudFFI.deinit();
-    // Destroy the sounds (and their BufferStreams) before closing the
-    // NativeCallable trampolines: an in-flight addData on another isolate
-    // could otherwise invoke a freed metadata/buffering trampoline while
-    // its BufferStream is still alive.
-    _controller.soLoudFFI.disposeAllSound();
+    // Native teardown has completed before this runs, so no native thread can
+    // invoke a callback while its owning NativeCallable is being closed.
     _controller.soLoudFFI.disposeNativeCallables();
     _activeSounds.clear();
   }
