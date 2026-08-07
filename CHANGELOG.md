@@ -1,4 +1,5 @@
 ##### 4.1.7 (X Xxx 2026)
+- fix: a failed `changeDevice()` no longer freezes the app (ANR on Android). The cleanup after a device that could not be started ran while SoLoud's audio mutex was held, deadlocking the calling thread against the audio thread. The failure now surfaces as `SoLoudAudioDeviceFailedToStartCppException`. Thanks to @Colton127
 - fix: `changeDevice()` now selects the system default device when called without an argument and reports device-change failures instead of silently succeeding. Thanks to @Colton127 #532
 - fix: `init()` no longer blocks the UI thread while the audio device starts. On Android a slow or busy audio HAL could stall the platform thread long enough for the app to be reported as not responding; engine startup and teardown now run on a short-lived worker isolate. Thanks to @Colton127 #481
 - added `deinitAsync()`, a non-blocking counterpart to `deinit()`. `deinit()` is unchanged and still supported, but it can stall the UI thread when it lands while `init()` is still starting the device — prefer `deinitAsync()` in new code.

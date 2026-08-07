@@ -690,9 +690,20 @@ namespace SoLoud
         if (startResult != MA_SUCCESS)
         {
             soloud_platform_log("miniaudio_changeDevice_impl: ma_device_start failed with error %d\n", startResult);
+            // Drop the audio mutex BEFORE tearing the half-started device down.
+            // `ma_device_uninit()` waits for the backend's data callback to
+            // return, and that callback (`soloud_miniaudio_audiomixer` ->
+            // `Soloud::mix`) blocks on this very mutex. Uniniting while holding
+            // it deadlocks the calling thread against the audio thread: the
+            // permanent freeze/ANR seen on Android when AAudio falls back to
+            // the legacy AudioTrack path.
+            soloud->unlockAudioMutex_internal();
             ma_device_uninit(&gDevice);
             gDeviceInitialized = false;
-            soloud->unlockAudioMutex_internal();
+            // The device never reached a running state and is now gone, so
+            // don't leave `deinit()` polling for a "stopped" notification that
+            // can no longer arrive.
+            gDeviceStopped = true;
             return UNKNOWN_ERROR;
         }
 
