@@ -6,8 +6,10 @@
 # plugin translation unit set. It is built with the test-only hooks enabled
 # (SOLOUD_LIFECYCLE_TEST_HOOKS), which the shipping build never defines.
 #
-# The scenarios that need an initialized engine also need an output device. On a
-# machine without one they report SKIPPED and the run still exits 0.
+# Every scenario needs an engine that can initialize. miniaudio falls back to its
+# null backend on a machine with no audio hardware, so a failure to open one is
+# treated as a broken environment rather than a reason to pass vacuously; set
+# SOLOUD_LIFECYCLE_TEST_ALLOW_NO_DEVICE=1 to downgrade that to a skip.
 #
 # Pass --tsan to build under ThreadSanitizer.
 

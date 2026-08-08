@@ -1,25 +1,32 @@
 // Standalone native regression tests for FlutterEngine lifecycle ownership.
 //
 // The native engine is process-global: one Player, one output device, one
-// lifecycle scheduler, one set of Dart callback pointers. The Dart isolate that
-// drives it belongs to a single FlutterEngine, which can go away while the
-// process keeps running -- a cached engine behind audio_service, an add-to-app
-// host destroying an engine, or a hot restart swapping the isolate underneath a
-// live engine. The Android plugin bridges those transitions into the two
-// entry points exercised here:
+// lifecycle scheduler, and Dart callable pointers held both globally and inside
+// every buffer-backed sound. The Dart isolate that drives it belongs to a
+// single FlutterEngine, which can go away while the process keeps running -- a
+// cached engine behind audio_service, an add-to-app host destroying an engine,
+// or a hot restart swapping the isolate underneath a live engine. The Android
+// plugin bridges those transitions into the two entry points exercised here:
 //
 //   clearDartCallbackRegistrationsForEngine()  (hot restart, and detach)
 //   requestEngineTeardownForEngine()           (engine destroy)
 //
 // What these tests pin down:
 //
-//   * a retired callable is never invoked again;
+//   * retirement makes *every* callable inert synchronously -- the four global
+//     ones and the per-BufferStream/PullBufferStream ones, which no retirement
+//     can afford to walk to. The per-source ones are driven through the real
+//     dispatchers the audio thread uses, not a stand-in;
+//   * a replacement engine's registration does not resurrect a retired
+//     engine's sources;
 //   * callback ownership and lifecycle ownership are separate, so an engine
 //     that owns the callables but not the claim retires its own callables and
 //     still cannot dispose the engine that replaced it;
 //   * a teardown queued by a destroyed engine cannot dispose or disturb the
 //     engine that claimed after it;
-//   * both hooks return promptly even while init_deinit_mutex is held by an
+//   * an engine destroyed while its initialization is parked inside the device
+//     open still ends up with nothing left running;
+//   * both hooks return promptly while init_deinit_mutex is held by an
 //     unrelated operation -- they run on Android's platform thread, where
 //     waiting for a device operation is an ANR;
 //   * duplicate destroy/detach notifications tear down exactly once.
@@ -28,6 +35,7 @@
 //
 //   ./test/run_engine_lifecycle_test.sh
 
+#include "audiobuffer/metadata_ffi.h"
 #include "enums.h"
 
 #include <atomic>
@@ -50,14 +58,30 @@ extern "C"
                                                   unsigned int *, uint64_t *),
                               void (*state_changed)(enum PlayerStateEvents *),
                               int64_t owner_engine_id);
+    bool setMixerOutputCallbackForEngine(void (*callback)(unsigned char *,
+                                                          uint64_t),
+                                         int64_t owner_engine_id);
     bool clearDartCallbackRegistrationsForEngine(int64_t engine_id);
     bool requestEngineTeardownForEngine(int64_t engine_id);
+    enum PlayerErrors setPullBufferStream(
+        unsigned int *hash, unsigned int bufferSizeBytes,
+        double bufferTriggerPosition, unsigned int sampleRate,
+        unsigned int channels, int format, uint64_t audioSizeBytes,
+        dartOnBufferingCallback_t onBufferingCallback,
+        dartOnMetadataCallback_t onMetadataCallback,
+        dartOnMoreDataIsNeededCallback_t onMoreDataIsNeededCallback,
+        dartOnAudioDurationCallback_t onAudioDurationCallback);
 
     // Test-only hooks (SOLOUD_LIFECYCLE_TEST_HOOKS).
     void soloudTestLockInitDeinit();
     void soloudTestUnlockInitDeinit();
     void soloudTestInvokeStateChanged(unsigned int state);
+    bool soloudTestInvokeStreamCallbacks(unsigned int hash);
     int soloudTestPlayerIsInited();
+    int soloudTestCallbacksAreLive();
+    void soloudTestArmInitBarrier();
+    void soloudTestWaitInitBarrierReached();
+    void soloudTestReleaseInitBarrier();
 }
 
 namespace
@@ -67,9 +91,9 @@ constexpr int64_t kEngineA = 1001;
 constexpr int64_t kEngineB = 1002;
 constexpr int64_t kNoEngineId = -1;
 
-// A lifecycle hook does a handful of atomic stores and spawns a detached
-// worker. The number this excludes is the one that matters: the seconds a
-// device stop or a scheduler join can take while init_deinit_mutex is held.
+// A lifecycle hook takes one uncontended lock and does a handful of stores. The
+// number this excludes is the one that matters: the seconds a device stop, a
+// scheduler join or a decode can take while init_deinit_mutex is held.
 constexpr long long kPlatformThreadBudgetMs = 100;
 
 int gFailures = 0;
@@ -90,6 +114,7 @@ int gAssertions = 0;
 std::atomic<int> gVoiceEndedCalls{0};
 std::atomic<int> gFileLoadedCalls{0};
 std::atomic<int> gStateChangedCalls{0};
+std::atomic<int> gStreamCallbackCalls{0};
 
 // Stand-ins for the Dart trampolines. Native code owns the pointers it hands
 // over, exactly as the real callables do.
@@ -115,16 +140,34 @@ void onStateChanged(enum PlayerStateEvents *state)
     ++gStateChangedCalls;
 }
 
+void onBuffering(bool, unsigned int, double) { ++gStreamCallbackCalls; }
+void onMetadata(struct AudioMetadataFFI) { ++gStreamCallbackCalls; }
+void onMoreDataIsNeeded(uint64_t) { ++gStreamCallbackCalls; }
+void onAudioDuration(double) { ++gStreamCallbackCalls; }
+
 void registerCallbacksFor(int64_t engineId)
 {
     setDartEventCallback(onVoiceEnded, onFileLoaded, onStateChanged, engineId);
 }
 
-/// Number of times the state-changed bridge reached a callable.
-int stateChangedCallsAfterDispatch()
+/// How many times one dispatch through the global state-changed bridge reached
+/// a callable: 1 while it is live, 0 once it has been retired.
+int stateChangedDelta()
 {
+    const int before = gStateChangedCalls.load();
     soloudTestInvokeStateChanged(0);
-    return gStateChangedCalls.load();
+    return gStateChangedCalls.load() - before;
+}
+
+/// How many of a real PullBufferStream's four callables one dispatch reached.
+/// Goes through the same dispatchers the audio thread calls, and is measured as
+/// a delta because creating the stream already fires some of them.
+int streamCallDelta(unsigned int hash)
+{
+    const int before = gStreamCallbackCalls.load();
+    if (!soloudTestInvokeStreamCallbacks(hash))
+        return -1;
+    return gStreamCallbackCalls.load() - before;
 }
 
 template <typename Predicate>
@@ -155,46 +198,105 @@ void resetGlobalState()
     gVoiceEndedCalls = 0;
     gFileLoadedCalls = 0;
     gStateChangedCalls = 0;
+    gStreamCallbackCalls = 0;
 }
-
-/// Whether a real output device could be opened. Several scenarios need an
-/// initialized engine; on a machine without any audio device those are skipped
-/// rather than reported as failures.
-bool gHasAudioDevice = false;
 
 bool initEngineAs(int64_t engineId)
 {
     prepareEngineInit(engineId);
-    const PlayerErrors error = initEngine(-1, 44100, 2048, 2, 0);
-    return error == noError;
+    return initEngine(-1, 44100, 2048, 2, 0) == noError;
+}
+
+/// Create a PullBufferStream holding all four Dart callables. Returns 0 on
+/// failure.
+unsigned int createPullStream()
+{
+    unsigned int hash = 0;
+    const PlayerErrors error = setPullBufferStream(
+        &hash, 1024 * 64, 0.5, 44100, 2, static_cast<int>(BufferType::PCM_S16LE),
+        1024 * 1024, onBuffering, onMetadata, onMoreDataIsNeeded,
+        onAudioDuration);
+    return error == noError ? hash : 0;
 }
 
 // ---------------------------------------------------------------------------
 
 /// Hot restart keeps the same FlutterEngine -- same engine id, same lifecycle
-/// claim -- and replaces only the isolate. The callables must go inert
-/// immediately; the engine must stay claimed, because the new isolate's init()
-/// is what disposes the stale engine.
-void testHotRestartRetiresCallablesButKeepsClaim()
+/// claim -- and replaces only the isolate. Every callable must go inert
+/// immediately, including the ones living inside sounds, which is the part a
+/// retirement cannot afford to walk to. The engine stays claimed, because the
+/// new isolate's init() is what disposes the stale engine.
+void testHotRestartRetiresEveryCallable()
 {
-    std::printf("hot restart retires callables and keeps the claim\n");
+    std::printf("hot restart retires every callable, sources included\n");
     resetGlobalState();
 
-    prepareEngineInit(kEngineA);
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
     registerCallbacksFor(kEngineA);
 
-    EXPECT(stateChangedCallsAfterDispatch() == 1,
-           "a registered callable should be invoked");
+    const unsigned int hash = createPullStream();
+    EXPECT(hash != 0, "a pull buffer stream should be created");
+
+    EXPECT(stateChangedDelta() == 1,
+           "a registered global callable should be invoked");
+    EXPECT(streamCallDelta(hash) == 4,
+           "all four registered stream callables should be invoked");
 
     EXPECT(clearDartCallbackRegistrationsForEngine(kEngineA),
            "the owning engine should be allowed to retire its callables");
-    EXPECT(stateChangedCallsAfterDispatch() == 1,
-           "a retired callable must never be invoked again");
+
+    EXPECT(soloudTestCallbacksAreLive() == 0,
+           "nothing may be live once the owner has retired");
+    EXPECT(stateChangedDelta() == 0,
+           "a retired global callable must never be invoked again");
+    EXPECT(streamCallDelta(hash) == 0,
+           "retired stream callables must never be invoked again -- these are "
+           "the ones the audio thread calls, and the isolate is gone");
 
     // The claim survived the restart, so a later destroy of the same
     // FlutterEngine is still accepted.
     EXPECT(requestEngineTeardownForEngine(kEngineA),
            "hot restart must not release the lifecycle claim");
+
+    resetGlobalState();
+}
+
+/// A replacement engine publishes its own registration while a retired engine's
+/// sources are still in the Player. Those sources must stay dead: their
+/// callables belong to an isolate that no longer exists.
+void testReplacementDoesNotResurrectRetiredSources()
+{
+    std::printf("a new registration does not resurrect retired sources\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+
+    const unsigned int hash = createPullStream();
+    EXPECT(hash != 0, "a pull buffer stream should be created");
+    EXPECT(streamCallDelta(hash) == 4, "A's stream should be live");
+
+    EXPECT(clearDartCallbackRegistrationsForEngine(kEngineA),
+           "A should retire its own callables");
+
+    // B claims and publishes. A's sound object is still in the Player, still
+    // holding A's now-dangling callable pointers.
+    prepareEngineInit(kEngineB);
+    registerCallbacksFor(kEngineB);
+
+    EXPECT(soloudTestCallbacksAreLive() == 1,
+           "B's own registration should be live");
+    EXPECT(streamCallDelta(hash) == 0,
+           "A's stream callables must stay inert under B's registration");
+    EXPECT(stateChangedDelta() == 1, "B's global callables should work");
 
     resetGlobalState();
 }
@@ -210,7 +312,7 @@ void testCallbackRetirementIsScopedToTheOwner()
 
     EXPECT(!clearDartCallbackRegistrationsForEngine(kEngineB),
            "a non-owner must not retire the current registration");
-    EXPECT(stateChangedCallsAfterDispatch() == 1,
+    EXPECT(stateChangedDelta() == 1,
            "the owner's callables must still be live");
 
     EXPECT(!clearDartCallbackRegistrationsForEngine(kNoEngineId),
@@ -230,15 +332,14 @@ void testCallbackOwnerDiffersFromLifecycleOwner()
 
     prepareEngineInit(kEngineA);
     registerCallbacksFor(kEngineA);
-    EXPECT(stateChangedCallsAfterDispatch() == 1,
-           "A's callables should start out live");
+    EXPECT(stateChangedDelta() == 1, "A's callables should start out live");
 
     // B claims the native engine while A's callables are still published.
     prepareEngineInit(kEngineB);
 
     EXPECT(!requestEngineTeardownForEngine(kEngineA),
            "A must not tear down the engine B now owns");
-    EXPECT(stateChangedCallsAfterDispatch() == 1,
+    EXPECT(stateChangedDelta() == 0,
            "A's callables must be retired even though its teardown was refused");
     EXPECT(requestEngineTeardownForEngine(kEngineB),
            "B's lifecycle claim must be intact");
@@ -267,7 +368,31 @@ void testTeardownRefusedWithoutAClaim()
     resetGlobalState();
 }
 
-/// The ordinary destroy path: bridges inert at once, native engine gone
+/// The mixer callable is published on its own and can be re-published when
+/// capture starts, so it needs its own ownership check: a dying isolate must
+/// not be able to re-arm a callable that retirement has just made inert.
+void testMixerCallbackPublicationIsOwnerScoped()
+{
+    std::printf("mixer callback publication is owner scoped\n");
+    resetGlobalState();
+
+    prepareEngineInit(kEngineA);
+    registerCallbacksFor(kEngineA);
+
+    EXPECT(setMixerOutputCallbackForEngine(nullptr, kEngineA),
+           "the owner should be allowed to publish the mixer callable");
+    EXPECT(!setMixerOutputCallbackForEngine(nullptr, kEngineB),
+           "a non-owner must not publish over the live registration");
+
+    EXPECT(clearDartCallbackRegistrationsForEngine(kEngineA),
+           "A should retire its own callables");
+    EXPECT(!setMixerOutputCallbackForEngine(nullptr, kEngineA),
+           "publication must be refused after the registration is retired");
+
+    resetGlobalState();
+}
+
+/// The ordinary destroy path: callables inert at once, native engine gone
 /// shortly after, and the duplicate notification (onEngineWillDestroy() and
 /// onDetachedFromEngine() both fire) tears down exactly once.
 void testEngineDestroyDisposesTheNativeEngine()
@@ -275,13 +400,11 @@ void testEngineDestroyDisposesTheNativeEngine()
     std::printf("engine destroy disposes the native engine exactly once\n");
     resetGlobalState();
 
-    if (!gHasAudioDevice)
+    if (!initEngineAs(kEngineA))
     {
-        std::printf("  SKIPPED: no usable output device\n");
+        EXPECT(false, "the engine should initialize");
         return;
     }
-
-    EXPECT(initEngineAs(kEngineA), "the engine should initialize");
     registerCallbacksFor(kEngineA);
     EXPECT(soloudTestPlayerIsInited() == 1, "the player should be initialized");
     EXPECT(isInited() == 1, "readiness should be published");
@@ -294,7 +417,7 @@ void testEngineDestroyDisposesTheNativeEngine()
     EXPECT(elapsed < kPlatformThreadBudgetMs,
            "teardown request took %lldms; it must not block the platform thread",
            elapsed);
-    EXPECT(stateChangedCallsAfterDispatch() == 0,
+    EXPECT(stateChangedDelta() == 0,
            "the callables must be inert as soon as the request returns");
 
     EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
@@ -308,6 +431,51 @@ void testEngineDestroyDisposesTheNativeEngine()
     resetGlobalState();
 }
 
+/// A FlutterEngine destroyed while its initialization is parked inside the
+/// device open. On Android that window is seconds long, and it is the one where
+/// no callables are registered yet -- so only the lifecycle claim can authorize
+/// the teardown.
+void testEngineDestroyedDuringInitialization()
+{
+    std::printf("an engine destroyed mid-initialization leaves nothing\n");
+    resetGlobalState();
+
+    soloudTestArmInitBarrier();
+
+    std::atomic<int> initResult{-1};
+    std::thread initWorker([&initResult]
+                           { initResult = initEngineAs(kEngineA) ? 1 : 0; });
+
+    // Park inside initEngine(), just past the device open.
+    soloudTestWaitInitBarrierReached();
+
+    const auto start = std::chrono::steady_clock::now();
+    const bool accepted = requestEngineTeardownForEngine(kEngineA);
+    const long long elapsed = millisSince(start);
+
+    EXPECT(accepted,
+           "an engine still holding the claim must be able to tear down what "
+           "its initialization is building");
+    EXPECT(elapsed < kPlatformThreadBudgetMs,
+           "teardown request took %lldms while an init held the lifecycle lock; "
+           "it must not wait for it",
+           elapsed);
+
+    soloudTestReleaseInitBarrier();
+    initWorker.join();
+
+    EXPECT(initResult.load() == 0,
+           "an initialization cannot report ready after its engine was "
+           "destroyed");
+    EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
+           "whatever the initialization built must be disposed");
+    EXPECT(isInited() == 0, "readiness must not be published");
+    EXPECT(!requestEngineTeardownForEngine(kEngineA),
+           "the claim must have been released by the teardown");
+
+    resetGlobalState();
+}
+
 /// A teardown worker that reaches init_deinit_mutex after a replacement engine
 /// has claimed must leave that engine completely alone. This is the scenario
 /// the generation exists for, forced rather than raced: the mutex is held for
@@ -317,13 +485,11 @@ void testStaleTeardownCannotDisposeReplacement()
     std::printf("a stale teardown cannot dispose the replacement engine\n");
     resetGlobalState();
 
-    if (!gHasAudioDevice)
+    if (!initEngineAs(kEngineA))
     {
-        std::printf("  SKIPPED: no usable output device\n");
+        EXPECT(false, "the engine should initialize");
         return;
     }
-
-    EXPECT(initEngineAs(kEngineA), "the engine should initialize");
     registerCallbacksFor(kEngineA);
 
     // Stand in for an unrelated operation holding the lifecycle lock -- a
@@ -339,7 +505,7 @@ void testStaleTeardownCannotDisposeReplacement()
            "teardown request took %lldms with the lifecycle lock held; it must "
            "not wait for it",
            elapsed);
-    EXPECT(stateChangedCallsAfterDispatch() == 0,
+    EXPECT(stateChangedDelta() == 0,
            "A's callables must be inert immediately, not once the lock frees");
 
     // The replacement claims and publishes its own callables while A's worker
@@ -354,7 +520,7 @@ void testStaleTeardownCannotDisposeReplacement()
 
     EXPECT(soloudTestPlayerIsInited() == 1,
            "A's stale worker must not dispose the engine B claimed");
-    EXPECT(stateChangedCallsAfterDispatch() == 1,
+    EXPECT(stateChangedDelta() == 1,
            "B's callables must survive A's teardown");
     EXPECT(requestEngineTeardownForEngine(kEngineB),
            "B's lifecycle claim must still be current");
@@ -364,16 +530,22 @@ void testStaleTeardownCannotDisposeReplacement()
     resetGlobalState();
 }
 
-/// The Player-owned callbacks (the per-BufferStream ones) need
-/// init_deinit_mutex, which a lifecycle hook must not wait for. The hook has to
-/// return with the global bridges already inert and the rest queued.
-void testDeferredPlayerCallbackClear()
+/// Retirement must not wait for the locks that guard Player and its sounds.
+/// `sounds_mutex` in particular is held across decoding by addAudioDataStream(),
+/// and init_deinit_mutex for the whole of a dispose().
+void testRetirementNeverWaitsForNativeWork()
 {
-    std::printf("player-owned callback clear is deferred, not waited on\n");
+    std::printf("retirement never waits for the native lifecycle locks\n");
     resetGlobalState();
 
-    prepareEngineInit(kEngineA);
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
     registerCallbacksFor(kEngineA);
+    const unsigned int hash = createPullStream();
+    EXPECT(hash != 0, "a pull buffer stream should be created");
 
     soloudTestLockInitDeinit();
 
@@ -386,15 +558,15 @@ void testDeferredPlayerCallbackClear()
            "callback clear took %lldms with the lifecycle lock held; it must "
            "not wait for it",
            elapsed);
-    EXPECT(stateChangedCallsAfterDispatch() == 0,
-           "the global bridges must be inert before the lock is released");
+    EXPECT(stateChangedDelta() == 0,
+           "global callables must be inert before the lock is released");
 
     soloudTestUnlockInitDeinit();
 
-    // The queued worker takes the mutex once it is free; this call cannot
-    // return until it has released it again.
-    EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
-           "the deferred worker must not wedge the lifecycle lock");
+    // The source-owned callables were inert from the moment the hook returned,
+    // with the Player untouched -- nothing was deferred to make that true.
+    EXPECT(streamCallDelta(hash) == 0,
+           "stream callables must be inert without any deferred cleanup");
 
     resetGlobalState();
 }
@@ -403,22 +575,33 @@ void testDeferredPlayerCallbackClear()
 
 int main()
 {
-    // One probe decides whether the device-dependent scenarios can run.
-    gHasAudioDevice = initEngineAs(kEngineA);
+    // Every scenario below needs an engine that can actually initialize. A
+    // deliberate failure beats a green run that skipped the substance: on a
+    // machine with no output device at all, miniaudio still opens its null
+    // backend, so this failing means something is wrong with the build or the
+    // environment, not merely that the box is headless.
+    const bool canInit = initEngineAs(kEngineA);
     dispose();
-    if (!gHasAudioDevice)
+    if (!canInit)
     {
-        std::printf(
-            "note: no usable output device; engine-init scenarios skipped\n");
+        std::fprintf(stderr,
+                     "FATAL: no output device could be opened, not even a null "
+                     "backend; the lifecycle scenarios cannot run.\n"
+                     "Set SOLOUD_LIFECYCLE_TEST_ALLOW_NO_DEVICE=1 to downgrade "
+                     "this to a skip.\n");
+        return std::getenv("SOLOUD_LIFECYCLE_TEST_ALLOW_NO_DEVICE") ? 0 : 1;
     }
 
-    testHotRestartRetiresCallablesButKeepsClaim();
+    testHotRestartRetiresEveryCallable();
+    testReplacementDoesNotResurrectRetiredSources();
     testCallbackRetirementIsScopedToTheOwner();
     testCallbackOwnerDiffersFromLifecycleOwner();
     testTeardownRefusedWithoutAClaim();
+    testMixerCallbackPublicationIsOwnerScoped();
     testEngineDestroyDisposesTheNativeEngine();
+    testEngineDestroyedDuringInitialization();
     testStaleTeardownCannotDisposeReplacement();
-    testDeferredPlayerCallbackClear();
+    testRetirementNeverWaitsForNativeWork();
 
     std::printf("\n%d assertions, %d failures\n", gAssertions, gFailures);
     return gFailures == 0 ? 0 : 1;

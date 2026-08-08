@@ -49,8 +49,9 @@ to one FlutterEngine. On Android the plugin observes that engine's lifecycle so
 the two cannot drift apart:
 
 - **Hot restart** retires the callbacks belonging to the discarded isolate, so
-  nothing calls into it. The engine stays up and the new isolate's `init()`
-  replaces it as usual.
+  nothing calls into it — including the per-stream buffering, metadata and
+  data-request callbacks that the audio thread drives. The engine stays up and
+  the new isolate's `init()` replaces it as usual.
 - **FlutterEngine destroyed** (a cached engine behind `audio_service` being
   disposed, an add-to-app host destroying an engine) tears down the player, the
   output device and the scheduler that engine owned, even if your Dart code

@@ -330,7 +330,10 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       nativeStateChangedCallable!.nativeFunction,
       currentEngineId,
     );
-    _setMixerOutputCallback(nativeMixerOutputDataCallable!.nativeFunction);
+    _setMixerOutputCallback(
+      nativeMixerOutputDataCallable!.nativeFunction,
+      currentEngineId,
+    );
   }
 
   @override
@@ -339,7 +342,12 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         ffi.NativeCallable<DartMixerOutputDataCallbackTFunction>.listener(
           _mixerOutputDataCallback,
         );
-    _setMixerOutputCallback(nativeMixerOutputDataCallable!.nativeFunction);
+    // A refusal means this isolate's registration has already been retired --
+    // its FlutterEngine is going away -- so there is nothing to listen with.
+    _setMixerOutputCallback(
+      nativeMixerOutputDataCallable!.nativeFunction,
+      currentEngineId,
+    );
   }
 
   late final _setDartEventCallbackPtr =
@@ -526,12 +534,18 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   late final _getMixerOutputWavHeader = _getMixerOutputWavHeaderPtr
       .asFunction<ffi.Pointer<ffi.Uint8> Function()>();
 
+  /// Publishes the mixer callable as part of this engine's registration, so
+  /// native code refuses it once that registration has been retired. The
+  /// unscoped `setMixerOutputCallback` export is left for the web build, which
+  /// binds it from the prebuilt wasm.
   late final _setMixerOutputCallbackPtr =
       _lookup<
-        ffi.NativeFunction<ffi.Void Function(DartMixerOutputDataCallbackT)>
-      >('setMixerOutputCallback');
+        ffi.NativeFunction<
+          ffi.Bool Function(DartMixerOutputDataCallbackT, ffi.Int64)
+        >
+      >('setMixerOutputCallbackForEngine');
   late final _setMixerOutputCallback = _setMixerOutputCallbackPtr
-      .asFunction<void Function(DartMixerOutputDataCallbackT)>();
+      .asFunction<bool Function(DartMixerOutputDataCallbackT, int)>();
 
   // ////////////////////////////////////////////////
   // Navtive bindings
