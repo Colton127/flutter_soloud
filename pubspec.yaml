@@ -50,6 +50,12 @@ flutter:
   plugin:
     platforms:
       android:
+        # Still an FFI plugin: `package`/`pluginClass` only add a plugin object
+        # that observes FlutterEngine lifecycle (hot restart, engine destroy) so
+        # the process-global native engine can be retired with its owner. It
+        # registers no method channel and does no work at attach time.
+        package: flutter.soloud.flutter_soloud
+        pluginClass: FlutterSoloudPlugin
         ffiPlugin: true
       ios:
         ffiPlugin: true

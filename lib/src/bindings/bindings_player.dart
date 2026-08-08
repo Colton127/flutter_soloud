@@ -203,6 +203,13 @@ abstract class FlutterSoLoud {
   Future<void> deinitAsync();
 
   /// Prepare native init state before dispatching an asynchronous init.
+  ///
+  /// On platforms with a FlutterEngine lifecycle this also claims the
+  /// process-global native engine for the FlutterEngine that owns this isolate.
+  /// The claim is taken here, synchronously, rather than when callbacks
+  /// register: opening the audio device can take seconds on Android, and an
+  /// engine destroyed during that window still has to be able to tear down what
+  /// it just built.
   @mustBeOverridden
   void prepareEngineInit();
 

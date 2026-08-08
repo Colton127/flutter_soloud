@@ -8,6 +8,7 @@ import 'dart:async';
 import 'dart:ffi' as ffi;
 import 'dart:isolate';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter_soloud/src/bindings/audio_data.dart';
@@ -151,6 +152,26 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   FlutterSoLoudFfi.fromLookup(
     ffi.Pointer<T> Function<T extends ffi.NativeType>(String symbolName) lookup,
   ) : _lookup = lookup;
+
+  /// Sentinel used where no FlutterEngine lifecycle is available. Must match
+  /// `kNoEngineId` in `src/bindings.cpp`.
+  static const int noEngineId = -1;
+
+  /// The FlutterEngine that owns this isolate, or [noEngineId] where the
+  /// embedder does not expose one.
+  ///
+  /// Native code uses it to decide whether a detaching or hot-restarting
+  /// FlutterEngine owns the registered callables and the native engine, and the
+  /// Android plugin passes the same value down from
+  /// `FlutterEngine.getEngineId()`.
+  ///
+  /// It must be read on the isolate the engine runs on:
+  /// `PlatformDispatcher.instance.engineId` is set through an engine hook that
+  /// only fires there, so a worker isolate would see `null`. Both call sites
+  /// ([prepareEngineInit] and [setDartEventCallbacks]) run on that isolate,
+  /// before any work is handed to `Isolate.run`.
+  static int get currentEngineId =>
+      ui.PlatformDispatcher.instance.engineId ?? noEngineId;
 
   // ////////////////////////////////////////////////
   // Callbacks impl
@@ -307,6 +328,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       nativeVoiceEndedCallable!.nativeFunction,
       nativeFileLoadedCallable!.nativeFunction,
       nativeStateChangedCallable!.nativeFunction,
+      currentEngineId,
     );
     _setMixerOutputCallback(nativeMixerOutputDataCallable!.nativeFunction);
   }
@@ -327,6 +349,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
             DartVoiceEndedCallbackT,
             DartFileLoadedCallbackT,
             DartStateChangedCallbackT,
+            ffi.Int64,
           )
         >
       >('setDartEventCallback');
@@ -336,6 +359,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
           DartVoiceEndedCallbackT,
           DartFileLoadedCallbackT,
           DartStateChangedCallbackT,
+          int,
         )
       >();
 
@@ -705,12 +729,14 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   @override
-  void prepareEngineInit() => _prepareEngineInit();
+  void prepareEngineInit() => _prepareEngineInit(currentEngineId);
 
   late final _prepareEngineInit = _prepareEngineInitPtr
-      .asFunction<void Function()>();
+      .asFunction<void Function(int)>();
   late final _prepareEngineInitPtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function()>>('prepareEngineInit');
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
+        'prepareEngineInit',
+      );
 
   @override
   void requestEngineShutdown() => _requestEngineShutdown();

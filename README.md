@@ -42,6 +42,32 @@ If you are looking for a package to visualize audio using shaders or CustomPaint
 
 Also, if you are building using Swift Package Manager (SPM), please check out [iOS and macOS Configuration](https://docs.page/alnitak/flutter_soloud_docs/get_started/setup#ios-and-macos-configuration).
 
+### Android: FlutterEngine lifecycle
+
+The native engine is process-global, while the Dart isolate driving it belongs
+to one FlutterEngine. On Android the plugin observes that engine's lifecycle so
+the two cannot drift apart:
+
+- **Hot restart** retires the callbacks belonging to the discarded isolate, so
+  nothing calls into it. The engine stays up and the new isolate's `init()`
+  replaces it as usual.
+- **FlutterEngine destroyed** (a cached engine behind `audio_service` being
+  disposed, an add-to-app host destroying an engine) tears down the player, the
+  output device and the scheduler that engine owned, even if your Dart code
+  never got to call `deinit()`. The blocking part runs on a native worker
+  thread, so the platform thread is never held.
+- **Activity recreation is not engine destruction.** A cached FlutterEngine
+  deliberately outlives its Activity; rotating the screen or recreating the
+  Activity tears nothing down.
+
+None of this needs any setup: the plugin registers itself, and does no native
+work at all until one of those transitions happens.
+
+**Supported scope:** one active FlutterEngine at a time, including replacing it
+with a new one. Two FlutterEngines using the plugin *simultaneously* is not
+supported — the engine they would share is process-global, and the last one to
+initialize wins.
+
 ## Documentation
 
 - [Full Documentation](https://docs.page/alnitak/flutter_soloud_docs)
