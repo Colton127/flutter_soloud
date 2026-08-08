@@ -61,6 +61,12 @@ extern "C"
     bool setMixerOutputCallbackForEngine(void (*callback)(unsigned char *,
                                                           uint64_t),
                                          int64_t owner_engine_id);
+    enum PlayerErrors startMixerCapture(int format, int sampleRate, int channels,
+                                        int bufferSizeBytes,
+                                        int notificationThresholdBytes,
+                                        int chunkPCMFrames);
+    void stopMixerCapture();
+    int isMixerCaptureRunning();
     bool clearDartCallbackRegistrationsForEngine(int64_t engine_id);
     bool requestEngineTeardownForEngine(int64_t engine_id);
     enum PlayerErrors setPullBufferStream(
@@ -464,6 +470,78 @@ void testStaleWorkerMixerCallbackCannotBeRevived()
     resetGlobalState();
 }
 
+/// The mixer notification thread invokes the callback MixerOutput holds while
+/// two lifecycle paths replace it: engine teardown -- nothing stops a
+/// FlutterEngine being destroyed with a capture still running, because there is
+/// no Dart left to stop it first -- and a capture starting on another isolate,
+/// which republishes independently. Both write what that thread is reading, so
+/// the pointer has to be safe to publish concurrently, not merely ordered
+/// around. Run under ThreadSanitizer this is the scenario that proves it.
+void testTeardownDuringActiveMixerCapture()
+{
+    std::printf("teardown races an active mixer capture safely\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
+           "the owner should publish its mixer callable");
+
+    // Chunk mode on purpose: it advances the read offset itself, so the
+    // notification thread keeps dispatching. Threshold mode latches after one
+    // notification until a consumer advances the buffer, which would give the
+    // reader a single read to race against.
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_S16LE, 44100, 2,
+                             /*bufferSizeBytes=*/64 * 1024,
+                             /*notificationThresholdBytes=*/256,
+                             /*chunkPCMFrames=*/2048) == noError,
+           "the capture should start");
+    EXPECT(isMixerCaptureRunning() == 1, "the capture should be running");
+
+    // Wait for the notification thread to actually invoke the callback, so the
+    // writes below land while it is reading rather than before it starts.
+    const bool dispatched = waitFor([] { return gMixerOutputCalls.load() > 0; },
+                                    3000);
+
+    // A worker isolate republishing its capture callable, in a tight loop, for
+    // long enough that writes interleave with many reads. A burst that happens
+    // to land between two reads would prove nothing.
+    const int dispatchesBefore = gMixerOutputCalls.load();
+    const auto raceDeadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < raceDeadline &&
+           gMixerOutputCalls.load() - dispatchesBefore < 100)
+    {
+        setMixerOutputCallbackForEngine(onMixerOutput, kNoEngineId);
+    }
+    const int dispatchesDuringRace = gMixerOutputCalls.load() - dispatchesBefore;
+
+    // The FlutterEngine is destroyed with the capture still running.
+    EXPECT(requestEngineTeardownForEngine(kEngineA),
+           "the owning engine's teardown should be accepted");
+    EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
+           "the native engine should be disposed");
+    EXPECT(isMixerCaptureRunning() == 0,
+           "teardown should stop the capture it inherited");
+    EXPECT(mixerOutputDelta() == 0,
+           "the mixer callable must be inert after teardown");
+
+    // Say what was actually exercised. A green run with no overlapping
+    // dispatches would prove nothing about the concurrency, and this test only
+    // earns its name under ThreadSanitizer.
+    std::printf("  (%d dispatches raced the republish loop)\n",
+                dispatchesDuringRace);
+    EXPECT(dispatched && dispatchesDuringRace > 0,
+           "the notification thread must dispatch while the callback is being "
+           "republished, or this scenario tests nothing");
+
+    resetGlobalState();
+}
+
 /// The ordinary destroy path: callables inert at once, native engine gone
 /// shortly after, and the duplicate notification (onEngineWillDestroy() and
 /// onDetachedFromEngine() both fire) tears down exactly once.
@@ -671,6 +749,7 @@ int main()
     testTeardownRefusedWithoutAClaim();
     testMixerCallbackPublicationIsOwnerScoped();
     testStaleWorkerMixerCallbackCannotBeRevived();
+    testTeardownDuringActiveMixerCapture();
     testEngineDestroyDisposesTheNativeEngine();
     testEngineDestroyedDuringInitialization();
     testStaleTeardownCannotDisposeReplacement();
