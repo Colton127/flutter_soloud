@@ -76,6 +76,29 @@ namespace dart_callbacks
     }
   } // namespace detail
 
+#ifdef __EMSCRIPTEN__
+
+  /// The web has nothing for this gate to protect, so it compiles away.
+  ///
+  /// There is no Dart FFI trampoline on the web. A callback is a JS function
+  /// parked on `globalThis` under its sound hash, and the dispatchers reach it
+  /// through EM_ASM, which resolves the name at call time and does nothing when
+  /// it is absent — the pointer native code holds is the sentinel `1`, never an
+  /// address. Nothing can dangle, so there is nothing to retire: the web build
+  /// has no FlutterEngine lifecycle hooks and never claims a generation, which
+  /// would leave every source stuck at kNoGeneration and every callback dead.
+  ///
+  /// It is also the wrong lock to hold there. The gate would span an
+  /// EM_ASM → JS → Dart call, and the web callback model re-enters in ways a
+  /// `NativeCallable.listener` does not.
+  class InvocationPass
+  {
+  public:
+    bool isLive(uint64_t) const { return true; }
+  };
+
+#else
+
   /// Held for the duration of one Dart trampoline invocation.
   ///
   /// Construct it *before* loading the callable pointer, and keep it alive
@@ -100,6 +123,8 @@ namespace dart_callbacks
     std::shared_lock<std::shared_mutex> mLock;
     uint64_t mLiveGeneration;
   };
+
+#endif // __EMSCRIPTEN__
 
   /// Exclusive access for publishing or retiring registrations.
   ///

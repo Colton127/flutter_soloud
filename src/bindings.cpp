@@ -164,7 +164,8 @@ extern "C"
   typedef void (*dartVoiceEndedCallback_t)(unsigned int *);
   typedef void (*dartFileLoadedCallback_t)(enum PlayerErrors *, char *completeFileName, unsigned int *, uint64_t *counter);
   typedef void (*dartStateChangedCallback_t)(enum PlayerStateEvents *);
-  typedef void (*dartMixerOutputDataCallback_t)(unsigned char *, uint64_t);
+  // dartMixerOutputDataCallback_t comes from enums.h: ffi_gen_tmp.h has to be
+  // able to name it too.
 
   // to be used by `NativeCallable`, these functions must return void.
   // Atomic so the audio thread can safely snapshot the pointer before calling.
