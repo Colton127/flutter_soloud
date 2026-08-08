@@ -52,6 +52,14 @@ namespace
   /// after initEngine() has returned.
   uint64_t globalCallbackGeneration = dart_callbacks::kNoGeneration;
 
+  /// The generation the mixer-output callable was published at. It gets its own
+  /// because it is published separately from the other three — by
+  /// startMixerOutputStream(), possibly from a worker isolate — so the
+  /// registration live when it was installed is not necessarily the one live
+  /// now. Judging it by globalCallbackGeneration would let a callable installed
+  /// under a dead registration come back to life under a later engine's.
+  uint64_t mixerCallbackGeneration = dart_callbacks::kNoGeneration;
+
   /// Which FlutterEngine currently claims the native engine, and a counter
   /// advanced by every prepareEngineInit(). Claimed at the *start* of an
   /// initialization rather than when callbacks register, so the engine has a
@@ -391,6 +399,7 @@ extern "C"
     dartStateChangedCallback.store(nullptr, std::memory_order_release);
     dartMixerOutputDataCallback.store(nullptr, std::memory_order_release);
     globalCallbackGeneration = dart_callbacks::kNoGeneration;
+    mixerCallbackGeneration = dart_callbacks::kNoGeneration;
   }
 
   /// Additionally null the Dart callbacks stored inside Player-owned state: the
@@ -548,63 +557,107 @@ extern "C"
     return result;
   }
 
-  /// Publish the mixer-output data callable for [owner_engine_id].
-  ///
-  /// Unlike the other three this one is published on its own, and can be
-  /// re-published later when mixer capture starts, so it cannot lean on
-  /// setDartEventCallback() having recorded the owner. It joins the live
-  /// registration instead: publication is refused once that registration has
-  /// been retired, or if it belongs to another engine, which stops a dying
-  /// isolate re-arming a callable that retirement has just made inert.
-  ///
-  /// Returns whether the callable was published. [owner_engine_id] of -1 skips
-  /// the ownership check, for callers with no engine lifecycle.
-  FFI_PLUGIN_EXPORT bool setMixerOutputCallbackForEngine(
-      dartMixerOutputDataCallback_t callback, int64_t owner_engine_id)
+  /// What MixerOutput calls on its notification thread. Named rather than a
+  /// lambda so a test can drive the exact function MixerOutput holds.
+  static void dispatchMixerOutputToDart(uint8_t *data, size_t length)
+  {
+#ifdef __EMSCRIPTEN__
+    // On the web the callback may fire from the audio thread, so we cannot call
+    // Dart directly. Send the offset/length to the web worker, which forwards
+    // it to the main isolate.
+    if (length == 0)
+      return;
+    const size_t offset = reinterpret_cast<size_t>(data);
+    sendMixerOutputToWorker(offset, length,
+                            MixerOutput::instance().captureId());
+#else
+    // Held across the call so a retirement cannot return — and the owning
+    // isolate cannot go away — while this trampoline is running. Checked
+    // against the generation *this callable* was published at, not the one
+    // currently live: those differ whenever the mixer callable outlives the
+    // registration it joined.
+    const dart_callbacks::InvocationPass pass;
+    if (!pass.isLive(mixerCallbackGeneration))
+      return;
+    auto cb = dartMixerOutputDataCallback.load(std::memory_order_acquire);
+    if (cb != nullptr)
+    {
+      cb(data, static_cast<uint64_t>(length));
+    }
+#endif
+  }
+
+  /// Publish the mixer-output callable and tag it with the registration it
+  /// joins. [require_live] is false only for the lifecycle-free entry point
+  /// below.
+  static bool publishMixerOutputCallback(dartMixerOutputDataCallback_t callback,
+                                         int64_t owner_engine_id,
+                                         bool require_live)
   {
     {
       dart_callbacks::Registration registration;
-      if (owner_engine_id != kNoEngineId &&
-          !registration.isOwnedBy(owner_engine_id))
+
+      if (owner_engine_id != kNoEngineId)
+      {
+        // A caller that can name its engine must own the live registration.
+        if (!registration.isOwnedBy(owner_engine_id))
+          return false;
+      }
+      else if (require_live &&
+               registration.generation() == dart_callbacks::kNoGeneration)
+      {
+        // A caller that cannot name its engine may still only join a
+        // registration that is actually live.
         return false;
+      }
 
       dartMixerOutputDataCallback.store(callback, std::memory_order_release);
+      mixerCallbackGeneration = registration.generation();
     }
-    MixerOutput::instance().setDataCallback(
-        [](uint8_t *data, size_t length)
-        {
-#ifdef __EMSCRIPTEN__
-          // On the web the callback may fire from the audio thread, so we
-          // cannot call Dart directly. Send the offset/length to the web
-          // worker, which forwards it to the main isolate.
-          if (length == 0)
-            return;
-          const size_t offset = reinterpret_cast<size_t>(data);
-          sendMixerOutputToWorker(offset, length,
-                                  MixerOutput::instance().captureId());
-#else
-          // Held across the call so a retirement cannot return — and the owning
-          // isolate cannot go away — while this trampoline is running.
-          const dart_callbacks::InvocationPass pass;
-          if (!pass.isLive(globalCallbackGeneration))
-            return;
-          auto cb = dartMixerOutputDataCallback.load(std::memory_order_acquire);
-          if (cb != nullptr)
-          {
-            cb(data, static_cast<uint64_t>(length));
-          }
-#endif
-        });
+
+    MixerOutput::instance().setDataCallback(dispatchMixerOutputToDart);
     return true;
   }
 
-  /// Ownership-unaware entry point, kept for callers with no FlutterEngine
-  /// lifecycle. The web build binds this exported symbol directly from the
-  /// prebuilt wasm, so its signature must not change.
+  /// Publish the mixer-output data callable for [owner_engine_id].
+  ///
+  /// Unlike the other three this one is published on its own, and re-published
+  /// whenever mixer capture starts, so it cannot lean on setDartEventCallback()
+  /// having just recorded the owner. It joins the live registration instead and
+  /// carries that generation, so it dies with the registration it joined and
+  /// cannot be revived by a later engine claiming a new one.
+  ///
+  /// [owner_engine_id] of -1 means "I cannot name my engine", not "there is no
+  /// engine": a worker isolate reaches this through
+  /// `SoLoudIsolate.startMixerOutputStream()`, and `PlatformDispatcher.engineId`
+  /// is only set on the isolate the engine runs. Such a caller still may not
+  /// publish into a retired registration — that is how a capture isolate that
+  /// is still running while its FlutterEngine is being destroyed is stopped
+  /// from re-arming a callable retirement has just made inert.
+  ///
+  /// What it cannot tell apart is a worker of engine A publishing while a
+  /// *replacement* engine B holds the live registration; it would join B's.
+  /// Closing that needs the worker to name its engine, which needs the id
+  /// plumbed through the isolate that spawned it, and it only arises with
+  /// overlapping FlutterEngines — which this package does not support.
+  ///
+  /// Returns whether the callable was published.
+  FFI_PLUGIN_EXPORT bool setMixerOutputCallbackForEngine(
+      dartMixerOutputDataCallback_t callback, int64_t owner_engine_id)
+  {
+    return publishMixerOutputCallback(callback, owner_engine_id,
+                                      /*require_live=*/true);
+  }
+
+  /// Lifecycle-free entry point, for hosts where no registration is ever
+  /// claimed. The web build binds this exported symbol directly from the
+  /// prebuilt wasm, so its signature must not change — and it must keep
+  /// publishing unconditionally, because the web never claims a generation and
+  /// its dispatch does not consult one.
   FFI_PLUGIN_EXPORT void setMixerOutputCallback(
       dartMixerOutputDataCallback_t callback)
   {
-    setMixerOutputCallbackForEngine(callback, kNoEngineId);
+    publishMixerOutputCallback(callback, kNoEngineId, /*require_live=*/false);
   }
 
   //////////////////////////////////////////////////////////////////////////////////
@@ -1028,6 +1081,13 @@ extern "C"
       test_init_barrier_armed = false;
     }
     test_init_barrier_cv.notify_all();
+  }
+
+  /// Drive the exact function MixerOutput holds on its notification thread.
+  FFI_PLUGIN_EXPORT void soloudTestInvokeMixerOutput()
+  {
+    unsigned char scratch[4] = {0, 0, 0, 0};
+    dispatchMixerOutputToDart(scratch, sizeof(scratch));
   }
 
   /// True while a Dart callable registered at the current generation may run.

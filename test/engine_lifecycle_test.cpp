@@ -79,6 +79,7 @@ extern "C"
     bool soloudTestInvokeStreamCallbacks(unsigned int hash);
     int soloudTestPlayerIsInited();
     int soloudTestCallbacksAreLive();
+    void soloudTestInvokeMixerOutput();
     void soloudTestArmInitBarrier();
     void soloudTestWaitInitBarrierReached();
     void soloudTestReleaseInitBarrier();
@@ -115,6 +116,7 @@ std::atomic<int> gVoiceEndedCalls{0};
 std::atomic<int> gFileLoadedCalls{0};
 std::atomic<int> gStateChangedCalls{0};
 std::atomic<int> gStreamCallbackCalls{0};
+std::atomic<int> gMixerOutputCalls{0};
 
 // Stand-ins for the Dart trampolines. Native code owns the pointers it hands
 // over, exactly as the real callables do.
@@ -140,6 +142,8 @@ void onStateChanged(enum PlayerStateEvents *state)
     ++gStateChangedCalls;
 }
 
+void onMixerOutput(unsigned char *, uint64_t) { ++gMixerOutputCalls; }
+
 void onBuffering(bool, unsigned int, double) { ++gStreamCallbackCalls; }
 void onMetadata(struct AudioMetadataFFI) { ++gStreamCallbackCalls; }
 void onMoreDataIsNeeded(uint64_t) { ++gStreamCallbackCalls; }
@@ -157,6 +161,15 @@ int stateChangedDelta()
     const int before = gStateChangedCalls.load();
     soloudTestInvokeStateChanged(0);
     return gStateChangedCalls.load() - before;
+}
+
+/// Whether one dispatch through the function MixerOutput holds reached the
+/// published mixer callable.
+int mixerOutputDelta()
+{
+    const int before = gMixerOutputCalls.load();
+    soloudTestInvokeMixerOutput();
+    return gMixerOutputCalls.load() - before;
 }
 
 /// How many of a real PullBufferStream's four callables one dispatch reached.
@@ -199,6 +212,7 @@ void resetGlobalState()
     gFileLoadedCalls = 0;
     gStateChangedCalls = 0;
     gStreamCallbackCalls = 0;
+    gMixerOutputCalls = 0;
 }
 
 bool initEngineAs(int64_t engineId)
@@ -368,9 +382,12 @@ void testTeardownRefusedWithoutAClaim()
     resetGlobalState();
 }
 
-/// The mixer callable is published on its own and can be re-published when
-/// capture starts, so it needs its own ownership check: a dying isolate must
-/// not be able to re-arm a callable that retirement has just made inert.
+/// The mixer callable is published on its own and re-published whenever capture
+/// starts, so it needs its own ownership check and its own generation. It is
+/// also the one callable a *worker* isolate publishes -- mixer capture is
+/// documented as runnable from one via `SoLoudIsolate` -- and a worker cannot
+/// read `PlatformDispatcher.engineId`, so it arrives with the no-engine
+/// sentinel and no engine to check against.
 void testMixerCallbackPublicationIsOwnerScoped()
 {
     std::printf("mixer callback publication is owner scoped\n");
@@ -379,15 +396,70 @@ void testMixerCallbackPublicationIsOwnerScoped()
     prepareEngineInit(kEngineA);
     registerCallbacksFor(kEngineA);
 
-    EXPECT(setMixerOutputCallbackForEngine(nullptr, kEngineA),
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
            "the owner should be allowed to publish the mixer callable");
-    EXPECT(!setMixerOutputCallbackForEngine(nullptr, kEngineB),
+    EXPECT(mixerOutputDelta() == 1, "the published callable should be invoked");
+
+    EXPECT(!setMixerOutputCallbackForEngine(onMixerOutput, kEngineB),
            "a non-owner must not publish over the live registration");
+
+    // A worker isolate: it cannot name its engine, but the registration it
+    // belongs to is live, so it joins it.
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kNoEngineId),
+           "a worker isolate should join the live registration");
+    EXPECT(mixerOutputDelta() == 1,
+           "a worker's callable should be invoked while its engine is live");
 
     EXPECT(clearDartCallbackRegistrationsForEngine(kEngineA),
            "A should retire its own callables");
-    EXPECT(!setMixerOutputCallbackForEngine(nullptr, kEngineA),
+    EXPECT(mixerOutputDelta() == 0,
+           "the mixer callable must be inert once its registration is retired");
+    EXPECT(!setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
            "publication must be refused after the registration is retired");
+
+    resetGlobalState();
+}
+
+/// The regression this ownership model exists for, on the one callable a worker
+/// isolate publishes. `onEngineWillDestroy()` fires while the engine is still
+/// valid, so a capture isolate can still be running native calls across the
+/// retirement boundary -- and it publishes with the no-engine sentinel, which
+/// used to be an unconditional bypass. A callable it arms there must not come
+/// back to life when a replacement engine claims the next generation.
+void testStaleWorkerMixerCallbackCannotBeRevived()
+{
+    std::printf("a retired worker's mixer callable is never revived\n");
+    resetGlobalState();
+
+    // Engine A is live and a worker isolate publishes its capture callable.
+    prepareEngineInit(kEngineA);
+    registerCallbacksFor(kEngineA);
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kNoEngineId),
+           "the worker should join A's live registration");
+    EXPECT(mixerOutputDelta() == 1, "A's worker callable should be live");
+
+    // A's FlutterEngine is being destroyed. The worker is still running.
+    EXPECT(clearDartCallbackRegistrationsForEngine(kEngineA),
+           "A's registration should be retired");
+
+    // The worker races the destruction and re-arms its callable.
+    EXPECT(!setMixerOutputCallbackForEngine(onMixerOutput, kNoEngineId),
+           "a worker must not publish into a retired registration");
+    EXPECT(mixerOutputDelta() == 0,
+           "nothing should be reachable while no registration is live");
+
+    // A replacement engine claims the next generation. The stale worker
+    // callable must not inherit it.
+    prepareEngineInit(kEngineB);
+    registerCallbacksFor(kEngineB);
+    EXPECT(mixerOutputDelta() == 0,
+           "a stale worker callable must not be revived by B's generation");
+
+    // B's own mixer callable works, so this is a targeted refusal and not a
+    // wedged mixer path.
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineB),
+           "B should be able to publish its own mixer callable");
+    EXPECT(mixerOutputDelta() == 1, "B's callable should be invoked");
 
     resetGlobalState();
 }
@@ -598,6 +670,7 @@ int main()
     testCallbackOwnerDiffersFromLifecycleOwner();
     testTeardownRefusedWithoutAClaim();
     testMixerCallbackPublicationIsOwnerScoped();
+    testStaleWorkerMixerCallbackCannotBeRevived();
     testEngineDestroyDisposesTheNativeEngine();
     testEngineDestroyedDuringInitialization();
     testStaleTeardownCannotDisposeReplacement();

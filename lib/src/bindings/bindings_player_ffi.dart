@@ -342,12 +342,28 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         ffi.NativeCallable<DartMixerOutputDataCallbackTFunction>.listener(
           _mixerOutputDataCallback,
         );
-    // A refusal means this isolate's registration has already been retired --
-    // its FlutterEngine is going away -- so there is nothing to listen with.
-    _setMixerOutputCallback(
+    // Called from whichever isolate owns the capture, including a worker one
+    // via `SoLoudIsolate.startMixerOutputStream()`. On a worker,
+    // [currentEngineId] is the no-engine sentinel and native code joins this
+    // callable to whatever registration is live.
+    //
+    // A refusal means there is no live registration to join: the engine was
+    // never initialized, has been deinitialized, or its FlutterEngine is being
+    // destroyed. Publishing anyway would arm a callable belonging to an isolate
+    // that is going away, so the capture simply produces nothing -- worth a
+    // line in the log, since the stream stays silent rather than throwing.
+    final published = _setMixerOutputCallback(
       nativeMixerOutputDataCallable!.nativeFunction,
       currentEngineId,
     );
+    if (!published) {
+      _log.warning(
+        'The mixer output callback was refused: no live engine callback '
+        'registration to join. The capture stream will not receive chunks. '
+        'Initialize the engine before starting a mixer output capture, and '
+        'stop the capture before deinitializing it.',
+      );
+    }
   }
 
   late final _setDartEventCallbackPtr =
