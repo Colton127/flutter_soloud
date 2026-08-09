@@ -70,14 +70,26 @@ static const int64_t kNoEngineId = -1;
     return;
   }
 
-  if (![call.arguments isKindOfClass:[NSNumber class]]) {
-    result([FlutterError errorWithCode:@"invalid_engine_id"
-                               message:@"Expected the engine id as an integer."
+  NSDictionary *arguments = call.arguments;
+  if (![arguments isKindOfClass:[NSDictionary class]]) {
+    result([FlutterError errorWithCode:@"invalid_arguments"
+                               message:@"Expected a map of prepare arguments."
                                details:nil]);
     return;
   }
 
-  const int64_t engineId = [(NSNumber *)call.arguments longLongValue];
+  NSNumber *engineIdArgument = arguments[@"engineId"];
+  NSNumber *epochArgument = arguments[@"shutdownEpoch"];
+  if (![engineIdArgument isKindOfClass:[NSNumber class]] ||
+      ![epochArgument isKindOfClass:[NSNumber class]]) {
+    result([FlutterError
+        errorWithCode:@"invalid_arguments"
+              message:@"Expected an engine id and a shutdown epoch."
+              details:nil]);
+    return;
+  }
+
+  const int64_t engineId = [engineIdArgument longLongValue];
   if (engineId == kNoEngineId) {
     result([FlutterError
         errorWithCode:@"invalid_engine_id"
@@ -86,6 +98,28 @@ static const int64_t kNoEngineId = -1;
     return;
   }
 
+  const uint64_t shutdownEpoch =
+      (uint64_t)[epochArgument unsignedLongLongValue];
+
+  // Claimed here, before the reply, so the claim exists before Dart dispatches
+  // the initialization. Opening the audio device takes a while, and an engine
+  // deallocated during that window must still have something to tear down;
+  // claiming after the reply would leave a gap where it does not.
+  //
+  // Conditional on the epoch Dart read before it sent this: `deinit()` can run
+  // while Dart is suspended waiting for the reply, and a claim landing after
+  // that teardown would lower the shutdown flag and record ownership for an
+  // engine that is already gone.
+  if (!prepareEngineInitForRequest(engineId, shutdownEpoch)) {
+    result([FlutterError
+        errorWithCode:@"stale_prepare"
+              message:@"This initialization was superseded by a shutdown."
+              details:nil]);
+    return;
+  }
+
+  // Only now is this plugin associated with the engine: a refused request must
+  // not arm a teardown, because it took no claim to tear down.
   _engineId = engineId;
   _hasEngineId = YES;
 
@@ -95,13 +129,10 @@ static const int64_t kNoEngineId = -1;
   // API can retire them. It is scoped to this engine, and the new isolate has
   // not registered its own callables yet, so it can only ever retire stale
   // same-engine ones.
+  //
+  // After the claim rather than before: a refused claim must leave everything
+  // untouched, including a newer engine's callables.
   clearDartCallbackRegistrationsForEngine(engineId);
-
-  // Claimed here, before the reply, so the claim exists before Dart dispatches
-  // the initialization. Opening the audio device takes a while, and an engine
-  // deallocated during that window must still have something to tear down;
-  // claiming after the reply would leave a gap where it does not.
-  prepareEngineInit(engineId);
 
   result(@(YES));
 }

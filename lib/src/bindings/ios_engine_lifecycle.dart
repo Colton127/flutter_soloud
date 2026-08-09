@@ -1,7 +1,28 @@
-import 'dart:io';
-
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:logging/logging.dart';
+
+/// What came of asking the iOS plugin to claim the native engine.
+enum IosEnginePrepareResult {
+  /// The plugin took the native lifecycle claim. Initialization continues, and
+  /// automatic teardown on FlutterEngine destruction is armed.
+  claimed,
+
+  /// The channel could not be used at all, so nothing was claimed and nothing
+  /// happened natively. The caller must take the claim itself.
+  ///
+  /// Only ever reported for failures that happen *before* the message is sent —
+  /// this is not iOS, Flutter's messaging is not initialized, or the plugin is
+  /// not registered. Never for a failure that might mean the handler ran.
+  unavailable,
+
+  /// The plugin refused, or the outcome of a sent request is unknown.
+  ///
+  /// Either way the caller must not claim the engine itself: the request may
+  /// already have been committed, and a second claim would advance the native
+  /// lifecycle generation a second time. This initialization is over.
+  refused,
+}
 
 /// Hands the iOS plugin the engine id it cannot obtain for itself.
 ///
@@ -21,54 +42,85 @@ class IosEngineLifecycle {
 
   static final Logger _log = Logger('flutter_soloud.IosEngineLifecycle');
 
-  static const MethodChannel _channel = MethodChannel(
-    'flutter_soloud/engine_lifecycle',
-  );
+  /// The plugin's engine-local channel name.
+  @visibleForTesting
+  static const String channelName = 'flutter_soloud/engine_lifecycle';
 
-  /// Whether this platform has the iOS lifecycle plugin at all.
-  static bool get _isSupported => Platform.isIOS;
+  /// Whether this platform runs the iOS lifecycle plugin at all.
+  ///
+  /// Uses [defaultTargetPlatform] rather than `dart:io` so it works on every
+  /// build target and so tests can drive both branches.
+  static bool get isSupported => defaultTargetPlatform == TargetPlatform.iOS;
 
-  /// Asks the plugin to adopt [engineId] and take the native lifecycle claim.
+  /// Asks the plugin to adopt [engineId] and claim the native engine, valid
+  /// only while the native shutdown epoch is still [shutdownEpoch].
   ///
-  /// Returns whether it did. `false` means the caller must take the claim
-  /// itself through FFI: either this is not iOS, or the channel could not be
-  /// used — most often because the app called `SoLoud.init()` without
-  /// `WidgetsFlutterBinding.ensureInitialized()`, which has never been a
-  /// requirement of this package and does not become one here.
-  ///
-  /// The cost of falling back is only that automatic teardown on FlutterEngine
-  /// destruction is not armed; initialization itself is unaffected.
-  Future<bool> prepareEngineInit(int engineId) async {
-    if (!_isSupported) return false;
+  /// The epoch is what makes a superseded request safe: `deinit()` can run
+  /// while this call is suspended, and the claim must not land afterwards.
+  Future<IosEnginePrepareResult> prepareEngineInit(
+    int engineId,
+    int shutdownEpoch,
+  ) async {
+    if (!isSupported) return IosEnginePrepareResult.unavailable;
+
+    // Resolved before sending, and separately, so that "there is no messenger"
+    // stays distinguishable from "the message was sent and something went
+    // wrong". Only the former may fall back to claiming directly: the latter
+    // might mean the handler already claimed.
+    final BinaryMessenger messenger;
+    try {
+      messenger = ServicesBinding.instance.defaultBinaryMessenger;
+    } on Object catch (error) {
+      _log.warning(
+        'Flutter messaging is not available, so automatic iOS FlutterEngine '
+        'teardown cannot be armed; initializing directly instead. Calling '
+        'WidgetsFlutterBinding.ensureInitialized() before SoLoud.init() arms '
+        'it. The engine is still torn down by an explicit deinit(), and a '
+        'later init() recovers a stale engine.',
+        error,
+      );
+      return IosEnginePrepareResult.unavailable;
+    }
+
+    final channel = MethodChannel(
+      channelName,
+      const StandardMethodCodec(),
+      messenger,
+    );
 
     try {
-      final claimed = await _channel.invokeMethod<bool>(
-        'prepareEngineInit',
-        engineId,
-      );
-      if (claimed ?? false) return true;
+      final claimed = await channel.invokeMethod<bool>('prepareEngineInit', {
+        'engineId': engineId,
+        'shutdownEpoch': shutdownEpoch,
+      });
+      if (claimed ?? false) return IosEnginePrepareResult.claimed;
 
+      // A reply that is not `true` is not something to work around.
+      _log.warning('The iOS lifecycle plugin did not claim engine $engineId.');
+      return IosEnginePrepareResult.refused;
+    } on MissingPluginException catch (error) {
+      // Definitive: nothing handled the message, so nothing was claimed.
       _log.warning(
-        'The iOS lifecycle plugin declined to claim engine $engineId. '
-        'Automatic native teardown on FlutterEngine destruction is not armed; '
-        'initialization continues normally.',
+        'The iOS lifecycle plugin is not registered, so automatic '
+        'FlutterEngine teardown cannot be armed; initializing directly '
+        'instead.',
+        error,
       );
-      return false;
+      return IosEnginePrepareResult.unavailable;
     } on Object catch (error, stackTrace) {
-      // Deliberately broad: a MissingPluginException (registrant not run), a
-      // binding that was never initialized, and a platform-thread failure all
-      // mean the same thing here, and none of them may be allowed to fail an
-      // initialization that would otherwise have worked.
+      // Everything else is either an explicit refusal (stale_prepare,
+      // engine_detached, invalid arguments) or an unknown failure of a message
+      // that was already sent. Both must be treated as refused: retrying or
+      // falling back could claim the engine a second time on top of a request
+      // the platform may have committed.
       _log.warning(
-        'Unable to arm automatic iOS FlutterEngine lifecycle teardown; '
-        'falling back to direct native initialization. The native engine will '
-        'still be torn down by an explicit deinit(), and a later init() '
-        'recovers a stale engine, but it will not be released automatically '
-        'when the FlutterEngine is destroyed.',
+        'The iOS lifecycle handshake for engine $engineId failed after the '
+        'request was sent; abandoning this initialization rather than risking '
+        'a duplicate native claim.',
         error,
         stackTrace,
       );
-      return false;
+      return IosEnginePrepareResult.refused;
     }
   }
 }

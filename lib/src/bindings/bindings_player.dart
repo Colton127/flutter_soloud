@@ -211,12 +211,29 @@ abstract class FlutterSoLoud {
   /// and an engine destroyed during that window still has to be able to tear
   /// down what it just built.
   ///
-  /// Asynchronous because iOS cannot take the claim from Dart: the plugin that
-  /// observes FlutterEngine destruction has to be the one that takes it, which
-  /// means a round trip to the platform thread. Everywhere else this completes
-  /// without yielding to the event loop.
+  /// Synchronous everywhere except iOS: see [usesAsyncEnginePrepare].
   @mustBeOverridden
-  Future<void> prepareEngineInit();
+  void prepareEngineInit();
+
+  /// Whether this platform must claim the engine through
+  /// [prepareEngineInitAsync] instead of [prepareEngineInit].
+  ///
+  /// True only on iOS, where the plugin that observes FlutterEngine destruction
+  /// has to be the one that takes the claim — it cannot discover the engine id
+  /// by itself — which means a round trip to the platform thread. Everywhere
+  /// else the claim is taken synchronously, with no suspension point between
+  /// deciding to initialize and owning the engine.
+  @mustBeOverridden
+  bool get usesAsyncEnginePrepare;
+
+  /// Claim the engine by way of the platform, for [usesAsyncEnginePrepare].
+  ///
+  /// Throws `SoLoudInitializationStoppedByDeinitException` when the claim was
+  /// refused — most often because a `deinit()` ran while this was in flight and
+  /// superseded it. Falls back to the synchronous claim, without throwing, when
+  /// the platform channel was definitively unusable.
+  @mustBeOverridden
+  Future<void> prepareEngineInitAsync();
 
   /// Publish a native shutdown request before dispatching asynchronous dispose.
   @mustBeOverridden

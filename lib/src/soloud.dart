@@ -528,12 +528,17 @@ interface class SoLoud {
       }
     }
 
-    // Claims the native engine for this FlutterEngine before the device open
-    // is dispatched. On iOS this is a round trip to the platform thread, so it
-    // is a suspension point like any other in this method.
-    await _controller.soLoudFFI.prepareEngineInit();
-    if (initializationGeneration != _lifecycleGeneration) {
-      await _waitForInitializationTeardownAndThrow();
+    // Claims the native engine for this FlutterEngine before the device open is
+    // dispatched. Only iOS has to go through the platform to do it, and only
+    // there does this become a suspension point -- everywhere else the claim is
+    // taken with no window for a deinit() to interleave.
+    if (_controller.soLoudFFI.usesAsyncEnginePrepare) {
+      await _controller.soLoudFFI.prepareEngineInitAsync();
+      if (initializationGeneration != _lifecycleGeneration) {
+        await _waitForInitializationTeardownAndThrow();
+      }
+    } else {
+      _controller.soLoudFFI.prepareEngineInit();
     }
 
     // Must be set before the engine opens the device so the backend picks it

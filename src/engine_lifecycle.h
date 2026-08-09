@@ -40,6 +40,21 @@ extern "C"
   /// -1 means "no engine lifecycle available on this platform".
   FFI_PLUGIN_EXPORT void prepareEngineInit(int64_t owner_engine_id);
 
+  /// The epoch a prepare request must quote to be accepted. Read it before
+  /// starting a claim that cannot be taken synchronously.
+  FFI_PLUGIN_EXPORT uint64_t currentEngineShutdownEpoch(void);
+
+  /// Take the claim prepareEngineInit() would take, but only if no shutdown has
+  /// been requested since [shutdown_epoch] was read. Returns whether it did.
+  ///
+  /// For callers that decide to initialize at one moment and can only claim at
+  /// a later one — iOS hands the claim to its plugin over a method channel, and
+  /// `deinit()` can run while Dart is suspended in between. A claim that lands
+  /// after the teardown that superseded it would lower the shutdown flag and
+  /// leave ownership recorded for an engine that is already gone.
+  FFI_PLUGIN_EXPORT bool prepareEngineInitForRequest(int64_t owner_engine_id,
+                                                     uint64_t shutdown_epoch);
+
   /// Retire every Dart callable owned by [engine_id] — the process-global ones
   /// and the per-source ones alike. Returns false when a different engine owns
   /// the live registration. Takes one uncontended lock and performs no blocking

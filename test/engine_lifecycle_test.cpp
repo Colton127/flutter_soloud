@@ -69,6 +69,10 @@ extern "C"
     int isMixerCaptureRunning();
     bool clearDartCallbackRegistrationsForEngine(int64_t engine_id);
     bool requestEngineTeardownForEngine(int64_t engine_id);
+    void requestEngineShutdown();
+    uint64_t currentEngineShutdownEpoch();
+    bool prepareEngineInitForRequest(int64_t owner_engine_id,
+                                     uint64_t shutdown_epoch);
     enum PlayerErrors setPullBufferStream(
         unsigned int *hash, unsigned int bufferSizeBytes,
         double bufferTriggerPosition, unsigned int sampleRate,
@@ -776,6 +780,114 @@ void testIosHandshakeIsScopedToItsEngine()
     resetGlobalState();
 }
 
+/// The iOS prepare handshake cannot claim the engine synchronously: Dart is
+/// suspended while the request crosses to the platform thread, and `deinit()`
+/// can run in that gap. A claim landing on the far side of that teardown would
+/// lower the shutdown flag and leave ownership recorded for an engine that no
+/// longer exists -- the initialization lost, but its claim would win.
+void testSupersededPrepareCannotClaim()
+{
+    std::printf("a prepare superseded by deinit cannot claim afterwards\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+
+    // A new initialization begins: Dart reads the epoch and sends the request.
+    const uint64_t epoch = currentEngineShutdownEpoch();
+
+    // While it is in flight, deinit() runs to completion.
+    requestEngineShutdown();
+    dispose();
+
+    // The request arrives late.
+    EXPECT(!prepareEngineInitForRequest(kEngineA, epoch),
+           "a prepare superseded by a shutdown must be refused");
+    EXPECT(soloudTestPlayerIsInited() == 0, "the engine must stay disposed");
+    EXPECT(isInited() == 0, "readiness must stay false");
+    EXPECT(!requestEngineTeardownForEngine(kEngineA),
+           "the refused prepare must not have left a lifecycle claim");
+
+    // A later, legitimate initialization still claims normally.
+    const uint64_t freshEpoch = currentEngineShutdownEpoch();
+    EXPECT(prepareEngineInitForRequest(kEngineA, freshEpoch),
+           "a fresh request should claim");
+    EXPECT(requestEngineTeardownForEngine(kEngineA),
+           "and that claim should be tearable down");
+
+    resetGlobalState();
+}
+
+/// Every route that requests a shutdown has to invalidate requests in flight,
+/// not just the one Dart calls: an engine destroyed through the detach hook
+/// supersedes a pending initialization just as much as deinit() does.
+void testEveryShutdownRouteInvalidatesPendingPrepare()
+{
+    std::printf("every shutdown route invalidates a pending prepare\n");
+    resetGlobalState();
+
+    // Route 1: the explicit shutdown request Dart's deinit path uses.
+    uint64_t epoch = currentEngineShutdownEpoch();
+    requestEngineShutdown();
+    EXPECT(!prepareEngineInitForRequest(kEngineA, epoch),
+           "requestEngineShutdown() must invalidate a pending prepare");
+
+    // Route 2: dispose().
+    epoch = currentEngineShutdownEpoch();
+    dispose();
+    EXPECT(!prepareEngineInitForRequest(kEngineA, epoch),
+           "dispose() must invalidate a pending prepare");
+
+    // Route 3: a FlutterEngine being destroyed.
+    prepareEngineInit(kEngineA);
+    epoch = currentEngineShutdownEpoch();
+    EXPECT(requestEngineTeardownForEngine(kEngineA),
+           "the teardown should be accepted");
+    EXPECT(!prepareEngineInitForRequest(kEngineA, epoch),
+           "an accepted teardown must invalidate a pending prepare");
+
+    resetGlobalState();
+}
+
+/// The replacement-ordering case: a request that was cancelled, a newer
+/// initialization that succeeded, and then the stale request arriving. It must
+/// not disturb the newer engine in any way.
+void testStalePrepareCannotDisturbNewerInit()
+{
+    std::printf("a stale prepare cannot disturb a newer initialization\n");
+    resetGlobalState();
+
+    // Request A goes out.
+    const uint64_t staleEpoch = currentEngineShutdownEpoch();
+
+    // A is cancelled by a deinit.
+    requestEngineShutdown();
+    dispose();
+
+    // A newer initialization claims and registers, for a different engine.
+    const uint64_t freshEpoch = currentEngineShutdownEpoch();
+    EXPECT(prepareEngineInitForRequest(kEngineB, freshEpoch),
+           "the newer initialization should claim");
+    registerCallbacksFor(kEngineB);
+    EXPECT(stateChangedDelta() == 1, "B's callables should be live");
+
+    // Now A arrives.
+    EXPECT(!prepareEngineInitForRequest(kEngineA, staleEpoch),
+           "the stale request must be refused");
+    EXPECT(stateChangedDelta() == 1,
+           "the stale request must not retire B's callables");
+    EXPECT(requestEngineTeardownForEngine(kEngineB),
+           "B must still own its lifecycle claim");
+    EXPECT(!requestEngineTeardownForEngine(kEngineA),
+           "the stale request must not have claimed anything for A");
+
+    resetGlobalState();
+}
+
 /// The ordinary destroy path: callables inert at once, native engine gone
 /// shortly after, and the duplicate notification (onEngineWillDestroy() and
 /// onDetachedFromEngine() both fire) tears down exactly once.
@@ -980,6 +1092,9 @@ int main()
 
     testHotRestartRetiresEveryCallable();
     testIosLifecycleHandshake();
+    testSupersededPrepareCannotClaim();
+    testEveryShutdownRouteInvalidatesPendingPrepare();
+    testStalePrepareCannotDisturbNewerInit();
     testIosHandshakeIsScopedToItsEngine();
     testReplacementDoesNotResurrectRetiredSources();
     testCallbackRetirementIsScopedToTheOwner();

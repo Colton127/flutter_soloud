@@ -760,19 +760,46 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   @override
-  Future<void> prepareEngineInit() async {
+  void prepareEngineInit() => _prepareEngineInit(currentEngineId);
+
+  @override
+  bool get usesAsyncEnginePrepare => IosEngineLifecycle.isSupported;
+
+  @override
+  Future<void> prepareEngineInitAsync() async {
     final engineId = currentEngineId;
 
-    // On iOS the claim has to be taken by the plugin, because only it observes
-    // FlutterEngine destruction and it cannot discover the engine id by itself.
-    // Anywhere else -- and on iOS whenever the channel is unusable -- Dart
-    // takes the claim directly, exactly as before.
-    if (await _iosEngineLifecycle.prepareEngineInit(engineId)) return;
+    // Read before the request goes out: `deinit()` can run while this is
+    // suspended, and the claim must not land on the far side of the teardown
+    // that superseded it. Native refuses a request whose epoch has moved.
+    final shutdownEpoch = _currentEngineShutdownEpoch();
 
-    _prepareEngineInit(engineId);
+    final result = await _iosEngineLifecycle.prepareEngineInit(
+      engineId,
+      shutdownEpoch,
+    );
+
+    switch (result) {
+      case IosEnginePrepareResult.claimed:
+        return;
+      case IosEnginePrepareResult.unavailable:
+        // Nothing was sent, so nothing was claimed: claim directly, exactly as
+        // every other platform does. Automatic teardown is simply not armed.
+        _prepareEngineInit(engineId);
+      case IosEnginePrepareResult.refused:
+        // Either the platform said no, or a sent request's outcome is unknown.
+        // Claiming again here could take the claim a second time on top of one
+        // the platform may already have committed.
+        throw const SoLoudInitializationStoppedByDeinitException();
+    }
   }
 
   static const IosEngineLifecycle _iosEngineLifecycle = IosEngineLifecycle();
+
+  late final _currentEngineShutdownEpoch =
+      _lookup<ffi.NativeFunction<ffi.Uint64 Function()>>(
+        'currentEngineShutdownEpoch',
+      ).asFunction<int Function()>();
 
   late final _prepareEngineInit = _prepareEngineInitPtr
       .asFunction<void Function(int)>();

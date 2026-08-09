@@ -109,6 +109,28 @@ namespace
   int64_t nativeInitOwnerEngineId = kNoEngineId;
   uint64_t engineInitGeneration = 0;
 
+  /// Advanced every time a shutdown is requested, by any route.
+  ///
+  /// It exists for callers that cannot claim the engine synchronously. iOS has
+  /// to hand the claim to its plugin over a method channel, so Dart is
+  /// suspended between deciding to initialize and the claim actually being
+  /// taken — and `deinit()` can run in that gap. Without this, the late claim
+  /// would land *after* the teardown that superseded it, lowering the shutdown
+  /// flag and leaving an ownership claim for an engine that no longer exists.
+  ///
+  /// Such a caller reads the epoch before it starts, and the claim is refused
+  /// if the epoch has moved by the time it arrives. A synchronous caller has no
+  /// gap to protect and does not need it.
+  uint64_t engineShutdownEpoch = 0;
+
+  /// Raise the shutdown flag and invalidate every prepare request that was
+  /// already in flight. Callers must hold engine_lifecycle_mutex.
+  void requestShutdownLocked()
+  {
+    engine_shutdown_requested.store(true, std::memory_order_release);
+    ++engineShutdownEpoch;
+  }
+
   /// A snapshot of the lifecycle claim, taken so a worker that will run later
   /// can tell whether the engine it was asked to act on is still the current
   /// one.
@@ -145,8 +167,8 @@ namespace
 
     *out = EngineLifecycleClaim{nativeInitOwnerEngineId, engineInitGeneration};
     // Rejects an initialization worker of this same engine that has not entered
-    // native code yet.
-    engine_shutdown_requested.store(true, std::memory_order_release);
+    // native code yet, and any prepare request still in flight.
+    requestShutdownLocked();
     return true;
   }
 
@@ -925,7 +947,10 @@ extern "C"
   /// what a *destroyed* engine uses.
   FFI_PLUGIN_EXPORT void dispose()
   {
-    engine_shutdown_requested.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+      requestShutdownLocked();
+    }
     engine_initialized.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> guard(init_deinit_mutex);
     std::lock_guard<std::mutex> guard_load(loadMutex);
@@ -960,7 +985,44 @@ extern "C"
   FFI_PLUGIN_EXPORT void requestEngineShutdown()
   {
     std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
-    engine_shutdown_requested.store(true, std::memory_order_release);
+    requestShutdownLocked();
+  }
+
+  /// The epoch a prepare request must quote to be accepted.
+  ///
+  /// Read it synchronously, before starting a claim that cannot complete
+  /// synchronously; pass it to prepareEngineInitForRequest() when the claim
+  /// finally happens. Anything that requests a shutdown in between moves the
+  /// epoch and the claim is refused.
+  FFI_PLUGIN_EXPORT uint64_t currentEngineShutdownEpoch()
+  {
+    std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+    return engineShutdownEpoch;
+  }
+
+  /// prepareEngineInit() for a claim that was decided earlier than it is taken.
+  ///
+  /// Returns false, changing nothing, when a shutdown has been requested since
+  /// [shutdown_epoch] was read — the initialization that asked for this claim
+  /// has been superseded, and letting it land would lower the shutdown flag and
+  /// leave an ownership claim behind a teardown that already won.
+  ///
+  /// This is not a second way to claim the engine: it is the same claim, taken
+  /// under the condition that nothing has cancelled it. A caller that can claim
+  /// synchronously has no such window and should keep using prepareEngineInit().
+  FFI_PLUGIN_EXPORT bool prepareEngineInitForRequest(int64_t owner_engine_id,
+                                                     uint64_t shutdown_epoch)
+  {
+    std::lock_guard<std::mutex> guard(engine_lifecycle_mutex);
+
+    if (engineShutdownEpoch != shutdown_epoch)
+      return false;
+
+    engine_shutdown_requested.store(false, std::memory_order_release);
+    engine_initialized.store(false, std::memory_order_release);
+    nativeInitOwnerEngineId = owner_engine_id;
+    ++engineInitGeneration;
+    return true;
   }
 
   /// Tear the engine down because its owning FlutterEngine is being destroyed
