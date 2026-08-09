@@ -1,6 +1,11 @@
 #include "analyzer.h"
 #include "audiobuffer/pull_buffer_stream.h"
 #include "dart_callback_gate.h"
+// The FlutterEngine lifecycle entry points defined below. Included so the
+// declarations the embedder plugins compile against are checked against these
+// definitions rather than being repeated by hand in Java, Objective-C++ and
+// Dart.
+#include "engine_lifecycle.h"
 #include "mixeroutput/mixer_output.h"
 #include "mixeroutput/wav_output_encoder.h"
 #include "player.h"

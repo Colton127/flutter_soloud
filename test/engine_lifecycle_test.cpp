@@ -711,6 +711,71 @@ void testConcurrentCaptureStopsAreSerialized()
     resetGlobalState();
 }
 
+/// The sequence the iOS plugin runs in its lifecycle handshake, which is the
+/// only supported point at which iOS can retire a previous isolate's callables.
+///
+/// iOS has no equivalent of Android's onPreEngineRestart(), so after a hot
+/// restart the old isolate's callables are still registered under the *same*
+/// engine id when the new isolate starts initializing. The handler retires them
+/// and then takes a fresh claim, in that order, on the platform thread.
+void testIosLifecycleHandshake()
+{
+    std::printf("the iOS handshake retires stale callables and reclaims\n");
+    resetGlobalState();
+
+    // The old isolate: initialized, callables registered under engine A.
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    const unsigned int hash = createPullStream();
+    EXPECT(hash != 0, "a pull buffer stream should be created");
+    EXPECT(stateChangedDelta() == 1, "the old isolate's callables are live");
+
+    // Hot restart: the isolate is gone, the FlutterEngine and its id are not.
+    // The replacement isolate's handshake arrives, for the same engine id.
+    EXPECT(clearDartCallbackRegistrationsForEngine(kEngineA),
+           "the handshake should retire the previous isolate's callables");
+    EXPECT(stateChangedDelta() == 0,
+           "the old isolate's global callables must be inert");
+    EXPECT(streamCallDelta(hash) == 0,
+           "the old isolate's stream callables must be inert too");
+
+    prepareEngineInit(kEngineA);
+
+    // The claim is established before the reply, so an engine deallocated while
+    // the replacement is opening the device still has something to tear down.
+    EXPECT(requestEngineTeardownForEngine(kEngineA),
+           "the handshake should leave a claim the detach hook can tear down");
+    EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
+           "that teardown should dispose the engine");
+
+    resetGlobalState();
+}
+
+/// A handshake names its own engine, so it can never retire another engine's
+/// callables -- the case that matters when two engines overlap and the
+/// replacement is the one that owns the registration.
+void testIosHandshakeIsScopedToItsEngine()
+{
+    std::printf("the iOS handshake cannot retire another engine's callables\n");
+    resetGlobalState();
+
+    prepareEngineInit(kEngineB);
+    registerCallbacksFor(kEngineB);
+    EXPECT(stateChangedDelta() == 1, "B's callables should be live");
+
+    // A late handshake from engine A, whose isolate is starting while B holds
+    // the registration.
+    EXPECT(!clearDartCallbackRegistrationsForEngine(kEngineA),
+           "A's handshake must not retire B's callables");
+    EXPECT(stateChangedDelta() == 1, "B's callables must still be live");
+
+    resetGlobalState();
+}
+
 /// The ordinary destroy path: callables inert at once, native engine gone
 /// shortly after, and the duplicate notification (onEngineWillDestroy() and
 /// onDetachedFromEngine() both fire) tears down exactly once.
@@ -914,6 +979,8 @@ int main()
     }
 
     testHotRestartRetiresEveryCallable();
+    testIosLifecycleHandshake();
+    testIosHandshakeIsScopedToItsEngine();
     testReplacementDoesNotResurrectRetiredSources();
     testCallbackRetirementIsScopedToTheOwner();
     testCallbackOwnerDiffersFromLifecycleOwner();

@@ -58,6 +58,12 @@ flutter:
         pluginClass: FlutterSoloudPlugin
         ffiPlugin: true
       ios:
+        # Same arrangement as Android: still an FFI plugin, with a plugin class
+        # whose only job is to observe FlutterEngine lifetime so the
+        # process-global native engine can be retired with its owner. It
+        # registers a lifecycle channel and nothing else, and does no native
+        # work at registration.
+        pluginClass: FlutterSoloudPlugin
         ffiPlugin: true
       linux:
         ffiPlugin: true

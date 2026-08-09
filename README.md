@@ -69,6 +69,33 @@ with a new one. Two FlutterEngines using the plugin *simultaneously* is not
 supported — the engine they would share is process-global, and the last one to
 initialize wins.
 
+### iOS: FlutterEngine lifecycle
+
+iOS gets the same native teardown, with one honest difference in timing.
+
+- **FlutterEngine deallocated** tears down the player, output device and
+  scheduler that engine owned, and cannot tear down an engine that has since
+  replaced it. The blocking part runs on a native worker, so the platform
+  thread is never held.
+- **Callback retirement is not guaranteed to happen before the isolate goes.**
+  Android can retire callbacks while the engine is still valid
+  (`onEngineWillDestroy`) and before a hot restart (`onPreEngineRestart`).
+  Flutter's public iOS plugin API offers neither: the only hook is plugin
+  detach during `FlutterEngine` deallocation, and a hot restart gives no hook at
+  all. So on iOS there is a window — between the old isolate going away and
+  either detach arriving or the next `init()` running — in which a native
+  callback belonging to the departed isolate has not yet been retired. Recovery
+  happens at the next initialization, which retires the stale registrations
+  before claiming afresh. We do not close this with private Flutter APIs.
+
+Arming this needs one round trip to the platform thread, because iOS does not
+expose the engine's identity to a plugin the way Android does. If Flutter's
+messaging is not available — for instance `SoLoud.init()` called without
+`WidgetsFlutterBinding.ensureInitialized()`, which this package has never
+required and still does not — initialization proceeds exactly as before and
+logs a warning that automatic teardown was not armed. An explicit `deinit()`,
+and recovery at the next `init()`, keep working either way.
+
 ## Documentation
 
 - [Full Documentation](https://docs.page/alnitak/flutter_soloud_docs)

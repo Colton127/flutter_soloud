@@ -13,6 +13,7 @@ import 'dart:ui' as ui;
 import 'package:ffi/ffi.dart';
 import 'package:flutter_soloud/src/bindings/audio_data.dart';
 import 'package:flutter_soloud/src/bindings/bindings_player.dart';
+import 'package:flutter_soloud/src/bindings/ios_engine_lifecycle.dart';
 import 'package:flutter_soloud/src/bindings/native_metadata_ffi.dart';
 import 'package:flutter_soloud/src/enums.dart';
 import 'package:flutter_soloud/src/exceptions/exceptions.dart';
@@ -759,7 +760,19 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   @override
-  void prepareEngineInit() => _prepareEngineInit(currentEngineId);
+  Future<void> prepareEngineInit() async {
+    final engineId = currentEngineId;
+
+    // On iOS the claim has to be taken by the plugin, because only it observes
+    // FlutterEngine destruction and it cannot discover the engine id by itself.
+    // Anywhere else -- and on iOS whenever the channel is unusable -- Dart
+    // takes the claim directly, exactly as before.
+    if (await _iosEngineLifecycle.prepareEngineInit(engineId)) return;
+
+    _prepareEngineInit(engineId);
+  }
+
+  static const IosEngineLifecycle _iosEngineLifecycle = IosEngineLifecycle();
 
   late final _prepareEngineInit = _prepareEngineInitPtr
       .asFunction<void Function(int)>();

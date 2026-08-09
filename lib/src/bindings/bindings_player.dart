@@ -206,12 +206,17 @@ abstract class FlutterSoLoud {
   ///
   /// On platforms with a FlutterEngine lifecycle this also claims the
   /// process-global native engine for the FlutterEngine that owns this isolate.
-  /// The claim is taken here, synchronously, rather than when callbacks
-  /// register: opening the audio device can take seconds on Android, and an
-  /// engine destroyed during that window still has to be able to tear down what
-  /// it just built.
+  /// The claim is taken here, before the initialization is dispatched, rather
+  /// than when callbacks register: opening the audio device can take seconds,
+  /// and an engine destroyed during that window still has to be able to tear
+  /// down what it just built.
+  ///
+  /// Asynchronous because iOS cannot take the claim from Dart: the plugin that
+  /// observes FlutterEngine destruction has to be the one that takes it, which
+  /// means a round trip to the platform thread. Everywhere else this completes
+  /// without yielding to the event loop.
   @mustBeOverridden
-  void prepareEngineInit();
+  Future<void> prepareEngineInit();
 
   /// Publish a native shutdown request before dispatching asynchronous dispose.
   @mustBeOverridden

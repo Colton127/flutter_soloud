@@ -528,7 +528,13 @@ interface class SoLoud {
       }
     }
 
-    _controller.soLoudFFI.prepareEngineInit();
+    // Claims the native engine for this FlutterEngine before the device open
+    // is dispatched. On iOS this is a round trip to the platform thread, so it
+    // is a suspension point like any other in this method.
+    await _controller.soLoudFFI.prepareEngineInit();
+    if (initializationGeneration != _lifecycleGeneration) {
+      await _waitForInitializationTeardownAndThrow();
+    }
 
     // Must be set before the engine opens the device so the backend picks it
     // up at stream creation (and re-applies it on device changes).

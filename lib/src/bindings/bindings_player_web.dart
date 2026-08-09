@@ -256,7 +256,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   Future<void> deinitAsync() async => deinit();
 
   @override
-  void prepareEngineInit() {}
+  Future<void> prepareEngineInit() async {}
 
   @override
   void requestEngineShutdown() {}
