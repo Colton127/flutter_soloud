@@ -106,6 +106,13 @@ typedef enum PlayerStateEvents {
   event_interruption_began,
   event_interruption_ended,
   event_unlocked,
+  /// An automatic output-device start failed, after the backend had already
+  /// rebuilt the device and retried. Emitted by the lifecycle scheduler, not by
+  /// the OS, so unlike the notifications above it is reliable on every backend.
+  ///
+  /// WARNING: Keep in sync with `PlayerStateNotification` in
+  /// `lib/src/enums.dart`; the Dart side indexes this by ordinal.
+  event_audio_device_start_failed,
 } PlayerEvents_t;
 
 /// The state of the audio output device.

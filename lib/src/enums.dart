@@ -358,6 +358,27 @@ enum PlayerStateNotification {
 
   /// The audio session is unlocked and ready for use.
   unlocked,
+
+  /// An automatic output-device start failed, after the backend had already
+  /// rebuilt the device and retried.
+  ///
+  /// Unlike the OS-sourced notifications above, this one is emitted by the
+  /// plugin's own lifecycle scheduler and is reliable on every backend. It is
+  /// surfaced publicly as `SoLoud.audioDeviceStartFailures`.
+  audioDeviceStartFailed,
+}
+
+/// Why an automatic output-device start failed.
+///
+/// Delivered by `SoLoud.audioDeviceStartFailures`.
+enum AudioDeviceStartFailure {
+  /// The backend could not start the output device, even after rebuilding it
+  /// against the current default output.
+  ///
+  /// Playback state is untouched: voices remain valid and unpaused, so audio
+  /// resumes if the device can later be started (for example by awaiting
+  /// `SoLoud.startAudioDevice`).
+  deviceUnavailable,
 }
 
 /// The state of the audio output device, as reported by

@@ -1,6 +1,7 @@
 #include "analyzer.h"
 #include "audiobuffer/pull_buffer_stream.h"
 #include "dart_callback_gate.h"
+#include "device_lifecycle_test_hooks.h"
 // The FlutterEngine lifecycle entry points defined below. Included so the
 // declarations the embedder plugins compile against are checked against these
 // definitions rather than being repeated by hand in Java, Objective-C++ and
@@ -840,11 +841,67 @@ extern "C"
   /// as possible once idle. [timeoutMs] > 0 keeps it running for that many
   /// milliseconds after going idle. Any play/unpause before the deadline
   /// cancels the pending stop. The default is 500. Can be called any time.
+  /// Coalesces deferred applications of the idle-timeout policy. Every worker
+  /// re-reads the published value, so one pending worker is enough no matter
+  /// how many times the setter is called while the lifecycle mutex is busy.
+  std::atomic<bool> idle_timeout_apply_queued{false};
+
+  /// Apply the published idle-timeout policy once init_deinit_mutex becomes
+  /// available, without making the caller wait for it.
+  static void queueAudioDeviceIdleTimeoutApply()
+  {
+    if (idle_timeout_apply_queued.exchange(true, std::memory_order_acq_rel))
+      return;
+
+    try
+    {
+      std::thread([]()
+                  {
+        // Cleared before blocking, so a call that arrives while this worker is
+        // still waiting queues a fresh one rather than being dropped. Two
+        // workers applying the same published value is harmless; losing the
+        // last write is not.
+        idle_timeout_apply_queued.store(false, std::memory_order_release);
+
+        std::lock_guard<std::mutex> guard(init_deinit_mutex);
+        if (player.get() != nullptr)
+          player.get()->applyPublishedAudioDeviceIdleTimeout(); })
+          .detach();
+    }
+    catch (...)
+    {
+      idle_timeout_apply_queued.store(false, std::memory_order_release);
+      // Best effort. The policy is already published process-wide, so the next
+      // init() still observes it.
+    }
+  }
+
+  /// Set the idle-timeout policy. This is called synchronously from the UI
+  /// isolate and is documented as callable at any time, so it must not block.
   FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs)
   {
-    std::lock_guard<std::mutex> guard(init_deinit_mutex);
-    if (player.get() != nullptr)
-      player.get()->setAudioDeviceIdleTimeout(timeoutMs);
+    // Publish first, with no lock at all. The policy is process-global and
+    // outlives any individual Player, so this alone guarantees the next init()
+    // uses it even when no Player can consume the update right now.
+    Player::publishAudioDeviceIdleTimeout(timeoutMs);
+
+    // Applying it to the *current* Player needs that pointer pinned, which
+    // means init_deinit_mutex -- and initEngine() holds that across the entire
+    // native device open, which is seconds on Android and is exactly the stall
+    // #481 moved off the UI isolate. Waiting for it here would put that stall
+    // straight back on the UI thread, so take the lock only if it is free...
+    {
+      std::unique_lock<std::mutex> guard(init_deinit_mutex, std::try_to_lock);
+      if (guard.owns_lock())
+      {
+        if (player.get() != nullptr)
+          player.get()->applyPublishedAudioDeviceIdleTimeout();
+        return;
+      }
+    }
+
+    // ...and otherwise hand it to a thread that can afford to wait.
+    queueAudioDeviceIdleTimeoutApply();
   }
 
   /// Stop the audio output device without deinitializing the engine. By default
@@ -942,8 +999,40 @@ extern "C"
   /// [deviceID] the device ID. -1 for default OS output device.
   FFI_PLUGIN_EXPORT enum PlayerErrors changeDevice(int deviceID)
   {
+    // Pins the global `player` for the whole operation, exactly as the
+    // start/stop exports do. Without it a change worker can be inside
+    // Player::changeDevice() while a teardown worker disposes that Player and
+    // installs a replacement -- the change then runs on freed memory. The
+    // window is wide on this path because device enumeration deliberately
+    // happens before Player::mDeviceLifecycleOperationMutex is taken.
+    //
+    // Holding init_deinit_mutex across enumeration and device replacement is
+    // affordable only because Dart runs changeDevice() on a worker isolate, so
+    // the blocking is never on Flutter's UI isolate.
+    //
+    // Lock order. init_deinit_mutex is strictly outermost -- no Player member
+    // function acquires it -- and below that it is a partial order, not a
+    // chain:
+    //
+    //   init_deinit_mutex
+    //     -> Player::mDeviceLifecycleOperationMutex
+    //          -> Player::mInterruptionMutex -> Player::mPauseMutex
+    //          -> SoLoud::gDeviceOperationMutex        (backend device call)
+    //
+    //   SoLoud::gDeviceOperationMutex
+    //     -> Player::mInterruptionMutex -> Player::mPauseMutex
+    //          (an OS interruption notification, which miniaudio can deliver
+    //           inline from a backend device call)
+    //
+    // gDeviceOperationMutex and mInterruptionMutex are therefore both reachable
+    // from the operation mutex, but never in opposite orders: no Player mutex
+    // is ever held across a backend device call. mPauseMutex is a leaf --
+    // nothing blocking runs under it.
+    std::lock_guard<std::mutex> guard(init_deinit_mutex);
     if (player.get() == nullptr)
       return backendNotInited;
+
+    SOLOUD_TEST_BARRIER(changeDeviceEntered);
 
     return player.get()->changeDevice(deviceID);
   }

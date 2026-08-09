@@ -72,6 +72,7 @@ namespace SoLoud
 #include <mutex>
 #include "soloud_common.h"
 #include "../../../../mixeroutput/mixer_output.h"
+#include "../../../../device_lifecycle_test_hooks.h"
 #if defined(_WIN32) || defined(_WIN64)
 #  include <windows.h>
 #else
@@ -392,6 +393,19 @@ namespace SoLoud
         if (isAAudio)
             ma_mutex_lock(&gDevice.aaudio.rerouteLock);
 #endif
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        // Lets a test drive the rebuild/retry path and the failure reporting
+        // behind it without needing hardware that can actually fail.
+        if (soloud_test::consumeForcedDeviceStartFailure())
+        {
+#if defined(MA_HAS_AAUDIO)
+            if (isAAudio)
+                ma_mutex_unlock(&gDevice.aaudio.rerouteLock);
+#endif
+            return UNKNOWN_ERROR;
+        }
+#endif
+
         if (ma_device_get_state(&gDevice) == ma_device_state_stopped)
         {
 #if defined(MA_APPLE_MOBILE)

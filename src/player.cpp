@@ -1,5 +1,6 @@
 #include "soloud_common.h"
 #include "player.h"
+#include "device_lifecycle_test_hooks.h"
 #include "audiobuffer/circular_float_buffer.h"
 #include "audiobuffer/pull_buffer_stream.h"
 #include "filters/filters.h"
@@ -285,6 +286,12 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
 
     mLifecycleRequestsAccepted.store(false, std::memory_order_release);
 
+    // Refresh from the published policy: the constructor ran earlier, and
+    // setAudioDeviceIdleTimeout() may have been called in between.
+    mIdleTimeoutMs.store(
+        gAudioDeviceIdleTimeoutMs.load(std::memory_order_acquire),
+        std::memory_order_release);
+
     // Choose the device performance profile before SoLoud opens the backend.
     SoLoud::miniaudio_setLowLatency(lowLatency);
 
@@ -330,7 +337,14 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
     }
     else
     {
+        // soloud.init() has already opened and started the device, so the
+        // mixer is running and reads mPostClipScaler every buffer. Writing it
+        // bare is a data race (ThreadSanitizer flags it in clip_internal), so
+        // take the audio mutex for the one store, exactly as the setters
+        // called during playback do.
+        soloud.lockAudioMutex_internal();
         soloud.setPostClipScaler(1.0f);
+        soloud.unlockAudioMutex_internal();
         mSampleRate = sampleRate;
         mBufferSize = bufferSize;
         mChannels = channels;
@@ -405,6 +419,10 @@ PlayerErrors Player::changeDevice(int deviceID)
             !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
             return backendNotInited;
 
+        // Taken before the state this decision reads, so playback starting
+        // mid-swap is detectable as newer intent below.
+        const uint64_t token = currentDeviceRequestGeneration();
+
         // The replacement device only has to be started if the old one was
         // running, or if the idle policy says it should be. A device stopped by
         // stopAudioDevice() or by the idle timeout stays stopped across the
@@ -416,10 +434,20 @@ PlayerErrors Player::changeDevice(int deviceID)
             previousState == audioDeviceStarted ||
             previousState == audioDeviceStarting;
 
-        // Device replacement supersedes any request targeting the old device.
-        // Playback/idle changes that occur during replacement post a newer
-        // request and run after this operation releases the lock.
-        invalidatePendingDeviceRequest();
+        SOLOUD_TEST_BARRIER(changeDeviceStartDecided);
+
+        // Device replacement supersedes requests that targeted the old device,
+        // but only those: a play() that created its voice after the decision
+        // above queued a start that is newer than this swap, and erasing it
+        // would leave the replacement stopped under active playback.
+        if (!cancelSupersededDeviceRequests(token))
+        {
+            // Bring the replacement up here rather than relying solely on the
+            // surviving request, so there is no window where a live voice is
+            // rendering into a stopped device.
+            shouldStartReplacement = true;
+        }
+
         const SoLoud::result result =
             soloud.miniaudio_changeDevice(playbackInfos_id);
 
@@ -1060,41 +1088,6 @@ void Player::setWaveformSuperwave(unsigned int soundHash, bool superwave)
     static_cast<Basicwave *>(s->sound.get())->setSuperWave(superwave);
 }
 
-PlayerErrors Player::ensureAudioDeviceStarted()
-{
-    if (!mInited.load(std::memory_order_acquire) ||
-        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
-        return backendNotInited;
-
-    PlayerErrors result;
-    {
-        // Serialize against the lifecycle scheduler: an idle stop must not
-        // interleave with the start this caller is about to depend on.
-        std::lock_guard<std::mutex> operationLock(
-            mDeviceLifecycleOperationMutex);
-
-        // Cancel a pending idle stop so it cannot stop the device out from
-        // under the voice the caller is about to create.
-        invalidatePendingDeviceRequest();
-        result = performAudioDeviceStart();
-        if (result == noError)
-        {
-            // Any idle request posted while the start was in progress predates
-            // it. Replace it with a fresh timeout below.
-            invalidatePendingDeviceRequest();
-        }
-    }
-
-    // Re-arm the idle timeout outside the operation lock, as startAudioDevice()
-    // does. This must not be skipped on the assumption that the caller is about
-    // to create a voice: the caller can still fail after this point (no voice
-    // could be allocated, unknown bus), and without a pending idle request the
-    // device it just started would keep running with nothing to stop it.
-    if (result == noError)
-        evaluateAudioDeviceIdle();
-    return result;
-}
-
 void Player::applyPauseState(unsigned int handle, bool pause, bool isUserAction)
 {
     soloud.setPause(handle, pause);
@@ -1289,9 +1282,22 @@ void Player::resumeEngine()
 #endif
 }
 
-void Player::setAudioDeviceIdleTimeout(int64_t timeoutMs)
+void Player::publishAudioDeviceIdleTimeout(int64_t timeoutMs)
 {
     gAudioDeviceIdleTimeoutMs.store(timeoutMs, std::memory_order_release);
+}
+
+void Player::applyPublishedAudioDeviceIdleTimeout()
+{
+    setAudioDeviceIdleTimeout(
+        gAudioDeviceIdleTimeoutMs.load(std::memory_order_acquire));
+}
+
+void Player::setAudioDeviceIdleTimeout(int64_t timeoutMs)
+{
+    publishAudioDeviceIdleTimeout(timeoutMs);
+    // Stored even when the engine is not initialized, so init() cannot start
+    // from a value that was superseded before it ran.
     mIdleTimeoutMs.store(timeoutMs, std::memory_order_release);
 
     if (!mInited.load(std::memory_order_acquire) ||
@@ -1338,6 +1344,8 @@ PlayerErrors Player::performAudioDeviceStart()
     if (mInterruptionActive.load(std::memory_order_acquire))
         return noError;
 
+    SOLOUD_TEST_BARRIER(performAudioDeviceStartEntered);
+
     // Use the normal resume hook so iOS reactivates AVAudioSession before the
     // Audio Unit is restarted.
     SoLoud::result result = soloud.resume();
@@ -1371,6 +1379,14 @@ PlayerErrors Player::performAudioDeviceStart()
     return noError;
 }
 
+void Player::reportAutomaticDeviceStartFailure()
+{
+    auto stateChangedCallback = soloud._stateChangedCallback;
+    if (stateChangedCallback != nullptr)
+        stateChangedCallback(
+            (unsigned int)PlayerStateEvents::event_audio_device_start_failed);
+}
+
 void Player::invalidatePendingDeviceRequest()
 {
 #ifndef __EMSCRIPTEN__
@@ -1382,6 +1398,55 @@ void Player::invalidatePendingDeviceRequest()
         ++mDeviceRequestGeneration;
     }
     mPauseCv.notify_one();
+#endif
+}
+
+uint64_t Player::currentDeviceRequestGeneration()
+{
+#ifdef __EMSCRIPTEN__
+    return 0;
+#else
+    std::lock_guard<std::mutex> lock(mPauseMutex);
+    return mDeviceRequestGeneration;
+#endif
+}
+
+bool Player::cancelSupersededDeviceRequests(uint64_t token)
+{
+#ifdef __EMSCRIPTEN__
+    // Web posts no lifecycle requests at all: there is no scheduler thread, so
+    // every path acts inline and there is nothing queued to lose.
+    (void)token;
+    return true;
+#else
+    {
+        std::lock_guard<std::mutex> lock(mPauseMutex);
+
+        if (mDeviceRequestGeneration != token)
+        {
+            // Something landed after the caller's decision. Only immediate work
+            // carries intent a direct operation must not erase; a newer idle
+            // request is still safe to drop.
+            const bool newerImmediateIntent =
+                mPendingDeviceRequest == DeviceLifecycleRequest::start ||
+                mPendingDeviceRequest ==
+                    DeviceLifecycleRequest::interruptionStop ||
+                mImmediateDeviceRequestInFlight ==
+                    DeviceLifecycleRequest::start ||
+                mImmediateDeviceRequestInFlight ==
+                    DeviceLifecycleRequest::interruptionStop ||
+                mStartRequestedAfterInterruptionStop;
+            if (newerImmediateIntent)
+                return false;
+        }
+
+        mPendingDeviceRequest = DeviceLifecycleRequest::none;
+        mIdleStopRequestedAfterImmediateOperation = false;
+        mStartRequestedAfterInterruptionStop = false;
+        ++mDeviceRequestGeneration;
+    }
+    mPauseCv.notify_one();
+    return true;
 #endif
 }
 
@@ -1406,14 +1471,37 @@ PlayerErrors Player::stopAudioDevice(bool force)
     std::lock_guard<std::mutex> operationLock(
         mDeviceLifecycleOperationMutex);
 
+    // Taken before the active-voice count is read, so a play() that creates its
+    // voice and queues a start while this operation is deciding is detectable
+    // as newer intent below. play() deliberately does not wait for this mutex,
+    // so that window is reachable in ordinary use.
+    const uint64_t token = currentDeviceRequestGeneration();
+
     // The conditional form is intentionally a successful no-op while any
-    // voice is active. This is also the final active-count check before an
-    // actual stop; playback beginning immediately afterward posts a newer
-    // start request and therefore wins after this operation completes.
+    // voice is active.
     if (!force && soloud.getActiveVoiceCount() != 0)
         return noError;
 
-    invalidatePendingDeviceRequest();
+    SOLOUD_TEST_BARRIER(stopAudioDeviceVoiceCountObserved);
+
+    if (!cancelSupersededDeviceRequests(token))
+    {
+        // A start (playback, an unpause) or an OS interruption stop landed
+        // after the decision above. It is newer than this stop, so it stays
+        // queued.
+        if (!force)
+        {
+            // The conditional form asked to stop only while idle, and the
+            // engine is no longer idle. Leaving the device running is the
+            // documented successful no-op.
+            return noError;
+        }
+        // A forced stop is an explicit instruction and still stops the device.
+        // The newer request survives, so the scheduler restarts the device
+        // afterwards -- native acquisition order decides, and neither request
+        // is lost.
+    }
+
     return performAudioDeviceStop(true);
 }
 
@@ -1443,16 +1531,42 @@ PlayerErrors Player::startAudioDevice()
         // activate the session and the start below fails, which surfaces a real
         // error instead of a false success. A genuine new interruption arriving
         // afterwards sets the flag again through the normal callback.
-        mInterruptionActive.store(false, std::memory_order_release);
+        //
+        // Clearing the latch and cancelling superseded work happen under
+        // mInterruptionMutex so they are atomic with respect to the OS
+        // interruption callback. Without that, a genuine interruption arriving
+        // in this window is indistinguishable from the stale flag this is meant
+        // to clear, and the cancellation below would erase the stop it queued.
+        uint64_t token;
+        {
+            std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+            mInterruptionActive.store(false, std::memory_order_release);
+            // Cancel a stale delayed idle stop before prewarming the device.
+            // Nothing concurrent can be newer than this point: the latch and
+            // the request queue moved together.
+            invalidatePendingDeviceRequest();
+            token = currentDeviceRequestGeneration();
+        }
 
-        // Cancel a stale delayed idle stop before prewarming the device.
-        invalidatePendingDeviceRequest();
+        SOLOUD_TEST_BARRIER(startAudioDeviceLatchCleared);
+
         result = performAudioDeviceStart();
         if (result == noError)
         {
-            // Any idle request posted while startup was in progress predates
-            // the completed prewarm. Replace it with a fresh timeout below.
-            invalidatePendingDeviceRequest();
+            if (mInterruptionActive.load(std::memory_order_acquire))
+            {
+                // A genuine interruption arrived while the start was in flight,
+                // so performAudioDeviceStart() skipped it. Reporting success
+                // here is exactly the "succeeded but left the device stopped"
+                // bug this API exists to avoid, and cancelling now would erase
+                // the interruption stop the callback queued.
+                result = audioDeviceFailedToStart;
+            }
+            else
+            {
+                // Only cancel work that predates the completed start.
+                cancelSupersededDeviceRequests(token);
+            }
         }
     }
 
@@ -1632,9 +1746,19 @@ void Player::pauseEngineScheduler()
             if (isDeviceRequestCurrent(requestGeneration))
             {
                 if (request == DeviceLifecycleRequest::start)
-                    performAudioDeviceStart();
+                {
+                    // performAudioDeviceStart() has already rebuilt the device
+                    // and retried by the time it reports an error, so this is
+                    // the end of the automatic recovery path. Nothing above can
+                    // return it to the caller -- play()/setPause() completed
+                    // long ago -- so publish it as an event instead.
+                    if (performAudioDeviceStart() != noError)
+                        reportAutomaticDeviceStartFailure();
+                }
                 else
+                {
                     performAudioDeviceStop(true);
+                }
             }
 
             bool shouldNotify = false;
@@ -1934,11 +2058,6 @@ PlayerErrors Player::playClocked(
         }
     }
 
-    // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    const PlayerErrors deviceError = ensureAudioDeviceStarted();
-    if (deviceError != noError)
-        return deviceError;
-
     SoLoud::handle newHandle = 0;
     if (busId == 0)
     {
@@ -1966,6 +2085,16 @@ PlayerErrors Player::playClocked(
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+
+    // Queue the device start rather than performing it inline. The scheduled
+    // delay is expressed in *samples* against mStreamTime, which only advances
+    // while the device is mixing, so a voice created against a stopped clock
+    // keeps its exact sample offset and simply starts counting down once the
+    // device runs. Blocking here to start the device first would only shift
+    // every schedule by the device-start latency -- and put ma_device_start()
+    // back on the calling isolate, which is the #481 stall.
+    resumeEngine();
+
     return PlayerErrors::noError;
 }
 
@@ -2029,11 +2158,6 @@ PlayerErrors Player::playScheduled(
         }
     }
 
-    // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    const PlayerErrors deviceError = ensureAudioDeviceStarted();
-    if (deviceError != noError)
-        return deviceError;
-
     SoLoud::handle newHandle = 0;
     if (busId == 0)
     {
@@ -2065,6 +2189,16 @@ PlayerErrors Player::playScheduled(
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+
+    // Queue the device start rather than performing it inline. The scheduled
+    // delay is expressed in *samples* against mStreamTime, which only advances
+    // while the device is mixing, so a voice created against a stopped clock
+    // keeps its exact sample offset and simply starts counting down once the
+    // device runs. Blocking here to start the device first would only shift
+    // every schedule by the device-start latency -- and put ma_device_start()
+    // back on the calling isolate, which is the #481 stall.
+    resumeEngine();
+
     return PlayerErrors::noError;
 }
 
@@ -2846,11 +2980,6 @@ PlayerErrors Player::play3dClocked(
         }
     }
 
-    // Ensure miniaudio device is started if it's stopped, ie by an interruption.
-    const PlayerErrors deviceError = ensureAudioDeviceStarted();
-    if (deviceError != noError)
-        return deviceError;
-
     SoLoud::handle newHandle = 0;
     if (busId == 0)
     {
@@ -2890,6 +3019,16 @@ PlayerErrors Player::play3dClocked(
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+
+    // Queue the device start rather than performing it inline. The scheduled
+    // delay is expressed in *samples* against mStreamTime, which only advances
+    // while the device is mixing, so a voice created against a stopped clock
+    // keeps its exact sample offset and simply starts counting down once the
+    // device runs. Blocking here to start the device first would only shift
+    // every schedule by the device-start latency -- and put ma_device_start()
+    // back on the calling isolate, which is the #481 stall.
+    resumeEngine();
+
     return PlayerErrors::noError;
 }
 

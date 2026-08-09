@@ -256,17 +256,6 @@ public:
   /// @param newWaveform the new waveform type.
   void setWaveform(unsigned int soundHash, int newWaveform);
 
-  /// @brief Make sure the output audio device is running.
-  ///
-  /// The OS can stop the device without notifying us (an interruption, the
-  /// Control Center on iOS, a device change, ...) and every operation that
-  /// needs to produce sound must therefore resume it first. This is the
-  /// single place where the result of `soloud.resume()` is inspected.
-  /// @return [noError] if the device is running, [backendNotInited] if the
-  /// engine is not initialized, [audioDeviceFailedToStart] if the device
-  /// could not be started.
-  PlayerErrors ensureAudioDeviceStarted();
-
   /// @brief Switch pause state for an already loaded sound identified by
   /// [handle].
   /// @param handle the sound handle
@@ -329,6 +318,19 @@ public:
   /// @param timeoutMs the idle timeout in milliseconds, or a negative value to
   /// keep the device running indefinitely.
   void setAudioDeviceIdleTimeout(int64_t timeoutMs);
+
+  /// Publish the idle-timeout policy process-wide.
+  ///
+  /// Static and lock-free on purpose: the policy outlives any individual
+  /// Player, so publishing it must never wait for the global engine lifecycle
+  /// mutex. A Player that cannot consume the update now still picks it up at
+  /// its next init().
+  static void publishAudioDeviceIdleTimeout(int64_t timeoutMs);
+
+  /// Apply the currently published policy to this Player and post whatever
+  /// lifecycle request it implies. The caller must keep this Player alive for
+  /// the duration (in practice: hold init_deinit_mutex).
+  void applyPublishedAudioDeviceIdleTimeout();
 
   /// @brief Stop the audio output device without deinitializing the engine.
   /// By default the device is stopped only when there are no active voices.
@@ -995,6 +997,40 @@ private:
   void applyPauseState(unsigned int handle, bool pause, bool isUserAction);
   PlayerErrors performAudioDeviceStart();
   PlayerErrors performAudioDeviceStop(bool explicitRequest);
+
+  /// Report that an *automatic* device start failed after rebuild/retry.
+  ///
+  /// The synchronous playback APIs hand device startup to the scheduler and
+  /// return before it runs, so they cannot report this. Without an event the
+  /// app is left with valid unpaused voices and no output and no way to find
+  /// out. Explicit starts return the error to their caller instead and do not
+  /// go through here.
+  void reportAutomaticDeviceStartFailure();
+
+  /// The generation a later cancellation can be compared against.
+  ///
+  /// A direct device operation takes this *before* it observes the state it
+  /// decides on (active voices, current device state, the interruption latch).
+  /// Anything posted from that point on carries a newer generation, which is
+  /// what makes "newer than my decision" decidable rather than a guess about
+  /// timing.
+  uint64_t currentDeviceRequestGeneration();
+
+  /// Cancel pending lifecycle work that predates [token].
+  ///
+  /// Returns false, cancelling nothing, when a start or interruption stop has
+  /// been posted since [token] was taken. Such a request expresses intent that
+  /// is newer than the operation asking to cancel, and erasing it is how an
+  /// unpaused voice ends up with a stopped device, or a genuine OS interruption
+  /// ends up ignored.
+  ///
+  /// Newer *idle* work is still cancelled: it only ever asks for the device to
+  /// stop, so no direct operation loses meaning by discarding it, and the idle
+  /// timeout is re-armed from the current voice state afterwards anyway.
+  bool cancelSupersededDeviceRequests(uint64_t token);
+
+  /// Unconditional cancellation, for the paths that own the whole lifecycle
+  /// state and have nothing concurrent to preserve (scheduler start/stop).
   void invalidatePendingDeviceRequest();
   bool isDeviceRequestCurrent(uint64_t generation);
   bool requestDeviceLifecycle(DeviceLifecycleRequest request);

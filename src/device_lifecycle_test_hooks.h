@@ -1,0 +1,75 @@
+#pragma once
+
+// Named barriers for forcing the device-lifecycle interleavings that matter.
+//
+// The races these cover are between a direct device operation (an explicit
+// start/stop, a device change, a teardown) and lifecycle intent posted
+// concurrently by ordinary playback. Every one of them turns on a window of a
+// few instructions between observing state and acting on it, so a timing-based
+// test can only make the collision likely. A barrier makes it certain.
+//
+// The whole facility compiles to nothing unless SOLOUD_LIFECYCLE_TEST_HOOKS is
+// defined, which no shipping build does. `SOLOUD_TEST_BARRIER()` expands to a
+// void expression, so the production call sites cost nothing and cannot drift
+// out of sync with the tests.
+
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+
+namespace soloud_test
+{
+  /// Points a test can park production code at. Each names the instant
+  /// *after* a decision has been made but *before* it has been acted on --
+  /// that is the window every one of these races lives in.
+  enum class DeviceBarrier
+  {
+    /// Inside the native changeDevice() export, after the global `player` has
+    /// been read but before Player::changeDevice() runs. Parks a change worker
+    /// against a concurrent teardown.
+    changeDeviceEntered = 0,
+    /// In Player::changeDevice(), after `shouldStartReplacement` has been
+    /// decided from the active-voice count and device state.
+    changeDeviceStartDecided,
+    /// In Player::stopAudioDevice(), after the conditional form has observed
+    /// the active-voice count as zero.
+    stopAudioDeviceVoiceCountObserved,
+    /// In Player::startAudioDevice(), after the stale-interruption latch has
+    /// been cleared and superseded work cancelled.
+    startAudioDeviceLatchCleared,
+    /// In Player::performAudioDeviceStart(), before the backend start runs.
+    performAudioDeviceStartEntered,
+    barrierCount
+  };
+
+  /// Arm [barrier]. The next thread reaching it parks until released.
+  void armBarrier(DeviceBarrier barrier);
+
+  /// Block until a thread has parked on [barrier].
+  void waitBarrierReached(DeviceBarrier barrier);
+
+  /// Release [barrier] and disarm it.
+  void releaseBarrier(DeviceBarrier barrier);
+
+  /// Called from production code. A no-op unless [barrier] is armed.
+  void hitBarrier(DeviceBarrier barrier);
+
+  /// Force the next [count] backend device starts to fail, so a test can drive
+  /// the rebuild/retry path and the failure reporting behind it.
+  void failNextDeviceStarts(int count);
+
+  /// How many forced failures are still pending.
+  int pendingForcedDeviceStartFailures();
+
+  /// Consume one forced failure. Called by the backend start path so a test
+  /// can drive rebuild/retry deterministically rather than by unplugging
+  /// hardware. Returns true when this start must be failed.
+  bool consumeForcedDeviceStartFailure();
+} // namespace soloud_test
+
+#define SOLOUD_TEST_BARRIER(name)                                              \
+  ::soloud_test::hitBarrier(::soloud_test::DeviceBarrier::name)
+
+#else
+
+#define SOLOUD_TEST_BARRIER(name) ((void)0)
+
+#endif // SOLOUD_LIFECYCLE_TEST_HOOKS
