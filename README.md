@@ -69,9 +69,9 @@ with a new one. Two FlutterEngines using the plugin *simultaneously* is not
 supported — the engine they would share is process-global, and the last one to
 initialize wins.
 
-### iOS: FlutterEngine lifecycle
+### iOS and macOS: FlutterEngine lifecycle
 
-iOS gets the same native teardown, with one honest difference in timing.
+Both get the same native teardown, with honest differences in timing.
 
 - **FlutterEngine deallocated** tears down the player, output device and
   scheduler that engine owned, and cannot tear down an engine that has since
@@ -88,8 +88,17 @@ iOS gets the same native teardown, with one honest difference in timing.
   happens at the next initialization, which retires the stale registrations
   before claiming afresh. We do not close this with private Flutter APIs.
 
-Arming this needs one round trip to the platform thread, because iOS does not
-expose the engine's identity to a plugin the way Android does. If Flutter's
+On **macOS** the difference is sharper still. Its plugin API has no detach hook
+of any kind — the protocol is only `registerWithRegistrar:` and
+`handleMethodCall:result:` — so the plugin takes its own deallocation as the
+signal that the engine has gone. That works because FlutterEngine's `dealloc`
+releases the references holding the plugin, but it is reference-count timing
+rather than a documented contract: an app that retains the plugin instance (via
+`valuePublishedByPlugin:`, say) delays or prevents it, and the result is simply
+that the engine is not released automatically, exactly as before this existed.
+
+Arming this needs one round trip to the platform thread, because neither Apple
+platform exposes the engine's identity to a plugin the way Android does. If Flutter's
 messaging is not available — for instance `SoLoud.init()` called without
 `WidgetsFlutterBinding.ensureInitialized()`, which this package has never
 required and still does not — initialization proceeds exactly as before and

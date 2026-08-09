@@ -13,7 +13,7 @@ import 'dart:ui' as ui;
 import 'package:ffi/ffi.dart';
 import 'package:flutter_soloud/src/bindings/audio_data.dart';
 import 'package:flutter_soloud/src/bindings/bindings_player.dart';
-import 'package:flutter_soloud/src/bindings/ios_engine_lifecycle.dart';
+import 'package:flutter_soloud/src/bindings/darwin_engine_lifecycle.dart';
 import 'package:flutter_soloud/src/bindings/native_metadata_ffi.dart';
 import 'package:flutter_soloud/src/enums.dart';
 import 'package:flutter_soloud/src/exceptions/exceptions.dart';
@@ -763,7 +763,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   void prepareEngineInit() => _prepareEngineInit(currentEngineId);
 
   @override
-  bool get usesAsyncEnginePrepare => IosEngineLifecycle.isSupported;
+  bool get usesAsyncEnginePrepare => DarwinEngineLifecycle.isSupported;
 
   @override
   Future<void> prepareEngineInitAsync() async {
@@ -780,13 +780,13 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     );
 
     switch (result) {
-      case IosEnginePrepareResult.claimed:
+      case DarwinEnginePrepareResult.claimed:
         return;
-      case IosEnginePrepareResult.unavailable:
+      case DarwinEnginePrepareResult.unavailable:
         // Nothing was sent, so nothing was claimed: claim directly, exactly as
         // every other platform does. Automatic teardown is simply not armed.
         _prepareEngineInit(engineId);
-      case IosEnginePrepareResult.refused:
+      case DarwinEnginePrepareResult.refused:
         // Either the platform said no, or a sent request's outcome is unknown.
         // Claiming again here could take the claim a second time on top of one
         // the platform may already have committed.
@@ -794,7 +794,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     }
   }
 
-  static const IosEngineLifecycle _iosEngineLifecycle = IosEngineLifecycle();
+  static const DarwinEngineLifecycle _iosEngineLifecycle =
+      DarwinEngineLifecycle();
 
   late final _currentEngineShutdownEpoch =
       _lookup<ffi.NativeFunction<ffi.Uint64 Function()>>(

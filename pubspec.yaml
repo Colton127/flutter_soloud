@@ -68,6 +68,10 @@ flutter:
       linux:
         ffiPlugin: true
       macos:
+        # As on iOS, with one difference: macOS has no
+        # `detachFromEngineForRegistrar:`, so the plugin takes its own
+        # deallocation as the signal that its FlutterEngine has gone.
+        pluginClass: FlutterSoloudPlugin
         ffiPlugin: true
       windows:
         ffiPlugin: true

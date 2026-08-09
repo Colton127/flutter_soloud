@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_soloud/src/bindings/ios_engine_lifecycle.dart';
+import 'package:flutter_soloud/src/bindings/darwin_engine_lifecycle.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The iOS lifecycle handshake decides, from what comes back over the channel,
@@ -12,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  const bridge = IosEngineLifecycle();
+  const bridge = DarwinEngineLifecycle();
   const engineId = 1234;
   const shutdownEpoch = 7;
 
@@ -27,7 +27,7 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
-          const MethodChannel(IosEngineLifecycle.channelName),
+          const MethodChannel(DarwinEngineLifecycle.channelName),
           null,
         );
   });
@@ -35,7 +35,7 @@ void main() {
   void handleWith(Future<Object?>? Function(MethodCall call) handler) {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
-          const MethodChannel(IosEngineLifecycle.channelName),
+          const MethodChannel(DarwinEngineLifecycle.channelName),
           (call) {
             calls.add(call);
             return handler(call);
@@ -48,7 +48,7 @@ void main() {
 
     final result = await bridge.prepareEngineInit(engineId, shutdownEpoch);
 
-    expect(result, IosEnginePrepareResult.claimed);
+    expect(result, DarwinEnginePrepareResult.claimed);
     expect(calls.single.method, 'prepareEngineInit');
     // The epoch has to reach the platform: it is what lets native refuse a
     // request that a deinit() superseded while this was in flight.
@@ -76,7 +76,7 @@ void main() {
 
         expect(
           result,
-          IosEnginePrepareResult.refused,
+          DarwinEnginePrepareResult.refused,
           reason: '$code must not be mistaken for an unusable channel',
         );
       }
@@ -88,7 +88,7 @@ void main() {
 
     expect(
       await bridge.prepareEngineInit(engineId, shutdownEpoch),
-      IosEnginePrepareResult.refused,
+      DarwinEnginePrepareResult.refused,
     );
   });
 
@@ -100,7 +100,7 @@ void main() {
 
     expect(
       await bridge.prepareEngineInit(engineId, shutdownEpoch),
-      IosEnginePrepareResult.refused,
+      DarwinEnginePrepareResult.refused,
     );
   });
 
@@ -110,18 +110,40 @@ void main() {
     // claiming directly is safe.
     expect(
       await bridge.prepareEngineInit(engineId, shutdownEpoch),
-      IosEnginePrepareResult.unavailable,
+      DarwinEnginePrepareResult.unavailable,
     );
   });
 
-  test('non-iOS platforms never touch the channel', () async {
-    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+  test('macOS uses the same handshake as iOS', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
     handleWith((call) async => true);
 
     expect(
       await bridge.prepareEngineInit(engineId, shutdownEpoch),
-      IosEnginePrepareResult.unavailable,
+      DarwinEnginePrepareResult.claimed,
     );
-    expect(calls, isEmpty);
+    expect(calls.single.arguments, <String, Object?>{
+      'engineId': engineId,
+      'shutdownEpoch': shutdownEpoch,
+    });
+  });
+
+  test('platforms without the plugin never touch the channel', () async {
+    for (final platform in <TargetPlatform>[
+      TargetPlatform.android,
+      TargetPlatform.linux,
+      TargetPlatform.windows,
+    ]) {
+      calls.clear();
+      debugDefaultTargetPlatformOverride = platform;
+      handleWith((call) async => true);
+
+      expect(
+        await bridge.prepareEngineInit(engineId, shutdownEpoch),
+        DarwinEnginePrepareResult.unavailable,
+        reason: '$platform has no lifecycle plugin to hand the engine id to',
+      );
+      expect(calls, isEmpty, reason: '$platform must not send anything');
+    }
   });
 }
