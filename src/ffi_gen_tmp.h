@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "enums.h"
 #include "audiobuffer/metadata_ffi.h"
@@ -230,3 +231,26 @@ FFI_PLUGIN_EXPORT enum PlayerErrors setPause(unsigned int handle, bool pause);
 /// if the engine is not initialized, [PlayerErrors.soundHandleNotFound] if
 /// [handle] is not valid (for example the voice has already ended).
 FFI_PLUGIN_EXPORT enum PlayerErrors stop(unsigned int handle);
+
+/// Set how long the audio output device keeps running while the engine is idle
+/// (no active voices) before it is automatically stopped, on every platform.
+/// [timeoutMs] < 0 keeps the device running indefinitely while idle (the
+/// deferred idle-pause is suppressed, so the device keeps rendering silence and
+/// the app keeps its OS audio session alive) and starts it immediately if it
+/// was stopped. [timeoutMs] == 0 stops the device as soon as possible once
+/// idle. [timeoutMs] > 0 keeps it running for that many milliseconds after
+/// going idle. Any play/unpause before the deadline cancels the pending stop.
+/// The default is 500. Can be called any time.
+FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs);
+
+/// Stop the device while idle, or regardless of active voices when force != 0.
+FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice(unsigned int force);
+
+/// Restart the audio output device previously stopped by stopAudioDevice(), so
+/// existing voices and loaded sounds keep operating. Idempotent: a no-op if the
+/// device is already started.
+FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice();
+
+/// Get the current state of the audio output device. Returns
+/// audioDeviceUninitialized if the engine is not initialized.
+FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState();

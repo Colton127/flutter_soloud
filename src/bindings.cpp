@@ -381,6 +381,14 @@ extern "C"
     voiceEndedCb(n);
   }
 
+  /// Requests a device-idle evaluation after SoLoud stops or pauses a voice.
+  /// SoLoud invokes this only after releasing its audio mutex.
+  FFI_PLUGIN_EXPORT void voiceInactiveCallback()
+  {
+    if (player != nullptr)
+      player->evaluateAudioDeviceIdle();
+  }
+
   /// The callback to monitor when a file is loaded.
   void fileLoadedCallback(enum PlayerErrors error, char *completeFileName, unsigned int *hash, uint64_t counter)
   {
@@ -796,6 +804,7 @@ extern "C"
 
     // Set the callback for when a voice is ended/stopped
     player.get()->setVoiceEndedCallback(voiceEndedCallback);
+    player.get()->setVoiceInactiveCallback(voiceInactiveCallback);
 
 #if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
     soloudTestInitBarrier();
@@ -820,6 +829,66 @@ extern "C"
   FFI_PLUGIN_EXPORT void setAndroidAAudioAttributes(unsigned int managed)
   {
     SoLoud::miniaudio_setAndroidAAudioAttributes(managed != 0);
+  }
+
+  /// Set how long the audio output device keeps running while the engine is
+  /// idle (no active voices) before it is automatically stopped, on every
+  /// platform. [timeoutMs] < 0 keeps the device running indefinitely while idle
+  /// (the deferred idle-pause is suppressed, so the device keeps rendering
+  /// silence and the app keeps its OS audio session alive) and starts it
+  /// immediately if it was stopped. [timeoutMs] == 0 stops the device as soon
+  /// as possible once idle. [timeoutMs] > 0 keeps it running for that many
+  /// milliseconds after going idle. Any play/unpause before the deadline
+  /// cancels the pending stop. The default is 500. Can be called any time.
+  FFI_PLUGIN_EXPORT void setAudioDeviceIdleTimeout(int64_t timeoutMs)
+  {
+    std::lock_guard<std::mutex> guard(init_deinit_mutex);
+    if (player.get() != nullptr)
+      player.get()->setAudioDeviceIdleTimeout(timeoutMs);
+  }
+
+  /// Stop the audio output device without deinitializing the engine. By default
+  /// this is a successful no-op while voices are active. [force] stops the
+  /// device even during active playback without mutating any voice.
+  FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice(unsigned int force)
+  {
+    std::lock_guard<std::mutex> guard(init_deinit_mutex);
+    if (player.get() == nullptr)
+      return backendNotInited;
+
+    return player.get()->stopAudioDevice(force != 0);
+  }
+
+  /// Restart the audio output device previously stopped by stopAudioDevice(),
+  /// so existing voices and loaded sounds keep operating. Idempotent: a no-op
+  /// if the device is already started.
+  FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice()
+  {
+    std::lock_guard<std::mutex> guard(init_deinit_mutex);
+    if (player.get() == nullptr)
+      return backendNotInited;
+
+    return player.get()->startAudioDevice();
+  }
+
+  /// Get the current state of the audio output device. Returns
+  /// [AudioDeviceState.audioDeviceUninitialized] if the engine is not
+  /// initialized.
+  FFI_PLUGIN_EXPORT enum AudioDeviceState getAudioDeviceState()
+  {
+    // Read the process-global backend state directly so this cheap synchronous
+    // query never waits behind an initialization or lifecycle API call.
+    return (AudioDeviceState)SoLoud::miniaudio_getAudioDeviceState();
+  }
+
+  /// Test-only hook that sends an interruption through miniaudio's normal
+  /// notification callback. This is intentionally absent from the public API.
+  FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began)
+  {
+    std::lock_guard<std::mutex> guard(init_deinit_mutex);
+    if (player.get() == nullptr || !player.get()->isInited())
+      return;
+    SoLoud::miniaudio_debugTriggerAudioInterruption(began != 0);
   }
 
   /// List playback devices.

@@ -25,6 +25,7 @@ freely, subject to the following restrictions:
 #ifndef SOLOUD_H
 #define SOLOUD_H
 
+#include <atomic>
 #include <stdlib.h> // rand
 #include <math.h> // sin
 #include <atomic> // std::atomic
@@ -174,14 +175,26 @@ namespace SoLoud
 		// Set the callback to call when a voice is ended/stopped.
 		//
 		// stopVoice_internal() runs with the audio mutex held, so it must not
-		// call out to the embedder directly: the callback reaches back into the
+		// call out to the embedder directly. The callback reaches back into the
 		// embedder's own bookkeeping (and its locks), which inverts the lock
 		// order against callers that hold those locks across a SoLoud call and
-		// deadlocks the engine. Ended voices are queued instead and dispatched
-		// by unlockAudioMutex_internal() once the mutex is released.
+		// deadlocks the engine; and a callback that crashes, stalls or blocks
+		// (for example a Dart NativeCallable whose isolate has gone away) would
+		// strand the audio mutex and wedge every later SoLoud call, including
+		// deinit(). Ended voices are queued instead and dispatched by
+		// unlockAudioMutex_internal() once the mutex is released.
 		std::atomic<void (*)(unsigned int*)> _voiceEndedCallback{nullptr};
 		void setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int*)) {
 			_voiceEndedCallback.store(voiceEndedCallback,
+				std::memory_order_release);
+		}
+
+		// Called after a mix cycle in which a voice stopped or became paused.
+		// The callback runs after the audio mutex has been released.
+		std::atomic<void (*)()> _voiceInactiveCallback{nullptr};
+		bool mVoiceInactiveCallbackPending = false;
+		void setVoiceInactiveCallback(void (*voiceInactiveCallback)()) {
+			_voiceInactiveCallback.store(voiceInactiveCallback,
 				std::memory_order_release);
 		}
 
@@ -201,6 +214,24 @@ namespace SoLoud
 		void (*_stateChangedCallback)(unsigned int) = nullptr;
 		void setStateChangedCallback(void (*stateChangedCallback)(unsigned int)) {
 			_stateChangedCallback = stateChangedCallback;
+		}
+
+		// Device-interruption callback used by the embedding lifecycle owner.
+		// The context is published before the callback and cleared afterward so
+		// notification threads never call through a non-null callback with a
+		// partially registered context.
+		std::atomic<void (*)(void *, bool)> _audioInterruptionCallback{nullptr};
+		std::atomic<void *> _audioInterruptionContext{nullptr};
+		void setAudioInterruptionCallback(
+			void (*audioInterruptionCallback)(void *, bool), void *context) {
+			if (audioInterruptionCallback == nullptr) {
+				_audioInterruptionCallback.store(nullptr, std::memory_order_release);
+				_audioInterruptionContext.store(nullptr, std::memory_order_release);
+				return;
+			}
+			_audioInterruptionContext.store(context, std::memory_order_release);
+			_audioInterruptionCallback.store(
+				audioInterruptionCallback, std::memory_order_release);
 		}
 
 		// CTor

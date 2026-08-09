@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -68,6 +69,10 @@ public:
 
   /// @brief Set a function callback triggered when a voice is stopped/ended.
   void setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int *));
+
+  /// @brief Set a function callback triggered after a voice stops or becomes
+  /// paused and the SoLoud audio mutex has been released.
+  void setVoiceInactiveCallback(void (*voiceInactiveCallback)());
 
   /// @brief Set a function callback triggered when the state of the player
   /// changes.
@@ -289,6 +294,60 @@ public:
   /// background pause, giving the audio backend and OS time to stabilize the
   /// audio session (e.g. Control Center on iOS).
   void pauseEngine();
+
+  /// @brief Apply the configured idle policy after a voice may have become
+  /// inactive. The lifecycle scheduler performs the authoritative active voice
+  /// count check before stopping the device.
+  void evaluateAudioDeviceIdle();
+
+  /// @brief Ensure the audio device is started, off the UI thread. Posts an
+  /// immediate resume request to the background scheduler so the blocking
+  /// native ma_device_start() does not freeze the caller (the UI thread on
+  /// the FFI path). Cancels any pending deferred pause. Idempotent: a no-op
+  /// at the backend if the device is already started.
+  void resumeEngine();
+
+  /// @brief Set how long the audio output device keeps running while the
+  /// engine is idle (no active voices) before it is automatically stopped.
+  /// This generalizes the deferred idle-pause: instead of a fixed ~500 ms
+  /// delay, the caller chooses the delay, disables it entirely, or makes the
+  /// device stop as soon as possible.
+  ///
+  /// [timeoutMs] < 0 keeps the device running indefinitely while idle (a
+  /// device-level replacement for playing a silent looping sound; the device
+  /// keeps rendering silence and the app keeps its OS audio session alive).
+  /// [timeoutMs] == 0 stops the device as soon as possible once idle (still
+  /// asynchronously, off the UI thread). [timeoutMs] > 0 keeps the device
+  /// running for that many milliseconds after going idle. Any play/unpause
+  /// before the deadline cancels the pending stop. The default is 500 ms.
+  ///
+  /// Switching to an indefinite timeout starts the device immediately (off the
+  /// UI thread) if it was stopped; switching to a finite timeout while nothing
+  /// is playing schedules the deferred idle-stop. OS-initiated interruptions
+  /// (e.g. a phone call) still stop the device regardless.
+  /// @param timeoutMs the idle timeout in milliseconds, or a negative value to
+  /// keep the device running indefinitely.
+  void setAudioDeviceIdleTimeout(int64_t timeoutMs);
+
+  /// @brief Stop the audio output device without deinitializing the engine.
+  /// By default the device is stopped only when there are no active voices.
+  /// When [force] is true it is stopped even during active playback. Neither
+  /// mode pauses or otherwise mutates voices, and both are idempotent.
+  /// @param force whether to stop even when active voices exist.
+  /// @return Returns [PlayerErrors.SO_NO_ERROR] if success.
+  PlayerErrors stopAudioDevice(bool force = false);
+
+  /// @brief Restart the audio output device previously stopped by
+  /// stopAudioDevice(), so existing voices and loaded sounds keep operating.
+  /// Idempotent: a no-op if the device is already started.
+  /// @return Returns [PlayerErrors.SO_NO_ERROR] if success.
+  PlayerErrors startAudioDevice();
+
+  /// @brief Get the current state of the audio output device.
+  /// @return The current [AudioDeviceState]. Returns
+  /// [AudioDeviceState.audioDeviceUninitialized] if the engine is not
+  /// initialized.
+  AudioDeviceState getAudioDeviceState();
 
   /// @brief Gets the pause state.
   /// @param handle the sound handle.
@@ -843,8 +902,9 @@ public:
   /// all the sounds loaded
   std::vector<std::unique_ptr<ActiveSound>> sounds;
 
-  /// true when the backend is initialized
-  std::atomic<bool> mInited;
+  /// True when the backend is initialized. This is read by the FFI thread,
+  /// lifecycle scheduler, and teardown path.
+  std::atomic<bool> mInited{false};
 
   /// main SoLoud engine
   SoLoud::Soloud soloud;
@@ -867,20 +927,81 @@ private:
   std::map<unsigned int, BusData> busMap;
   unsigned int busIdCounter = 0;
 
-  // Background scheduler for deferred engine pause. Started lazily on
-  // init() and stopped on dispose() so that the global Player object can
-  // be recreated by bindings.cpp without leaving a stray background thread.
-  static constexpr unsigned int kPauseEngineDelayMs = 500;
+  // Background scheduler for deferred engine pause and asynchronous engine
+  // resume. Started lazily on init() and stopped on dispose() so that the
+  // global Player object can be recreated by bindings.cpp without leaving a
+  // stray background thread. The same thread handles both the deferred device
+  // stop (pause) and the immediate device start (resume) so neither native
+  // ma_device_stop()/ma_device_start() call ever blocks the UI thread.
   std::thread mPauseThread;
   std::mutex mPauseMutex;
+  // Serializes the actual blocking device operations performed by both the
+  // scheduler and the explicit lifecycle APIs.
+  std::mutex mDeviceLifecycleOperationMutex;
   std::condition_variable mPauseCv;
-  std::atomic<bool> mPauseRequested{false};
-  std::atomic<bool> mStopPauseThread{false};
+  enum class DeviceLifecycleRequest : uint8_t {
+    none,
+    start,
+    interruptionStop,
+    idleStop,
+  };
+  // The pending request and generation are protected by mPauseMutex. Requests
+  // normally replace older intent and advance the generation, allowing a
+  // delayed idle stop to detect that it has become stale without maintaining a
+  // command queue. Immediate requests have priority over idle work.
+  DeviceLifecycleRequest mPendingDeviceRequest =
+      DeviceLifecycleRequest::none;
+  uint64_t mDeviceRequestGeneration = 0;
+  // Protected by mPauseMutex.
+  //
+  // mImmediateDeviceRequestInFlight identifies a start/interruption operation
+  // that has been dequeued but has not completed.
+  //
+  // mIdleStopRequestedAfterImmediateOperation records idle policy work that
+  // arrived after an immediate operation was already pending or in flight.
+  // Such idle work must not invalidate the immediate operation.
+  DeviceLifecycleRequest mImmediateDeviceRequestInFlight =
+      DeviceLifecycleRequest::none;
+  bool mIdleStopRequestedAfterImmediateOperation = false;
+  // Protected by mPauseMutex.
+  //
+  // Records that playback recovery requested a start while an interruption
+  // stop was pending or in flight. The start must run after the interruption
+  // stop completes, provided the interruption has ended.
+  bool mStartRequestedAfterInterruptionStop = false;
+  bool mStopPauseThread = false;
+  // False before initialization is complete and from the first step of
+  // shutdown onward. Lifecycle entry points use this to reject work that
+  // could otherwise race with scheduler teardown or backend destruction.
+  std::atomic<bool> mLifecycleRequestsAccepted{false};
+  // True between OS interruption-began and interruption-ended notifications.
+  // Start requests are deferred during this interval; interruption recovery
+  // reevaluates active playback and idle-timeout policy.
+  std::atomic<bool> mInterruptionActive{false};
+  std::mutex mInterruptionMutex;
   bool mPauseThreadRunning = false;
+  /// How long the device keeps running while idle before the deferred
+  /// idle-pause stops it (see setAudioDeviceIdleTimeout). A negative value
+  /// keeps the device running indefinitely (the idle-pause never stops it);
+  /// 0 stops it as soon as possible; a positive value is the delay in
+  /// milliseconds. Read by the scheduler thread, written from the FFI thread.
+  std::atomic<int64_t> mIdleTimeoutMs;
 
   void pauseEngineScheduler();
+  /// Apply a pause/unpause to [handle] and post the matching device
+  /// lifecycle request. [isUserAction] is false for automatic buffering
+  /// pauses, which must not flip the user-paused flag.
+  void applyPauseState(unsigned int handle, bool pause, bool isUserAction);
+  PlayerErrors performAudioDeviceStart();
+  PlayerErrors performAudioDeviceStop(bool explicitRequest);
+  void invalidatePendingDeviceRequest();
+  bool isDeviceRequestCurrent(uint64_t generation);
+  bool requestDeviceLifecycle(DeviceLifecycleRequest request);
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();
+  void stopDeviceAndDestroyAllSounds();
+  void handleAudioInterruption(bool began);
+  static void audioInterruptionCallback(void *context, bool began);
 };
 
 #endif // PLAYER_H

@@ -2263,7 +2263,14 @@ namespace SoLoud
 			}
 		}
 
+		const bool notifyVoiceInactive = mVoiceInactiveCallbackPending;
+		mVoiceInactiveCallbackPending = false;
 		unlockAudioMutex_internal();
+
+		auto voiceInactiveCallback =
+			_voiceInactiveCallback.load(std::memory_order_acquire);
+		if (notifyVoiceInactive && voiceInactiveCallback != nullptr)
+			voiceInactiveCallback();
 		
 		// Note: clipping channels*aStride, not channels*aSamples, so we're possibly clipping some unused data.
 		// The buffers should be large enough for it, we just may do a few bytes of unneccessary work.
@@ -2466,5 +2473,6 @@ namespace SoLoud
 			Thread::unlockMutex(mAudioThreadMutex);
 		}
 	}
+
 
 };
