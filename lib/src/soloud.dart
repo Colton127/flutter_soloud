@@ -944,10 +944,11 @@ interface class SoLoud {
 
   /// Reports failures of *automatic* output-device startup.
   ///
-  /// [play], [play3d], [setPause], [pauseSwitch], [speechText] and
-  /// `Bus.playOnEngine` are synchronous: they create the voice and hand the
-  /// blocking device start to a background scheduler, so they return before the
-  /// start has been attempted and cannot throw when it fails. The backend
+  /// Every synchronous playback and unpause API delegates its device start to
+  /// the background scheduler: [play], [play3d], [playClocked],
+  /// [play3dClocked], [playScheduled], [setPause], [pauseSwitch], [speechText]
+  /// and `Bus.playOnEngine`. They create the voice and return before the start
+  /// has been attempted, so none of them can throw when it fails. The backend
   /// already rebuilds the device against the current default output and retries
   /// once; this stream reports what is left when that has also failed.
   ///
@@ -967,9 +968,9 @@ interface class SoLoud {
   /// });
   /// ```
   ///
-  /// Explicit calls to [startAudioDevice], [changeDevice], [playClocked],
-  /// [play3dClocked] and [playScheduled] report device-start failures to their
-  /// caller instead and do not emit here.
+  /// [startAudioDevice] and [changeDevice] are the exceptions: they await their
+  /// device operation and report failures directly to their caller, so they do
+  /// not emit here.
   Stream<AudioDeviceStartFailure> get audioDeviceStartFailures =>
       _audioDeviceStartFailuresController.stream;
 

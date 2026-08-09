@@ -332,6 +332,13 @@ public:
   /// the duration (in practice: hold init_deinit_mutex).
   void applyPublishedAudioDeviceIdleTimeout();
 
+  /// The idle-timeout policy this Player is currently running with, in
+  /// milliseconds; negative means the indefinite keep-alive.
+  int64_t currentAudioDeviceIdleTimeoutMs() const
+  {
+    return mIdleTimeoutMs.load(std::memory_order_acquire);
+  }
+
   /// @brief Stop the audio output device without deinitializing the engine.
   /// By default the device is stopped only when there are no active voices.
   /// When [force] is true it is stopped even during active playback. Neither

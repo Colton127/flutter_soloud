@@ -230,6 +230,8 @@ void Player::dispose()
     if (!mInited.load(std::memory_order_acquire))
         return;
 
+    SOLOUD_TEST_BARRIER(playerDisposeEntered);
+
     // Reject new lifecycle work before waking and joining the scheduler.
     mLifecycleRequestsAccepted.store(false, std::memory_order_release);
     soloud.setAudioInterruptionCallback(nullptr, nullptr);
@@ -338,13 +340,11 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
     else
     {
         // soloud.init() has already opened and started the device, so the
-        // mixer is running and reads mPostClipScaler every buffer. Writing it
-        // bare is a data race (ThreadSanitizer flags it in clip_internal), so
-        // take the audio mutex for the one store, exactly as the setters
-        // called during playback do.
-        soloud.lockAudioMutex_internal();
+        // mixer is reading mPostClipScaler by the time this runs. The audio
+        // mutex does NOT order the two -- clip_internal() runs after
+        // unlockAudioMutex_internal() -- so the field is atomic instead; see
+        // its declaration in soloud.h.
         soloud.setPostClipScaler(1.0f);
-        soloud.unlockAudioMutex_internal();
         mSampleRate = sampleRate;
         mBufferSize = bufferSize;
         mChannels = channels;
@@ -1381,10 +1381,8 @@ PlayerErrors Player::performAudioDeviceStart()
 
 void Player::reportAutomaticDeviceStartFailure()
 {
-    auto stateChangedCallback = soloud._stateChangedCallback;
-    if (stateChangedCallback != nullptr)
-        stateChangedCallback(
-            (unsigned int)PlayerStateEvents::event_audio_device_start_failed);
+    soloud.notifyStateChanged(
+        (unsigned int)PlayerStateEvents::event_audio_device_start_failed);
 }
 
 void Player::invalidatePendingDeviceRequest()

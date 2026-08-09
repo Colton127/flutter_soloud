@@ -74,9 +74,25 @@ extern "C"
                               void (*state_changed)(enum PlayerStateEvents *),
                               int64_t owner_engine_id);
 
+    enum PlayerErrors play3dClocked(unsigned int soundHash, double soundTime,
+                                    unsigned int busId, float posX, float posY,
+                                    float posZ, float velX, float velY,
+                                    float velZ, float volume,
+                                    unsigned int *handle);
+    enum PlayerErrors playScheduled(unsigned int soundHash, double atTime,
+                                    double duration, unsigned int busId,
+                                    float volume, float pan,
+                                    unsigned int *handle);
+
     // Test-only hooks (SOLOUD_LIFECYCLE_TEST_HOOKS).
+    bool requestEngineTeardownForEngine(int64_t engine_id);
+    void clearDartCallbackRegistrations();
     void soloudTestLockInitDeinit();
     void soloudTestUnlockInitDeinit();
+    void soloudTestSetEngineStateCallback(unsigned int enable);
+    int soloudTestIdleTimeoutWorkerPeak();
+    void soloudTestResetIdleTimeoutWorkerPeak();
+    int64_t soloudTestAppliedIdleTimeoutMs();
 }
 
 namespace
@@ -124,13 +140,19 @@ void onFileLoaded(enum PlayerErrors *e, char *name, unsigned int *hash,
     std::free(counter);
 }
 
+std::atomic<int> gStateEvents{0};
+
 void onStateChanged(enum PlayerStateEvents *state)
 {
-    if (state != nullptr &&
-        *state == PlayerStateEvents::event_audio_device_start_failed)
+    if (state == nullptr)
+        return;
+    if (*state == PlayerStateEvents::event_audio_device_start_failed)
         gStartFailureEvents.fetch_add(1, std::memory_order_acq_rel);
-    // The real Dart bridge owns this pointer; the native side allocates it per
-    // event only on some paths, so this test's callback takes it by value.
+    gStateEvents.fetch_add(1, std::memory_order_acq_rel);
+    // The native bridge malloc()s this per event and hands ownership over,
+    // exactly as it does to Dart. Freeing it keeps leak-sanitizer runs
+    // meaningful.
+    std::free(state);
 }
 
 /// Bring an engine up. Returns false when the environment has no usable output
@@ -558,11 +580,11 @@ void testAutomaticStartFailureIsReported()
 
 /// Clocked and scheduled playback must not run a backend device start on the
 /// calling thread. Proven structurally rather than by timing: the barrier sits
-/// inside performAudioDeviceStart(), so if the call parked there it never
-/// returns while the barrier is armed.
+/// inside performAudioDeviceStart(), so if a call parked there it never returns
+/// while the barrier is armed.
 void testClockedPlaybackDoesNotStartDeviceInline()
 {
-    std::printf("clocked playback does not start the device inline\n");
+    std::printf("clocked/scheduled playback does not start the device inline\n");
     if (!bringUpEngine())
     {
         std::printf("  skipped: no usable output device\n");
@@ -577,34 +599,327 @@ void testClockedPlaybackDoesNotStartDeviceInline()
     EXPECT(getAudioDeviceState() != audioDeviceStarted,
            "the device should be stopped before the clocked play");
 
-    soloud_test::armBarrier(DeviceBarrier::performAudioDeviceStartEntered);
+    // Each of the three was changed independently, so each is asserted
+    // independently rather than by resemblance to playClocked().
+    struct ScheduledCall
+    {
+        const char *name;
+        PlayerErrors (*invoke)(unsigned int hash, unsigned int *handle);
+    };
+    static const ScheduledCall calls[] = {
+        {"playClocked",
+         [](unsigned int h, unsigned int *out) {
+             return playClocked(h, 0.0, 0, 1.0f, 0.0f, out);
+         }},
+        {"play3dClocked",
+         [](unsigned int h, unsigned int *out) {
+             return play3dClocked(h, 0.0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  1.0f, out);
+         }},
+        {"playScheduled",
+         [](unsigned int h, unsigned int *out) {
+             return playScheduled(h, 0.0, 0.0, 0, 1.0f, 0.0f, out);
+         }},
+    };
 
-    std::atomic<bool> returned{false};
-    unsigned int handle = 0;
-    std::thread caller([&] {
-        playClocked(hash, 0.0, 0, 1.0f, 0.0f, &handle);
-        returned.store(true, std::memory_order_release);
+    for (const ScheduledCall &call : calls)
+    {
+        stopAudioDevice(/*force*/ 1);
+        soloud_test::armBarrier(DeviceBarrier::performAudioDeviceStartEntered);
+
+        std::atomic<bool> returned{false};
+        unsigned int handle = 0;
+        std::thread caller([&] {
+            call.invoke(hash, &handle);
+            returned.store(true, std::memory_order_release);
+        });
+
+        // If the call still started the device inline it would be parked on the
+        // barrier right now and this would time out.
+        const auto started = std::chrono::steady_clock::now();
+        while (!returned.load(std::memory_order_acquire) &&
+               millisSince(started) < kNonBlockingBudgetMs)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        EXPECT(returned.load(std::memory_order_acquire),
+               "%s() performed a backend device start on the calling thread",
+               call.name);
+
+        soloud_test::releaseBarrier(
+            DeviceBarrier::performAudioDeviceStartEntered);
+        caller.join();
+
+        EXPECT(handle != 0, "%s() should have created a voice", call.name);
+        if (handle != 0)
+            stop(handle);
+    }
+
+    tearDownEngine();
+    std::printf("  ok: all three queued the device start\n");
+}
+
+
+/// Engine teardown must not start the audio device, even when the configured
+/// idle policy is the indefinite keep-alive.
+///
+/// disposeAllSound() is a *runtime* operation: after stopping the device it
+/// honours the policy and queues a start again, which is correct while the
+/// engine lives. Running it as part of teardown had deinit() ask the scheduler
+/// to start the device moments before joining that same scheduler -- a wholly
+/// pointless ma_device_start() that teardown then waits out, on exactly the
+/// backends where starting is slow.
+///
+/// Asserted by counting entries into performAudioDeviceStart() rather than by
+/// racing the scheduler, so the result does not depend on whether the scheduler
+/// happened to dequeue the request before Player::dispose() stopped it.
+void testTeardownDoesNotRestartDeviceUnderKeepAlive()
+{
+    std::printf("teardown does not restart the device under keep-alive\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    // The indefinite keep-alive: this is the policy that makes teardown want to
+    // restart the device.
+    setAudioDeviceIdleTimeout(-1);
+
+    const unsigned int hash = loadTestWaveform();
+    EXPECT(hash != 0, "the test waveform should load");
+    const unsigned int handle = playUnpaused(hash);
+    EXPECT(handle != 0, "playback should start");
+
+    // Let any start the keep-alive policy legitimately wanted settle first, so
+    // only teardown's own attempts are counted.
+    for (int i = 0; i < 100 && getAudioDeviceState() != audioDeviceStarted; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    soloud_test::resetBackendDeviceStartCount();
+
+    // Park teardown at the top of Player::dispose(), i.e. after anything it
+    // does *before* stopping the scheduler, and hold it there long enough for
+    // the scheduler to act on whatever that queued. Without this the assertion
+    // is a race: teardown normally reaches dispose() and stops the scheduler
+    // before it can perform the start, so the bug hides.
+    soloud_test::armBarrier(DeviceBarrier::playerDisposeEntered);
+    std::thread teardown([] { dispose(); });
+    soloud_test::waitBarrierReached(DeviceBarrier::playerDisposeEntered);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    soloud_test::releaseBarrier(DeviceBarrier::playerDisposeEntered);
+    teardown.join();
+
+    EXPECT(soloud_test::backendDeviceStartCount() == 0,
+           "teardown performed %d backend device start(s)",
+           soloud_test::backendDeviceStartCount());
+    EXPECT(isInited() == 0, "the engine should be torn down");
+    std::printf("  ok: no device start during teardown\n");
+}
+
+/// The same guarantee for the FlutterEngine-owned teardown path, which reaches
+/// disposeLocked() through requestEngineTeardownForEngine() rather than
+/// through Dart's deinit().
+void testEngineOwnedTeardownDoesNotRestartDevice()
+{
+    std::printf("FlutterEngine teardown does not restart the device\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+    setAudioDeviceIdleTimeout(-1);
+
+    const unsigned int hash = loadTestWaveform();
+    EXPECT(hash != 0, "the test waveform should load");
+    const unsigned int handle = playUnpaused(hash);
+    EXPECT(handle != 0, "playback should start");
+    for (int i = 0; i < 100 && getAudioDeviceState() != audioDeviceStarted; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    soloud_test::resetBackendDeviceStartCount();
+    soloud_test::armBarrier(DeviceBarrier::playerDisposeEntered);
+
+    EXPECT(requestEngineTeardownForEngine(kEngineId),
+           "the owning engine should be allowed to tear down");
+
+    soloud_test::waitBarrierReached(DeviceBarrier::playerDisposeEntered);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    soloud_test::releaseBarrier(DeviceBarrier::playerDisposeEntered);
+
+    for (int i = 0; i < 200 && isInited() != 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    EXPECT(isInited() == 0, "the engine should be torn down");
+    EXPECT(soloud_test::backendDeviceStartCount() == 0,
+           "engine teardown performed %d backend device start(s)",
+           soloud_test::backendDeviceStartCount());
+    tearDownEngine();
+    std::printf("  ok: no device start during engine teardown\n");
+}
+
+/// Repeated timeout updates while the lifecycle mutex is held must collapse
+/// onto one deferred worker, and the last published value must win.
+void testIdleTimeoutApplyIsCoalesced()
+{
+    std::printf("idle timeout apply is coalesced\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    soloudTestResetIdleTimeoutWorkerPeak();
+    soloudTestLockInitDeinit();
+
+    constexpr int kUpdates = 32;
+    long long slowest = 0;
+    for (int i = 1; i <= kUpdates; ++i)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        setAudioDeviceIdleTimeout(1000 + i);
+        const long long elapsed = millisSince(started);
+        if (elapsed > slowest)
+            slowest = elapsed;
+    }
+
+    EXPECT(slowest < kNonBlockingBudgetMs,
+           "the slowest of %d setter calls took %lldms while the lifecycle "
+           "mutex was held (budget %lldms)",
+           kUpdates, slowest, kNonBlockingBudgetMs);
+
+    soloudTestUnlockInitDeinit();
+
+    const int64_t expected = 1000 + kUpdates;
+    for (int i = 0; i < 200 && soloudTestAppliedIdleTimeoutMs() != expected; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    EXPECT(soloudTestAppliedIdleTimeoutMs() == expected,
+           "the last published policy should win: expected %lld, applied %lld",
+           (long long)expected, (long long)soloudTestAppliedIdleTimeoutMs());
+    EXPECT(soloudTestIdleTimeoutWorkerPeak() <= 1,
+           "%d deferred workers existed at once; %d setter calls must collapse "
+           "onto one",
+           soloudTestIdleTimeoutWorkerPeak(), kUpdates);
+
+    tearDownEngine();
+    std::printf("  ok: %d updates, one worker, last value applied\n", kUpdates);
+}
+
+/// A publication landing in the worker's own apply/idle window must not be
+/// lost. This is the window a "clear the queued flag after applying" scheme
+/// drops a write in, so it is forced with a barrier rather than raced.
+void testIdleTimeoutPublicationRacingWorkerExitIsApplied()
+{
+    std::printf("timeout published as the worker exits is still applied\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    // Get a worker running and parked just after it applied the first value.
+    soloud_test::armBarrier(DeviceBarrier::idleTimeoutWorkerApplied);
+    soloudTestLockInitDeinit();
+    setAudioDeviceIdleTimeout(4321);
+    soloudTestUnlockInitDeinit();
+
+    soloud_test::waitBarrierReached(DeviceBarrier::idleTimeoutWorkerApplied);
+
+    // The worker has applied 4321, released the lifecycle mutex, and is about
+    // to decide whether to go idle. Publish a newer value into exactly that
+    // window -- with the lifecycle mutex held, so the setter's opportunistic
+    // try_lock fails and it must rely on the worker noticing. Without that the
+    // setter simply applies the value itself and the window is never tested.
+    soloudTestLockInitDeinit();
+    setAudioDeviceIdleTimeout(8765);
+    soloudTestUnlockInitDeinit();
+
+    soloud_test::releaseBarrier(DeviceBarrier::idleTimeoutWorkerApplied);
+
+    for (int i = 0; i < 200 && soloudTestAppliedIdleTimeoutMs() != 8765; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    EXPECT(soloudTestAppliedIdleTimeoutMs() == 8765,
+           "a policy published in the worker's exit window was lost: applied "
+           "%lld",
+           (long long)soloudTestAppliedIdleTimeoutMs());
+
+    tearDownEngine();
+    std::printf("  ok: the racing publication was applied\n");
+}
+
+
+/// Retiring the engine-level state callback must never race its dispatch, and
+/// must never dispatch through a null pointer.
+///
+/// This targets SoLoud::_stateChangedCallback specifically -- the pointer the
+/// miniaudio notification threads read and that teardown clears -- not the
+/// Dart-side bridge, which the callback-generation gate already serializes.
+/// The read side goes through the real backend notification path; the write
+/// side mirrors what Player::dispose() does.
+///
+/// A bare `if (cb != nullptr) cb(...)` is two loads: a clear landing between
+/// them calls null. Run under ThreadSanitizer -- an unsynchronized pointer is a
+/// data race whether or not it happens to crash on a given run.
+void testStateCallbackRetirementRacesDispatch()
+{
+    std::printf("engine state callback retirement vs dispatch\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    gStateEvents.store(0, std::memory_order_release);
+
+    constexpr int kRounds = 4000;
+    std::atomic<int> dispatched{0};
+    std::atomic<bool> go{false};
+
+    // The read side: the backend notification path an OS interruption uses.
+    std::thread dispatcher([&] {
+        while (!go.load(std::memory_order_acquire))
+        {
+        }
+        bool began = true;
+        for (int i = 0; i < kRounds; ++i)
+        {
+            SoLoud::miniaudio_debugTriggerAudioInterruption(began);
+            began = !began;
+            dispatched.fetch_add(1, std::memory_order_acq_rel);
+        }
     });
 
-    // If playClocked() still started the device inline it would be parked on
-    // the barrier right now and this would time out.
-    const auto started = std::chrono::steady_clock::now();
-    while (!returned.load(std::memory_order_acquire) &&
-           millisSince(started) < kNonBlockingBudgetMs)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // The write side: retire and republish, as teardown and init do. Both
+    // threads run a fixed number of rounds and are released together, so the
+    // window actually overlaps rather than one finishing first.
+    std::thread writer([&] {
+        while (!go.load(std::memory_order_acquire))
+        {
+        }
+        for (int i = 0; i < kRounds; ++i)
+        {
+            soloudTestSetEngineStateCallback(0);
+            soloudTestSetEngineStateCallback(1);
+        }
+    });
 
-    EXPECT(returned.load(std::memory_order_acquire),
-           "playClocked() performed a backend device start on the calling "
-           "thread");
+    go.store(true, std::memory_order_release);
+    writer.join();
+    dispatcher.join();
 
-    soloud_test::releaseBarrier(DeviceBarrier::performAudioDeviceStartEntered);
-    caller.join();
+    EXPECT(dispatched.load(std::memory_order_acquire) > 0,
+           "the dispatcher should have run");
+    // Reaching here without a crash, and without TSan reporting a race on the
+    // callback pointer, is the assertion. How many dispatches land while a
+    // registration is live is legitimately nondeterministic.
+    std::printf("  ok: %d dispatches raced 2000 retirements\n",
+                dispatched.load(std::memory_order_acquire));
 
-    EXPECT(handle != 0, "the clocked voice should have been created");
-
-    stop(handle);
+    soloudTestSetEngineStateCallback(1);
+    // The interruption latch may be left set by the last toggle.
+    SoLoud::miniaudio_debugTriggerAudioInterruption(false);
     tearDownEngine();
-    std::printf("  ok: the device start was queued, not performed inline\n");
 }
 
 } // namespace
@@ -620,6 +935,11 @@ int main()
     testIdleTimeoutSetterDoesNotBlockOnInit();
     testAutomaticStartFailureIsReported();
     testClockedPlaybackDoesNotStartDeviceInline();
+    testTeardownDoesNotRestartDeviceUnderKeepAlive();
+    testEngineOwnedTeardownDoesNotRestartDevice();
+    testIdleTimeoutApplyIsCoalesced();
+    testIdleTimeoutPublicationRacingWorkerExitIsApplied();
+    testStateCallbackRetirementRacesDispatch();
 
     std::printf("\n%d assertions, %d failures\n", gAssertions, gFailures);
     return gFailures == 0 ? 0 : 1;

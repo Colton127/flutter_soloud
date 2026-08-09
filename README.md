@@ -161,6 +161,24 @@ stopped while voices remain active; their voice state is not changed.
 `uninitialized`, `stopped`, `started`, `starting`, or `stopping`. It does not
 report a pending scheduler request.
 
+Because that startup is asynchronous, a failing device start cannot be thrown
+back at `play()`. If it fails even after the backend has rebuilt the device and
+retried, the engine keeps valid, unpaused voices and produces no sound. Listen
+to `audioDeviceStartFailures` to notice:
+
+```dart
+SoLoud.instance.audioDeviceStartFailures.listen((_) async {
+  try {
+    await SoLoud.instance.startAudioDevice();
+  } on SoLoudAudioDeviceFailedToStartCppException {
+    // Still unavailable: tell the user, or back off and retry later.
+  }
+});
+```
+
+`startAudioDevice()` and `changeDevice()` report device-start failures to their
+caller instead, so they do not emit on that stream.
+
 ## Apps & Games Using flutter_soloud
 
 A showcase of apps and games built with this plugin:

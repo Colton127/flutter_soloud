@@ -19,6 +19,7 @@ namespace soloud_test
     std::condition_variable gCv;
     Barrier gBarriers[static_cast<int>(DeviceBarrier::barrierCount)];
     int gForcedStartFailures = 0;
+    int gBackendDeviceStarts = 0;
 
     Barrier &slot(DeviceBarrier barrier)
     {
@@ -59,6 +60,24 @@ namespace soloud_test
     b.reached = true;
     gCv.notify_all();
     gCv.wait(lock, [&] { return !slot(barrier).armed; });
+  }
+
+  void recordBackendDeviceStart()
+  {
+    std::lock_guard<std::mutex> lock(gMutex);
+    ++gBackendDeviceStarts;
+  }
+
+  int backendDeviceStartCount()
+  {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gBackendDeviceStarts;
+  }
+
+  void resetBackendDeviceStartCount()
+  {
+    std::lock_guard<std::mutex> lock(gMutex);
+    gBackendDeviceStarts = 0;
   }
 
   void failNextDeviceStarts(int count)

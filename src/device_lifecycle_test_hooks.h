@@ -37,6 +37,15 @@ namespace soloud_test
     startAudioDeviceLatchCleared,
     /// In Player::performAudioDeviceStart(), before the backend start runs.
     performAudioDeviceStartEntered,
+    /// At the top of Player::dispose(), before it stops accepting lifecycle
+    /// requests. Parking here gives the scheduler an opportunity to act on
+    /// anything teardown queued behind it, which is what makes "teardown
+    /// performed no device start" a deterministic assertion instead of a race.
+    playerDisposeEntered,
+    /// In the deferred idle-timeout worker, after it has applied a published
+    /// policy but before it decides whether to go idle. This is the window a
+    /// naive "clear the queued flag after applying" scheme loses a write in.
+    idleTimeoutWorkerApplied,
     barrierCount
   };
 
@@ -58,6 +67,16 @@ namespace soloud_test
 
   /// How many forced failures are still pending.
   int pendingForcedDeviceStartFailures();
+
+  /// Counts real backend device starts -- the points where ma_device_start()
+  /// actually runs, not merely where the engine considered starting. A start
+  /// request that finds the device already running costs nothing and is
+  /// deliberately not counted, which is what lets a test assert "teardown
+  /// performed no device start" without tripping over a start that was already
+  /// queued and harmlessly no-ops.
+  void recordBackendDeviceStart();
+  int backendDeviceStartCount();
+  void resetBackendDeviceStartCount();
 
   /// Consume one forced failure. Called by the backend start path so a test
   /// can drive rebuild/retry deterministically rather than by unplugging

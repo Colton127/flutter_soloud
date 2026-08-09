@@ -844,33 +844,93 @@ extern "C"
   /// Coalesces deferred applications of the idle-timeout policy. Every worker
   /// re-reads the published value, so one pending worker is enough no matter
   /// how many times the setter is called while the lifecycle mutex is busy.
-  std::atomic<bool> idle_timeout_apply_queued{false};
+  /// Bookkeeping for the single deferred idle-timeout worker.
+  ///
+  /// Guarded by its own tiny mutex, never by init_deinit_mutex: the setter runs
+  /// on the UI isolate and must not wait behind a device operation. Nothing
+  /// blocking happens under it.
+  std::mutex idle_timeout_worker_mutex;
+  /// Bumped by every publication. The worker compares it before going idle, so
+  /// a value published while the worker was applying the previous one cannot be
+  /// missed.
+  uint64_t idle_timeout_publication = 0;
+  bool idle_timeout_worker_running = false;
+
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+  /// Peak number of deferred workers alive at once. The whole point of the
+  /// bookkeeping above is that this never exceeds 1.
+  std::atomic<int> idle_timeout_worker_live{0};
+  std::atomic<int> idle_timeout_worker_peak{0};
+#endif
 
   /// Apply the published idle-timeout policy once init_deinit_mutex becomes
   /// available, without making the caller wait for it.
+  ///
+  /// Exactly one worker exists at a time and it always applies the newest
+  /// published value. The naive alternatives both fail: clearing a "queued"
+  /// flag before blocking lets every setter call spawn its own waiter, so a
+  /// slow init collects a pile of threads; clearing it after applying instead
+  /// drops a value published in the gap between the apply and the flag store.
   static void queueAudioDeviceIdleTimeoutApply()
   {
-    if (idle_timeout_apply_queued.exchange(true, std::memory_order_acq_rel))
-      return;
+    {
+      std::lock_guard<std::mutex> guard(idle_timeout_worker_mutex);
+      ++idle_timeout_publication;
+      if (idle_timeout_worker_running)
+        return; // The running worker will observe the newer publication.
+      idle_timeout_worker_running = true;
+    }
 
     try
     {
       std::thread([]()
                   {
-        // Cleared before blocking, so a call that arrives while this worker is
-        // still waiting queues a fresh one rather than being dropped. Two
-        // workers applying the same published value is harmless; losing the
-        // last write is not.
-        idle_timeout_apply_queued.store(false, std::memory_order_release);
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        const int live = idle_timeout_worker_live.fetch_add(
+                             1, std::memory_order_acq_rel) + 1;
+        int peak = idle_timeout_worker_peak.load(std::memory_order_acquire);
+        while (live > peak &&
+               !idle_timeout_worker_peak.compare_exchange_weak(
+                   peak, live, std::memory_order_acq_rel))
+        {
+        }
+#endif
+        for (;;)
+        {
+          uint64_t applied;
+          {
+            std::lock_guard<std::mutex> guard(idle_timeout_worker_mutex);
+            applied = idle_timeout_publication;
+          }
 
-        std::lock_guard<std::mutex> guard(init_deinit_mutex);
-        if (player.get() != nullptr)
-          player.get()->applyPublishedAudioDeviceIdleTimeout(); })
+          {
+            std::lock_guard<std::mutex> guard(init_deinit_mutex);
+            if (player.get() != nullptr)
+              player.get()->applyPublishedAudioDeviceIdleTimeout();
+          }
+
+          SOLOUD_TEST_BARRIER(idleTimeoutWorkerApplied);
+
+          std::lock_guard<std::mutex> guard(idle_timeout_worker_mutex);
+          if (idle_timeout_publication == applied)
+          {
+            // Going idle and observing "nothing newer" happen under the same
+            // lock the setter increments under, so a publication either sees
+            // this worker still running (and is picked up by the loop above)
+            // or starts a fresh one. It cannot fall between the two.
+            idle_timeout_worker_running = false;
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+            idle_timeout_worker_live.fetch_sub(1, std::memory_order_acq_rel);
+#endif
+            return;
+          }
+        } })
           .detach();
     }
     catch (...)
     {
-      idle_timeout_apply_queued.store(false, std::memory_order_release);
+      std::lock_guard<std::mutex> guard(idle_timeout_worker_mutex);
+      idle_timeout_worker_running = false;
       // Best effort. The policy is already published process-wide, so the next
       // init() still observes it.
     }
@@ -1089,7 +1149,14 @@ extern "C"
       return;
 
     clearPlayerDartCallbackRegistrationsLocked();
-    player.get()->disposeAllSound();
+    // Deliberately NOT disposeAllSound(): that is a runtime operation which
+    // honours the configured idle policy, so with an indefinite keep-alive it
+    // ends by queueing a device *start*. Running it here would have teardown
+    // ask the scheduler to start the device microseconds before joining that
+    // same scheduler -- an entirely pointless ma_device_start() that deinit()
+    // then has to wait out, on exactly the backends where starting is slow.
+    // Player::dispose() destroys the sounds itself, as the sole owner of native
+    // sound destruction during teardown.
     player.get()->dispose();
     player.reset();
     player = std::make_unique<Player>();
@@ -1261,6 +1328,42 @@ extern "C"
   /// init_deinit_mutex. That mutex is internal and no exported call holds it
   /// for a controllable length of time, so without a hook a test can only hope
   /// the scheduler puts the teardown inside that window.
+
+  /// Peak number of deferred idle-timeout workers alive at once. The
+  /// coalescing is only meaningful if this stays at 1 no matter how many times
+  /// the setter is called while init_deinit_mutex is held.
+  FFI_PLUGIN_EXPORT int soloudTestIdleTimeoutWorkerPeak()
+  {
+    return idle_timeout_worker_peak.load(std::memory_order_acquire);
+  }
+
+  FFI_PLUGIN_EXPORT void soloudTestResetIdleTimeoutWorkerPeak()
+  {
+    idle_timeout_worker_peak.store(0, std::memory_order_release);
+  }
+
+  /// The policy the current Player is actually running with, as opposed to the
+  /// process-global publication.
+  FFI_PLUGIN_EXPORT int64_t soloudTestAppliedIdleTimeoutMs()
+  {
+    std::lock_guard<std::mutex> guard(init_deinit_mutex);
+    if (player.get() == nullptr)
+      return 0;
+    return player.get()->currentAudioDeviceIdleTimeoutMs();
+  }
+
+  /// Set or clear the *engine-level* state callback -- the pointer
+  /// SoLoud::notifyStateChanged() dispatches through, which the miniaudio
+  /// notification threads read. Deliberately without init_deinit_mutex,
+  /// because that is exactly how teardown clears it relative to a notification
+  /// already in flight.
+  FFI_PLUGIN_EXPORT void soloudTestSetEngineStateCallback(unsigned int enable)
+  {
+    if (player.get() == nullptr)
+      return;
+    player.get()->setStateChangedCallback(enable != 0 ? stateChangedCallback
+                                                      : nullptr);
+  }
 
   FFI_PLUGIN_EXPORT void soloudTestLockInitDeinit()
   {

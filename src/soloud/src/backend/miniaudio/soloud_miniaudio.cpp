@@ -155,17 +155,17 @@ namespace SoLoud
         {
             case ma_device_notification_type_started:
             {
-                if (currentSoloud->_stateChangedCallback != nullptr) currentSoloud->_stateChangedCallback(0);
+                currentSoloud->notifyStateChanged(0);
             } break;
 
             case ma_device_notification_type_stopped:
             {
-                if (currentSoloud->_stateChangedCallback != nullptr) currentSoloud->_stateChangedCallback(1);
+                currentSoloud->notifyStateChanged(1);
             } break;
 
             case ma_device_notification_type_rerouted:
             {
-                if (currentSoloud->_stateChangedCallback != nullptr) currentSoloud->_stateChangedCallback(2);
+                currentSoloud->notifyStateChanged(2);
             } break;
 
             case ma_device_notification_type_interruption_began:
@@ -179,7 +179,7 @@ namespace SoLoud
                 if (interruptionCallback != nullptr &&
                     interruptionContext != nullptr)
                     interruptionCallback(interruptionContext, true);
-                if (currentSoloud->_stateChangedCallback != nullptr) currentSoloud->_stateChangedCallback(3);
+                currentSoloud->notifyStateChanged(3);
             } break;
 
             case ma_device_notification_type_interruption_ended:
@@ -193,13 +193,12 @@ namespace SoLoud
                 if (interruptionCallback != nullptr &&
                     interruptionContext != nullptr)
                     interruptionCallback(interruptionContext, false);
-                if (currentSoloud->_stateChangedCallback != nullptr)
-                    currentSoloud->_stateChangedCallback(4);
+                currentSoloud->notifyStateChanged(4);
             } break;
 
             case ma_device_notification_type_unlocked:
             {
-                if (currentSoloud->_stateChangedCallback != nullptr) currentSoloud->_stateChangedCallback(5);
+                currentSoloud->notifyStateChanged(5);
             } break;
 
             default: break;
@@ -442,7 +441,12 @@ namespace SoLoud
             }
             else
 #endif
-            result = ma_device_start(&gDevice);
+            {
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+                soloud_test::recordBackendDeviceStart();
+#endif
+                result = ma_device_start(&gDevice);
+            }
         }
 #if defined(MA_HAS_AAUDIO)
         if (isAAudio)

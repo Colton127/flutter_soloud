@@ -210,10 +210,26 @@ namespace SoLoud
 		// unlock just leaves its handle queued for the running drain loop.
 		bool mDispatchingEndedVoices = false;
 
-		// Set the callback to call when the device receive a state changed
-		void (*_stateChangedCallback)(unsigned int) = nullptr;
+		// Set the callback to call when the device receive a state changed.
+		//
+		// Atomic like the other cross-thread callbacks: miniaudio dispatches
+		// notifications from backend/platform threads while teardown clears
+		// this from the calling thread, and the embedder's device scheduler
+		// publishes its own events through it.
+		std::atomic<void (*)(unsigned int)> _stateChangedCallback{nullptr};
 		void setStateChangedCallback(void (*stateChangedCallback)(unsigned int)) {
-			_stateChangedCallback = stateChangedCallback;
+			_stateChangedCallback.store(stateChangedCallback,
+				std::memory_order_release);
+		}
+
+		// Snapshot once and dispatch. Centralized so no call site can
+		// reintroduce a check-then-load: with two separate reads, a teardown
+		// landing between them turns a non-null check into a null call.
+		void notifyStateChanged(unsigned int aState) {
+			auto stateChangedCallback =
+				_stateChangedCallback.load(std::memory_order_acquire);
+			if (stateChangedCallback != nullptr)
+				stateChangedCallback(aState);
 		}
 
 		// Device-interruption callback used by the embedding lifecycle owner.
@@ -646,7 +662,15 @@ namespace SoLoud
 		// Global volume. Applied before clipping.
 		float mGlobalVolume;
 		// Post-clip scaler. Applied after clipping.
-		float mPostClipScaler;
+		// ###### flutter_soloud local patch ######
+		// Atomic: clip_internal() runs on the audio thread *after*
+		// unlockAudioMutex_internal(), so the audio mutex does not order it
+		// against setPostClipScaler() -- which flutter_soloud calls from
+		// init(), by which point the device is already mixing.
+		// ThreadSanitizer reports the bare float as a data race in
+		// clip_internal(). Every reader snapshots it once into a local, which
+		// is also what the SSE paths need since they take its address.
+		std::atomic<float> mPostClipScaler;
 		// Current play index. Used to create audio handles.
 		unsigned int mPlayIndex;
 		// Current sound source index. Used to create sound source IDs.
