@@ -189,6 +189,29 @@ int streamCallDelta(unsigned int hash)
     return gStreamCallbackCalls.load() - before;
 }
 
+/// Fails the run rather than letting it hang forever.
+///
+/// The failure mode these lifecycle tests guard against is not always a wrong
+/// answer: unserialized capture stops join the same thread twice and wedge, and
+/// a wedged suite in CI is worse than a failing one. Nothing here should take
+/// anywhere near this long.
+void startWatchdog(int limitSeconds)
+{
+    std::thread(
+        [limitSeconds]
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(limitSeconds));
+            std::fprintf(stderr,
+                         "\n  FAIL: watchdog fired after %ds -- the suite is "
+                         "wedged, which is itself the bug.\n",
+                         limitSeconds);
+            std::fflush(stderr);
+            std::fflush(stdout);
+            std::_Exit(1);
+        })
+        .detach();
+}
+
 template <typename Predicate>
 bool waitFor(Predicate predicate, int timeoutMs = 5000)
 {
@@ -542,6 +565,152 @@ void testTeardownDuringActiveMixerCapture()
     resetGlobalState();
 }
 
+/// A capture must not be able to start once teardown has been decided. The
+/// window is wide and reachable: requestEngineTeardownForEngine() returns
+/// immediately, its worker may not run for a while, and a worker isolate's
+/// `isInitialized` still reads true in the meantime -- so `SoLoudIsolate` can
+/// legitimately ask to start a capture right inside it. Forced here by parking
+/// the teardown worker on the lifecycle lock, which is exactly where the gap
+/// lives.
+void testCaptureCannotStartAfterTeardownIsDecided()
+{
+    std::printf("a capture cannot start once teardown has been decided\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
+           "the owner should publish its mixer callable");
+
+    // Park the teardown worker before it reaches the mixer, so the test sits
+    // inside the window rather than hoping to land in it.
+    soloudTestLockInitDeinit();
+
+    EXPECT(requestEngineTeardownForEngine(kEngineA),
+           "the owning engine's teardown should be accepted");
+
+    // This is the call a still-running capture isolate would make here.
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_S16LE, 44100, 2,
+                             /*bufferSizeBytes=*/64 * 1024,
+                             /*notificationThresholdBytes=*/256,
+                             /*chunkPCMFrames=*/2048) == backendNotInited,
+           "a capture must be refused once teardown has been decided");
+    EXPECT(isMixerCaptureRunning() == 0, "no capture should be running");
+
+    soloudTestUnlockInitDeinit();
+
+    EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
+           "the native engine should be disposed");
+    EXPECT(isMixerCaptureRunning() == 0,
+           "no capture may outlive the engine it belonged to");
+
+    resetGlobalState();
+}
+
+/// Two stops arriving at once. `MixerOutput::stop()` guards itself with a
+/// check-then-act on `m_running`, so unserialized both callers can pass it and
+/// then join the same two std::threads and reset the same unique_ptrs -- a
+/// double join is undefined behaviour, not a lost update.
+///
+/// This is reachable without two engines: a capture isolate calling
+/// `SoLoudIsolate.stopMixerOutputStream()` while engine teardown stops the same
+/// capture from its own worker. Released from a spin so the two land together;
+/// a stopper that simply wins never enters the window at all.
+///
+/// Note for anyone reading a ThreadSanitizer run of this test: restarting a
+/// capture while the engine is playing also surfaces a *different*, older race
+/// that this branch does not touch. MixerOutput::start() rewrites m_format,
+/// m_channels, m_bufferSize and m_buffer, while the audio thread is inside
+/// onAudioData() reading them -- it checks m_running on entry, but stop() never
+/// waits for a callback already past that check, so the next start() can
+/// rewrite the state underneath it. It predates this work (the branch only
+/// changed how m_callback is stored) and belongs to the audio path rather than
+/// to engine lifecycle, so it is reported rather than fixed here.
+void testConcurrentCaptureStopsAreSerialized()
+{
+    std::printf("concurrent capture stops are serialized\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
+           "the owner should publish its mixer callable");
+
+    constexpr int kRounds = 25;
+    int started = 0;
+    for (int round = 0; round < kRounds; ++round)
+    {
+        if (startMixerCapture(MIXER_OUTPUT_PCM_S16LE, 44100, 2,
+                              /*bufferSizeBytes=*/64 * 1024,
+                              /*notificationThresholdBytes=*/256,
+                              /*chunkPCMFrames=*/2048) != noError)
+            break;
+        ++started;
+
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        auto stopper = [&ready, &go]
+        {
+            ready.fetch_add(1);
+            while (!go.load())
+            {
+            }
+            stopMixerCapture();
+        };
+
+        std::thread a(stopper);
+        std::thread b(stopper);
+        while (ready.load() < 2)
+        {
+        }
+        go.store(true);
+        a.join();
+        b.join();
+
+        if (isMixerCaptureRunning() != 0)
+            break;
+    }
+
+    EXPECT(started == kRounds,
+           "every round should have started a capture (started %d of %d)",
+           started, kRounds);
+    EXPECT(isMixerCaptureRunning() == 0,
+           "simultaneous stops must leave the capture stopped, exactly once");
+
+    // And the same collision against the stop engine teardown performs.
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_S16LE, 44100, 2,
+                             /*bufferSizeBytes=*/64 * 1024,
+                             /*notificationThresholdBytes=*/256,
+                             /*chunkPCMFrames=*/2048) == noError,
+           "a final capture should start");
+
+    std::atomic<bool> keepStopping{true};
+    std::thread stopper([&keepStopping]
+                        {
+        while (keepStopping.load())
+            stopMixerCapture(); });
+
+    EXPECT(requestEngineTeardownForEngine(kEngineA),
+           "the owning engine's teardown should be accepted");
+    EXPECT(waitFor([] { return soloudTestPlayerIsInited() == 0; }),
+           "the native engine should be disposed");
+
+    keepStopping.store(false);
+    stopper.join();
+
+    EXPECT(isMixerCaptureRunning() == 0, "the capture should be stopped");
+
+    resetGlobalState();
+}
+
 /// The ordinary destroy path: callables inert at once, native engine gone
 /// shortly after, and the duplicate notification (onEngineWillDestroy() and
 /// onDetachedFromEngine() both fire) tears down exactly once.
@@ -725,6 +894,8 @@ void testRetirementNeverWaitsForNativeWork()
 
 int main()
 {
+    startWatchdog(180);
+
     // Every scenario below needs an engine that can actually initialize. A
     // deliberate failure beats a green run that skipped the substance: on a
     // machine with no output device at all, miniaudio still opens its null
@@ -750,6 +921,8 @@ int main()
     testMixerCallbackPublicationIsOwnerScoped();
     testStaleWorkerMixerCallbackCannotBeRevived();
     testTeardownDuringActiveMixerCapture();
+    testCaptureCannotStartAfterTeardownIsDecided();
+    testConcurrentCaptureStopsAreSerialized();
     testEngineDestroyDisposesTheNativeEngine();
     testEngineDestroyedDuringInitialization();
     testStaleTeardownCannotDisposeReplacement();

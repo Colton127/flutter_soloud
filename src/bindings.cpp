@@ -76,6 +76,30 @@ namespace
   /// are never held together. It is never held across a device operation, a
   /// thread join, or any other blocking work. The rest of the file nests as
   /// `init_deinit_mutex -> loadMutex -> dart callback gate`.
+  /// Serializes mixer-capture lifecycle transitions: MixerOutput::start() and
+  /// stop() share buffers, encoder/queue unique_ptrs and two std::thread
+  /// objects, and guard themselves with nothing but an atomic `m_running` flag
+  /// — a check-then-act that two callers can both pass. Two concurrent stops
+  /// then join the same thread twice; a start racing a stop rebuilds the state
+  /// the stop is tearing down.
+  ///
+  /// That is reachable from ordinary use, not just from two engines: a capture
+  /// can be started and stopped from a worker isolate
+  /// (`SoLoudIsolate.startMixerOutputStream()`) while engine teardown stops the
+  /// same capture from its own worker thread.
+  ///
+  /// It also carries the "no capture may start once teardown has been decided"
+  /// check, which has to be atomic with the start itself — otherwise a start
+  /// that has already passed the check can still create a capture after
+  /// teardown's stop() has run, leaving a live notification thread attached to
+  /// a disposed engine.
+  ///
+  /// Lock ordering: `init_deinit_mutex -> mixer_lifecycle_mutex`. Never the
+  /// reverse — startMixerCapture() releases init_deinit_mutex before taking
+  /// this. Neither is ever held while acquiring the Dart callback gate, which
+  /// stays a leaf.
+  std::mutex mixer_lifecycle_mutex;
+
   std::mutex engine_lifecycle_mutex;
   int64_t nativeInitOwnerEngineId = kNoEngineId;
   uint64_t engineInitGeneration = 0;
@@ -436,8 +460,11 @@ extern "C"
 
     // Outside the gate: stop() joins the encoder and notification threads, and
     // those threads take the gate to invoke the mixer-output callable.
-    MixerOutput::instance().setDataCallback(nullptr);
-    MixerOutput::instance().stop();
+    {
+      std::lock_guard<std::mutex> mixerGuard(mixer_lifecycle_mutex);
+      MixerOutput::instance().setDataCallback(nullptr);
+      MixerOutput::instance().stop();
+    }
     clearPlayerDartCallbackRegistrationsLocked();
   }
 
@@ -481,6 +508,9 @@ extern "C"
     int ch = channels;
     if (sr <= 0 || ch <= 0)
     {
+      // Scoped deliberately: init_deinit_mutex must be released before
+      // mixer_lifecycle_mutex is taken, or this inverts the order that
+      // disposeLocked() uses and the two deadlock.
       std::lock_guard<std::mutex> guard(init_deinit_mutex);
       if (player.get() != nullptr && player.get()->isInited())
       {
@@ -496,6 +526,19 @@ extern "C"
     if (ch <= 0)
       ch = 2;
 
+    std::lock_guard<std::mutex> mixerGuard(mixer_lifecycle_mutex);
+
+    // Checked here rather than by the caller, and under the same lock as the
+    // start, because Dart's readiness check always races the native transition:
+    // requestEngineTeardownForEngine() raises this flag synchronously on the
+    // platform thread, long before its worker gets to stop the mixer, so a
+    // capture that begins after that point would otherwise outlive the engine
+    // it belongs to. Ordering is now decided by this mutex: a start that gets
+    // here first runs and is stopped by the teardown; one that arrives after is
+    // refused.
+    if (engine_shutdown_requested.load(std::memory_order_acquire))
+      return backendNotInited;
+
     return MixerOutput::instance().start(
         outputFormat, sr, ch,
         static_cast<size_t>(bufferSizeBytes),
@@ -505,6 +548,10 @@ extern "C"
 
   FFI_PLUGIN_EXPORT void stopMixerCapture()
   {
+    // Serialized against engine teardown's own stop, and against another
+    // isolate's: MixerOutput::stop() joins both worker threads and resets the
+    // encoder and queue, none of which survives being run twice at once.
+    std::lock_guard<std::mutex> mixerGuard(mixer_lifecycle_mutex);
     MixerOutput::instance().stop();
   }
 
@@ -839,8 +886,11 @@ extern "C"
       registration.retireAll();
       clearDartCallbackPointersLocked();
     }
-    MixerOutput::instance().setDataCallback(nullptr);
-    MixerOutput::instance().stop();
+    {
+      std::lock_guard<std::mutex> mixerGuard(mixer_lifecycle_mutex);
+      MixerOutput::instance().setDataCallback(nullptr);
+      MixerOutput::instance().stop();
+    }
 
     // Nothing is left for a FlutterEngine to own. A detach arriving after this
     // finds no claim and correctly declines to tear anything down; the next
