@@ -102,6 +102,7 @@ extern "C"
     int soloudTestIdleTimeoutWorkerPeak();
     void soloudTestResetIdleTimeoutWorkerPeak();
     int64_t soloudTestAppliedIdleTimeoutMs();
+    int soloudTestEngineTeardownCompletedCount();
 }
 
 namespace
@@ -748,6 +749,12 @@ void testEngineOwnedTeardownDoesNotRestartDevice()
     soloud_test::resetBackendDeviceStartCount();
     soloud_test::armBarrier(DeviceBarrier::playerDisposeEntered);
 
+    // isInited() goes false at the *start* of teardown, so waiting on it would
+    // let this test read the counter while the detached worker is still inside
+    // Player::dispose() and the backend shutdown. Synchronize on the worker's
+    // own completion instead.
+    const int teardownsBefore = soloudTestEngineTeardownCompletedCount();
+
     EXPECT(requestEngineTeardownForEngine(kEngineId),
            "the owning engine should be allowed to tear down");
 
@@ -755,8 +762,12 @@ void testEngineOwnedTeardownDoesNotRestartDevice()
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     soloud_test::releaseBarrier(DeviceBarrier::playerDisposeEntered);
 
-    for (int i = 0; i < 200 && isInited() != 0; ++i)
+    for (int i = 0; i < 500 &&
+                    soloudTestEngineTeardownCompletedCount() == teardownsBefore;
+         ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT(soloudTestEngineTeardownCompletedCount() == teardownsBefore + 1,
+           "the detached teardown worker did not complete");
 
     EXPECT(isInited() == 0, "the engine should be torn down");
     EXPECT(soloud_test::backendDeviceStartCount() == 0,
@@ -1174,6 +1185,63 @@ void testRetiredNotificationCannotReachReplacementEngine()
     std::printf("  ok: retired session dispatched nothing\n");
 }
 
+
+/// A device replacement must not become current while a notification admitted
+/// to the previous device is still running.
+///
+/// Retiring only around engine teardown is not enough: changeDevice() destroys
+/// and rebuilds the same global ma_device while the engine object stays alive,
+/// so an interruption admitted against device A could otherwise resume after B
+/// had taken its place and stop B because of an event belonging to a device
+/// that no longer exists.
+void testDeviceSwapWaitsForNotificationAdmittedToOldDevice()
+{
+    std::printf("device swap vs notification admitted to the old device\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+    setAudioDeviceIdleTimeout(kQuietIdleTimeoutMs);
+
+    soloud_test::armBarrier(DeviceBarrier::deviceNotificationAdmitted);
+
+    std::atomic<bool> notificationReturned{false};
+    std::thread notifier([&] {
+        // The interruption branch is the one that reaches back into Player and
+        // can stop a device.
+        SoLoud::miniaudio_debugTriggerAudioInterruption(true);
+        notificationReturned.store(true, std::memory_order_release);
+    });
+
+    soloud_test::waitBarrierReached(DeviceBarrier::deviceNotificationAdmitted);
+
+    std::atomic<bool> swapReturned{false};
+    std::thread swapper([&] {
+        changeDevice(-1);
+        swapReturned.store(true, std::memory_order_release);
+    });
+
+    // The replacement must not become current while the old device's
+    // notification is still inside the engine.
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT(!swapReturned.load(std::memory_order_acquire),
+           "the device was replaced while a notification admitted to the "
+           "previous device was still running");
+
+    soloud_test::releaseBarrier(DeviceBarrier::deviceNotificationAdmitted);
+    notifier.join();
+    swapper.join();
+
+    EXPECT(notificationReturned.load(std::memory_order_acquire),
+           "the notification should have completed");
+
+    // Clear the latch the interruption set, so the engine is left usable.
+    SoLoud::miniaudio_debugTriggerAudioInterruption(false);
+    tearDownEngine();
+    std::printf("  ok: the swap waited out the old device's notification\n");
+}
+
 } // namespace
 
 int main()
@@ -1198,6 +1266,7 @@ int main()
     testTeardownWaitsForInFlightNotification(/*interruption*/ false);
     testTeardownWaitsForInFlightNotification(/*interruption*/ true);
     testRetiredNotificationCannotReachReplacementEngine();
+    testDeviceSwapWaitsForNotificationAdmittedToOldDevice();
 
     std::printf("\n%d assertions, %d failures\n", gAssertions, gFailures);
     return gFailures == 0 ? 0 : 1;

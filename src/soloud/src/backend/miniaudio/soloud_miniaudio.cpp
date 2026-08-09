@@ -103,9 +103,28 @@ namespace SoLoud
     // close the window either, because the load can happen before it.
     //
     // So notifications are admitted, and teardown retires admission and then
-    // waits for admitted ones to finish before anything may be destroyed. The
-    // session id makes a delayed notification from device A unable to become
-    // valid again just because device B has since published a new gSoloud.
+    // waits for admitted ones to finish before anything may be destroyed.
+    //
+    // The same boundary is drawn around a *device* replacement, not only around
+    // engine teardown: replacing gDevice retires admission, drains, swaps, and
+    // republishes. That is what orders every notification belonging to the old
+    // device strictly before the replacement becomes current -- otherwise an
+    // interruption admitted against device A could resume after device B had
+    // taken its place and stop B because of an event belonging to a device that
+    // no longer exists.
+    //
+    // What this does NOT do is identify the *origin* of a backend event. The
+    // generation is assigned when on_notification() runs, not when the backend
+    // produced the event, so it cannot recognize an A-event that first enters
+    // this function after B is published. Safety there rests on a miniaudio
+    // property instead: ma_device_uninit() stops the device and joins the
+    // threads its notifications are delivered from, so once the swap above has
+    // uninitialized A, A can no longer deliver. Admission is closed for the
+    // whole window between uninit(A) and publish(B), so anything arriving in
+    // between is refused. If a backend is ever added that can deliver a
+    // notification after uninit returns, that assumption breaks and the event
+    // needs an identity established at its origin -- a per-device callback
+    // context rather than a generation read at dispatch time.
     //
     // Deliberately NOT gDeviceOperationMutex: notifications can be delivered
     // inline from device operations, so blocking on that lock here would need
@@ -114,7 +133,6 @@ namespace SoLoud
     static std::mutex gNotificationGateMutex;
     static std::condition_variable gNotificationGateCv;
     static int gNotificationsInFlight = 0;
-    static uint64_t gNotificationSession = 0;
     // gSoloud is the retirement state: it is written only by
     // publishNotificationTarget() and retireNotificationsAndDrain(), both under
     // gNotificationGateMutex, so "published" and "admitting" are the same
@@ -123,7 +141,6 @@ namespace SoLoud
     struct NotificationPass
     {
         SoLoud::Soloud *soloud = nullptr;
-        uint64_t session = 0;
         bool admitted = false;
     };
 
@@ -139,7 +156,6 @@ namespace SoLoud
 
         ++gNotificationsInFlight;
         pass->soloud = currentSoloud;
-        pass->session = gNotificationSession;
         pass->admitted = true;
         return true;
     }
@@ -174,7 +190,6 @@ namespace SoLoud
     {
         std::lock_guard<std::mutex> lock(gNotificationGateMutex);
         gSoloud.store(aSoloud, std::memory_order_release);
-        ++gNotificationSession;
     }
 
     /// Publishes the notification target for the duration of an
@@ -202,7 +217,6 @@ namespace SoLoud
     static void retireNotificationsAndDrain()
     {
         std::unique_lock<std::mutex> lock(gNotificationGateMutex);
-        ++gNotificationSession;
         gSoloud.store(nullptr, std::memory_order_release);
         gNotificationGateCv.wait(lock, []
                                  { return gNotificationsInFlight == 0; });
@@ -213,6 +227,31 @@ namespace SoLoud
         if (!committed)
             retireNotificationsAndDrain();
     }
+
+    /// Draws a notification-session boundary around a device replacement.
+    ///
+    /// Constructing it retires admission and waits out every notification
+    /// already inside the old device; destroying it republishes for the
+    /// replacement. Nothing belonging to the old device can therefore still be
+    /// running once the new one is current -- which is the ordering a bare
+    /// generation comparison could never establish, because rejecting a stale
+    /// notification after the fact still lets it run concurrently with the
+    /// swap.
+    ///
+    /// Republishes on every exit path, including failed swaps: the engine
+    /// object is still alive and must keep receiving notifications, and the
+    /// eventual teardown retires it again.
+    struct DeviceSessionBoundary
+    {
+        SoLoud::Soloud *soloud;
+        explicit DeviceSessionBoundary(SoLoud::Soloud *aSoloud) : soloud(aSoloud)
+        {
+            retireNotificationsAndDrain();
+        }
+        ~DeviceSessionBoundary() { publishNotificationTarget(soloud); }
+        DeviceSessionBoundary(const DeviceSessionBoundary &) = delete;
+        DeviceSessionBoundary &operator=(const DeviceSessionBoundary &) = delete;
+    };
     
     // Selects the miniaudio performance profile used when (re)initializing the
     // device. Low-latency (the historical default) maps to AAudio's
@@ -849,6 +888,12 @@ namespace SoLoud
             gSoloud.load(std::memory_order_acquire);
         if (currentSoloud == nullptr)
             return UNKNOWN_ERROR;
+
+        // Every caller that replaces gDevice comes through here -- the public
+        // changeDevice() and the stale-device rebuild inside
+        // performAudioDeviceStart() alike -- so this one boundary covers them
+        // all.
+        DeviceSessionBoundary sessionBoundary(currentSoloud);
 
         // Stop the device before uninitializing to ensure clean shutdown
         if (ma_device_get_state(&gDevice) != ma_device_state_stopped)

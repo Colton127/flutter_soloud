@@ -841,6 +841,13 @@ extern "C"
   /// as possible once idle. [timeoutMs] > 0 keeps it running for that many
   /// milliseconds after going idle. Any play/unpause before the deadline
   /// cancels the pending stop. The default is 500. Can be called any time.
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+  /// Incremented once per completed FlutterEngine-owned teardown worker. Only
+  /// the tests use it; the production API deliberately does not await that
+  /// worker.
+  std::atomic<int> engine_teardown_completed{0};
+#endif
+
   /// Coalesces deferred applications of the idle-timeout policy. Every worker
   /// re-reads the published value, so one pending worker is enough no matter
   /// how many times the setter is called while the lifecycle mutex is busy.
@@ -1298,6 +1305,21 @@ extern "C"
     {
       std::thread([claim]()
                   {
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        // Published when the worker is completely finished -- after
+        // disposeLocked() has reset the Player and the backend is down.
+        // `engine_initialized` goes false at the *start* of teardown, so it is
+        // not the same state and a test that waits on it is not synchronized
+        // with this worker at all.
+        struct CompletionSignal
+        {
+          ~CompletionSignal()
+          {
+            engine_teardown_completed.fetch_add(1, std::memory_order_acq_rel);
+          }
+        } completionSignal;
+#endif
+
         std::lock_guard<std::mutex> guard(init_deinit_mutex);
         std::lock_guard<std::mutex> guard_load(loadMutex);
 
@@ -1363,6 +1385,13 @@ extern "C"
       return;
     player.get()->setStateChangedCallback(enable != 0 ? stateChangedCallback
                                                       : nullptr);
+  }
+
+  /// How many FlutterEngine-owned teardown workers have run to completion.
+  /// Distinct from isInited(): that goes false when teardown *starts*.
+  FFI_PLUGIN_EXPORT int soloudTestEngineTeardownCompletedCount()
+  {
+    return engine_teardown_completed.load(std::memory_order_acquire);
   }
 
   FFI_PLUGIN_EXPORT void soloudTestLockInitDeinit()
