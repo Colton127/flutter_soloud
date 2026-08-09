@@ -51,10 +51,10 @@ FFI_PLUGIN_EXPORT void destroyBus(unsigned int busId);
 /// [handle] set to the voice handle of the bus, or 0 on error.
 /// Returns [PlayerErrors.noError] if success, [PlayerErrors.backendNotInited]
 /// if the engine is not initialized, [PlayerErrors.busIdNotFound] if [busId]
-/// is unknown, [PlayerErrors.audioDeviceFailedToStart] if the output device
-/// could not be started (only checked when [paused] is false),
-/// [PlayerErrors.failedToStartPlayback] if no voice could be created for the
-/// bus.
+/// is unknown, [PlayerErrors.failedToStartPlayback] if no voice could be
+/// created for the bus. When [paused] is false the output device is started
+/// asynchronously after the bus voice exists, so this never reports
+/// [PlayerErrors.audioDeviceFailedToStart].
 FFI_PLUGIN_EXPORT enum PlayerErrors busPlayOnEngine(unsigned int busId,
                                                     float volume, bool paused,
                                                     unsigned int *handle);
@@ -209,8 +209,8 @@ FFI_PLUGIN_EXPORT void setMixerOutputCallback(
 /// [handle] the sound handle
 /// Returns [PlayerErrors.noError] if success, [PlayerErrors.backendNotInited]
 /// if the engine is not initialized, [PlayerErrors.soundHandleNotFound] if
-/// [handle] is not valid, [PlayerErrors.audioDeviceFailedToStart] if
-/// unpausing could not start the output device.
+/// [handle] is not valid. Unpausing posts an asynchronous device start, so
+/// this never reports [PlayerErrors.audioDeviceFailedToStart].
 FFI_PLUGIN_EXPORT enum PlayerErrors pauseSwitch(unsigned int handle);
 
 /// Pause or unpause already loaded sound identified by [handle]
@@ -219,9 +219,8 @@ FFI_PLUGIN_EXPORT enum PlayerErrors pauseSwitch(unsigned int handle);
 /// [pause] the sound handle
 /// Returns [PlayerErrors.noError] if success, [PlayerErrors.backendNotInited]
 /// if the engine is not initialized, [PlayerErrors.soundHandleNotFound] if
-/// [handle] is not valid, [PlayerErrors.audioDeviceFailedToStart] if
-/// unpausing could not start the output device. When the device cannot be
-/// started, the voice is left paused.
+/// [handle] is not valid. Unpausing posts an asynchronous device start, so
+/// this never reports [PlayerErrors.audioDeviceFailedToStart].
 FFI_PLUGIN_EXPORT enum PlayerErrors setPause(unsigned int handle, bool pause);
 
 /// Stop already loaded sound identified by [handle] and clear it

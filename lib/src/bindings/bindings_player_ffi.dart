@@ -3463,8 +3463,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   /// [busId] the bus ID returned by createBus.
   /// [volume] playback volume (1.0 = full).
   /// [paused] whether to start paused.
-  /// When [paused] is false the output audio device is started first, so
-  /// this can also fail with [PlayerErrors.audioDeviceFailedToStart].
+  /// When [paused] is false the output audio device is started off the UI
+  /// thread after the bus voice has been created.
   ///
   /// Returns [PlayerErrors.noError] and the voice handle of the bus on
   /// success, or the error and a zeroed handle on failure.

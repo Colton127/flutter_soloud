@@ -271,8 +271,9 @@ public:
   /// [handle].
   /// @param handle the sound handle
   /// @return [noError] if success, [backendNotInited] if the engine is not
-  /// initialized, [soundHandleNotFound] if [handle] is not valid,
-  /// [audioDeviceFailedToStart] if unpausing could not start the device.
+  /// initialized, [soundHandleNotFound] if [handle] is not valid. Unpausing
+  /// posts an asynchronous device start, so this never reports
+  /// [audioDeviceFailedToStart].
   PlayerErrors pauseSwitch(unsigned int handle);
 
   /// @brief Pause or unpause already loaded sound identified by [handle].
@@ -282,9 +283,9 @@ public:
   /// (Dart setPause/pauseSwitch). Automatic buffering pauses pass false so
   /// they do not flip the user-paused flag.
   /// @return [noError] if success, [backendNotInited] if the engine is not
-  /// initialized, [soundHandleNotFound] if [handle] is not valid,
-  /// [audioDeviceFailedToStart] if unpausing could not start the device. When
-  /// the device cannot be started the voice is left paused.
+  /// initialized, [soundHandleNotFound] if [handle] is not valid. Unpausing
+  /// posts an asynchronous device start, so this never reports
+  /// [audioDeviceFailedToStart].
   PlayerErrors setPause(unsigned int handle, bool pause,
                         bool isUserAction = true);
 
@@ -884,9 +885,9 @@ public:
   /// @param handle set to the voice handle of the bus, or zero on error.
   /// @return [noError] if success, [backendNotInited] if the engine is not
   /// initialized, [busIdNotFound] if [busId] is unknown,
-  /// [audioDeviceFailedToStart] if the output device could not be started
-  /// (only checked when [paused] is false), [failedToStartPlayback] if no
-  /// voice could be created.
+  /// [failedToStartPlayback] if no voice could be created. When [paused] is
+  /// false the output device is started asynchronously after the bus voice
+  /// exists, so this never reports [audioDeviceFailedToStart].
   PlayerErrors busPlayOnEngine(unsigned int busId, float volume, bool paused,
                                unsigned int &handle);
   int busSetChannels(unsigned int busId, unsigned int channels);

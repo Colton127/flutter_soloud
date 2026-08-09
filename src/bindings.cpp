@@ -1748,8 +1748,8 @@ extern "C"
   /// [handle] the sound handle
   /// Returns [PlayerErrors.noError] if success, [PlayerErrors.backendNotInited]
   /// if the engine is not initialized, [PlayerErrors.soundHandleNotFound] if
-  /// [handle] is not valid, [PlayerErrors.audioDeviceFailedToStart] if
-  /// unpausing could not start the output device.
+  /// [handle] is not valid. Unpausing posts an asynchronous device start, so
+  /// this never reports [PlayerErrors.audioDeviceFailedToStart].
   FFI_PLUGIN_EXPORT enum PlayerErrors pauseSwitch(unsigned int handle)
   {
     if (player.get() == nullptr || !player.get()->isInited())
@@ -1763,9 +1763,8 @@ extern "C"
   /// [pause] the sound handle
   /// Returns [PlayerErrors.noError] if success, [PlayerErrors.backendNotInited]
   /// if the engine is not initialized, [PlayerErrors.soundHandleNotFound] if
-  /// [handle] is not valid, [PlayerErrors.audioDeviceFailedToStart] if
-  /// unpausing could not start the output device. When the device cannot be
-  /// started, the voice is left paused.
+  /// [handle] is not valid. Unpausing posts an asynchronous device start, so
+  /// this never reports [PlayerErrors.audioDeviceFailedToStart].
   FFI_PLUGIN_EXPORT enum PlayerErrors setPause(unsigned int handle, bool pause)
   {
     if (player.get() == nullptr || !player.get()->isInited())
@@ -3372,10 +3371,10 @@ extern "C"
   /// [handle] set to the voice handle of the bus, or 0 on error.
   /// Returns [PlayerErrors.noError] if success, [PlayerErrors.backendNotInited]
   /// if the engine is not initialized, [PlayerErrors.busIdNotFound] if [busId]
-  /// is unknown, [PlayerErrors.audioDeviceFailedToStart] if the output device
-  /// could not be started (only checked when [paused] is false),
-  /// [PlayerErrors.failedToStartPlayback] if no voice could be created for the
-  /// bus.
+  /// is unknown, [PlayerErrors.failedToStartPlayback] if no voice could be
+  /// created for the bus. When [paused] is false the output device is started
+  /// asynchronously after the bus voice exists, so this never reports
+  /// [PlayerErrors.audioDeviceFailedToStart].
   ///
   /// Note: to play a sound through a bus, the play() function is used with the
   /// bus ID as an argument. See play() for more information.

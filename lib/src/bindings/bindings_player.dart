@@ -499,9 +499,9 @@ abstract class FlutterSoLoud {
   /// [handle] the sound handle.
   /// Returns [PlayerErrors.noError] if success,
   /// [PlayerErrors.backendNotInited] if the engine is not initialized,
-  /// [PlayerErrors.soundHandleNotFound] if [handle] is not valid,
-  /// [PlayerErrors.audioDeviceFailedToStart] if unpausing could not start
-  /// the output device.
+  /// [PlayerErrors.soundHandleNotFound] if [handle] is not valid.
+  /// Unpausing posts an asynchronous device start, so this never reports
+  /// [PlayerErrors.audioDeviceFailedToStart].
   @mustBeOverridden
   PlayerErrors pauseSwitch(SoundHandle handle);
 
@@ -511,9 +511,9 @@ abstract class FlutterSoLoud {
   /// [pause] the new state.
   /// Returns [PlayerErrors.noError] if success,
   /// [PlayerErrors.backendNotInited] if the engine is not initialized,
-  /// [PlayerErrors.soundHandleNotFound] if [handle] is not valid,
-  /// [PlayerErrors.audioDeviceFailedToStart] if unpausing could not start
-  /// the output device. In the latter case the voice is left paused.
+  /// [PlayerErrors.soundHandleNotFound] if [handle] is not valid.
+  /// Unpausing posts an asynchronous device start, so this never reports
+  /// [PlayerErrors.audioDeviceFailedToStart].
   @mustBeOverridden
   PlayerErrors setPause(SoundHandle handle, int pause);
 
@@ -1427,8 +1427,8 @@ abstract class FlutterSoLoud {
   /// [busId] the bus ID returned by createBus.
   /// [volume] playback volume (1.0 = full).
   /// [paused] whether to start paused.
-  /// When [paused] is false the output audio device is started first, so
-  /// this can also fail with [PlayerErrors.audioDeviceFailedToStart].
+  /// When [paused] is false the output audio device is started off the UI
+  /// thread after the bus voice has been created.
   ///
   /// Returns [PlayerErrors.noError] and the voice handle of the bus on
   /// success, or the error and a zeroed handle on failure.

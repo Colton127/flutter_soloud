@@ -1066,24 +1066,32 @@ PlayerErrors Player::ensureAudioDeviceStarted()
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return backendNotInited;
 
-    // Serialize against the lifecycle scheduler: an idle stop must not
-    // interleave with the start this caller is about to depend on.
-    std::lock_guard<std::mutex> operationLock(mDeviceLifecycleOperationMutex);
-
-    // Cancel a pending idle stop so it cannot stop the device out from under
-    // the voice the caller is about to create.
-    invalidatePendingDeviceRequest();
-    const PlayerErrors result = performAudioDeviceStart();
-    if (result == noError)
+    PlayerErrors result;
     {
-        // Any idle request posted while the start was in progress predates it.
-        // Deliberately no re-arm here: the caller creates its voice next, and
-        // the idle timeout is re-armed when that voice goes inactive. Re-arming
-        // now would evaluate an engine that is still idle -- on web, where the
-        // evaluation is inline and immediate, that would stop the device again
-        // before the voice exists.
+        // Serialize against the lifecycle scheduler: an idle stop must not
+        // interleave with the start this caller is about to depend on.
+        std::lock_guard<std::mutex> operationLock(
+            mDeviceLifecycleOperationMutex);
+
+        // Cancel a pending idle stop so it cannot stop the device out from
+        // under the voice the caller is about to create.
         invalidatePendingDeviceRequest();
+        result = performAudioDeviceStart();
+        if (result == noError)
+        {
+            // Any idle request posted while the start was in progress predates
+            // it. Replace it with a fresh timeout below.
+            invalidatePendingDeviceRequest();
+        }
     }
+
+    // Re-arm the idle timeout outside the operation lock, as startAudioDevice()
+    // does. This must not be skipped on the assumption that the caller is about
+    // to create a voice: the caller can still fail after this point (no voice
+    // could be allocated, unknown bus), and without a pending idle request the
+    // device it just started would keep running with nothing to stop it.
+    if (result == noError)
+        evaluateAudioDeviceIdle();
     return result;
 }
 
@@ -1854,7 +1862,10 @@ PlayerErrors Player::play(
 
     {
         std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-        sound->handle.push_back({newHandle, MAX_DOUBLE, false});
+        // A voice the caller asked to start paused is user-paused: the
+        // BufferStream buffering logic must not silently unpause it once
+        // enough data has arrived.
+        sound->handle.push_back({newHandle, MAX_DOUBLE, paused});
     }
 
     if (looping)
@@ -2758,7 +2769,10 @@ PlayerErrors Player::play3d(
 
     {
         std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-        sound->handle.push_back({newHandle, MAX_DOUBLE, false});
+        // A voice the caller asked to start paused is user-paused: the
+        // BufferStream buffering logic must not silently unpause it once
+        // enough data has arrived.
+        sound->handle.push_back({newHandle, MAX_DOUBLE, paused});
     }
 
     if (looping)

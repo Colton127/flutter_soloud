@@ -2016,12 +2016,13 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudNotInitializedException] if the engine is not initialized.
   ///
-  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the output audio
-  /// device could not be started.
-  ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for the speech. In that case no audio source
   /// is created.
+  ///
+  /// Device startup is requested after the voice has been created and runs off
+  /// the UI thread, so this does not report output-device failures. Use
+  /// [startAudioDevice] when you need to observe them.
   AudioSource speechText(String textToSpeech) {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
@@ -2098,13 +2099,14 @@ interface class SoLoud {
   /// Throws [SoLoudSoundHashNotFoundDartException] if the given [sound]
   /// is not found.
   ///
-  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the output audio
-  /// device could not be started. Only checked when the sound will actually
-  /// play: with [paused] set to `true` no device is needed until you unpause
-  /// it, so a voice can be created and configured during an interruption.
-  ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// An unpaused voice requests output-device startup only after it has been
+  /// created successfully, and that startup runs off the UI thread. This method
+  /// therefore does not report output-device failures; with [paused] set to
+  /// `true` no device is requested at all. Use [startAudioDevice] when you need
+  /// to observe a device-start failure.
   SoundHandle play(
     AudioSource sound, {
     int busId = 0,
@@ -2550,8 +2552,9 @@ interface class SoLoud {
   /// Throws [SoLoudSoundHandleNotFoundCppException] if [handle] is not a
   /// valid voice handle (for example the sound has already ended).
   ///
-  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if unpausing could
-  /// not start the output audio device.
+  /// Unpausing requests output-device startup off the UI thread, so this does
+  /// not report output-device failures. Use [startAudioDevice] when you need to
+  /// observe them.
   void pauseSwitch(SoundHandle handle) {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
@@ -2573,8 +2576,9 @@ interface class SoLoud {
   /// Throws [SoLoudSoundHandleNotFoundCppException] if [handle] is not a
   /// valid voice handle (for example the sound has already ended).
   ///
-  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if unpausing could
-  /// not start the output audio device.
+  /// Unpausing requests output-device startup off the UI thread, so this does
+  /// not report output-device failures. Use [startAudioDevice] when you need to
+  /// observe them.
   void setPause(SoundHandle handle, bool pause) {
     if (!isInitialized) {
       throw const SoLoudNotInitializedException();
@@ -3889,13 +3893,14 @@ interface class SoLoud {
   /// Throws [SoLoudBufferStreamCanBePlayedOnlyOnceCppException] if we try to
   /// play a BufferStream using `release` buffer type more than once.
   ///
-  /// Throws [SoLoudAudioDeviceFailedToStartCppException] if the output audio
-  /// device could not be started. Only checked when the sound will actually
-  /// play: with [paused] set to `true` no device is needed until you unpause
-  /// it, so a voice can be created and configured during an interruption.
-  ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// An unpaused voice requests output-device startup only after it has been
+  /// created successfully, and that startup runs off the UI thread. This method
+  /// therefore does not report output-device failures; with [paused] set to
+  /// `true` no device is requested at all. Use [startAudioDevice] when you need
+  /// to observe a device-start failure.
   SoundHandle play3d(
     AudioSource sound,
     double posX,
