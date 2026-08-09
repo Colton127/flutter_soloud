@@ -37,6 +37,13 @@ namespace soloud_test
     startAudioDeviceLatchCleared,
     /// In Player::performAudioDeviceStart(), before the backend start runs.
     performAudioDeviceStartEntered,
+    /// In MixerOutput::onAudioData(), after the callback has been admitted to
+    /// the active capture session but before it touches any capture state.
+    mixerCaptureCallbackAdmitted,
+    /// In the miniaudio notification callback, after it has been admitted and
+    /// has pinned the current engine, but before it dereferences the Soloud or
+    /// the interruption callback's Player* context.
+    deviceNotificationAdmitted,
     /// At the top of Player::dispose(), before it stops accepting lifecycle
     /// requests. Parking here gives the scheduler an opportunity to act on
     /// anything teardown queued behind it, which is what makes "teardown
@@ -49,7 +56,9 @@ namespace soloud_test
     barrierCount
   };
 
-  /// Arm [barrier]. The next thread reaching it parks until released.
+  /// Arm [barrier]. The *next* thread reaching it parks until released; any
+  /// thread arriving after that passes straight through, so a barrier cannot
+  /// accidentally catch work the test itself triggered.
   void armBarrier(DeviceBarrier barrier);
 
   /// Block until a thread has parked on [barrier].

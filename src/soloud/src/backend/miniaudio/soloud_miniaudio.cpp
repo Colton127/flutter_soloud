@@ -69,6 +69,7 @@ namespace SoLoud
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <condition_variable>
 #include <mutex>
 #include "soloud_common.h"
 #include "../../../../mixeroutput/mixer_output.h"
@@ -91,6 +92,127 @@ namespace SoLoud
     // replace gDevice passes through this mutex. It is recursive because some
     // miniaudio backends can deliver notifications inline from an operation.
     static std::recursive_mutex gDeviceOperationMutex;
+
+    // Invocation gate for device notifications.
+    //
+    // Storing nullptr into gSoloud stops a notification that has not started
+    // yet; it does nothing for one that already loaded the pointer and was
+    // then preempted. That notification goes on to dereference the Soloud --
+    // and, on the interruption branch, the raw Player* held as the callback
+    // context -- after teardown has freed both. miniaudio's own uninit does not
+    // close the window either, because the load can happen before it.
+    //
+    // So notifications are admitted, and teardown retires admission and then
+    // waits for admitted ones to finish before anything may be destroyed. The
+    // session id makes a delayed notification from device A unable to become
+    // valid again just because device B has since published a new gSoloud.
+    //
+    // Deliberately NOT gDeviceOperationMutex: notifications can be delivered
+    // inline from device operations, so blocking on that lock here would need
+    // a per-backend deadlock proof. This gate is only ever held for a handful
+    // of instructions and never across the dispatch itself.
+    static std::mutex gNotificationGateMutex;
+    static std::condition_variable gNotificationGateCv;
+    static int gNotificationsInFlight = 0;
+    static uint64_t gNotificationSession = 0;
+    // gSoloud is the retirement state: it is written only by
+    // publishNotificationTarget() and retireNotificationsAndDrain(), both under
+    // gNotificationGateMutex, so "published" and "admitting" are the same
+    // condition and cannot drift apart.
+
+    struct NotificationPass
+    {
+        SoLoud::Soloud *soloud = nullptr;
+        uint64_t session = 0;
+        bool admitted = false;
+    };
+
+    /// Admit a notification and pin the engine it belongs to. A false return
+    /// means notifications are retired (teardown owns the engine now) and the
+    /// caller must touch nothing.
+    static bool admitNotification(NotificationPass *pass)
+    {
+        std::lock_guard<std::mutex> lock(gNotificationGateMutex);
+        SoLoud::Soloud *currentSoloud = gSoloud.load(std::memory_order_acquire);
+        if (currentSoloud == nullptr)
+            return false;
+
+        ++gNotificationsInFlight;
+        pass->soloud = currentSoloud;
+        pass->session = gNotificationSession;
+        pass->admitted = true;
+        return true;
+    }
+
+    static void releaseNotification(NotificationPass *pass)
+    {
+        if (!pass->admitted)
+            return;
+        pass->admitted = false;
+        {
+            std::lock_guard<std::mutex> lock(gNotificationGateMutex);
+            --gNotificationsInFlight;
+        }
+        gNotificationGateCv.notify_all();
+    }
+
+    /// RAII wrapper, so no dispatch path can return without releasing.
+    struct ScopedNotificationPass
+    {
+        NotificationPass pass;
+        ScopedNotificationPass() { admitNotification(&pass); }
+        ~ScopedNotificationPass() { releaseNotification(&pass); }
+        ScopedNotificationPass(const ScopedNotificationPass &) = delete;
+        ScopedNotificationPass &operator=(const ScopedNotificationPass &) = delete;
+        explicit operator bool() const { return pass.admitted; }
+        SoLoud::Soloud *operator->() const { return pass.soloud; }
+    };
+
+    /// Publish [aSoloud] as the engine notifications belong to, and open
+    /// admission. Called once the engine is ready to receive them.
+    static void publishNotificationTarget(SoLoud::Soloud *aSoloud)
+    {
+        std::lock_guard<std::mutex> lock(gNotificationGateMutex);
+        gSoloud.store(aSoloud, std::memory_order_release);
+        ++gNotificationSession;
+    }
+
+    /// Publishes the notification target for the duration of an
+    /// initialization and retires it again unless that initialization
+    /// commits. miniaudio_init() has several failure returns after the
+    /// engine is published but before mBackendCleanupFunc is installed;
+    /// without this, those paths would leave admission open on an engine that
+    /// has no teardown hook left to close it.
+    struct NotificationPublishGuard
+    {
+        bool committed = false;
+        explicit NotificationPublishGuard(SoLoud::Soloud *aSoloud)
+        {
+            publishNotificationTarget(aSoloud);
+        }
+        ~NotificationPublishGuard();
+        void commit() { committed = true; }
+        NotificationPublishGuard(const NotificationPublishGuard &) = delete;
+        NotificationPublishGuard &operator=(const NotificationPublishGuard &) = delete;
+    };
+
+    /// Close admission and wait for admitted notifications to finish. After
+    /// this returns, no notification holds a pointer into the engine, so it
+    /// may be torn down and destroyed.
+    static void retireNotificationsAndDrain()
+    {
+        std::unique_lock<std::mutex> lock(gNotificationGateMutex);
+        ++gNotificationSession;
+        gSoloud.store(nullptr, std::memory_order_release);
+        gNotificationGateCv.wait(lock, []
+                                 { return gNotificationsInFlight == 0; });
+    }
+
+    NotificationPublishGuard::~NotificationPublishGuard()
+    {
+        if (!committed)
+            retireNotificationsAndDrain();
+    }
     
     // Selects the miniaudio performance profile used when (re)initializing the
     // device. Low-latency (the historical default) maps to AAudio's
@@ -143,13 +265,18 @@ namespace SoLoud
         else if (pNotification->type == ma_device_notification_type_stopped)
             gDeviceStopped.store(true, std::memory_order_release);
 
-        // Guard against notifications delivered after deinitialization.
-        // The notifications may be pending on the main thread when the
-        // device is torn down.
-        SoLoud::Soloud *currentSoloud =
-            gSoloud.load(std::memory_order_acquire);
-        if (currentSoloud == nullptr)
+        // Admit and pin the engine for the whole dispatch. A bare load of
+        // gSoloud only rules out notifications that have not started; one that
+        // already read the pointer would go on to dereference a destroyed
+        // Soloud -- or, below, call through a freed Player* -- because teardown
+        // has no way to know it is there.
+        const ScopedNotificationPass pass;
+        if (!pass)
             return;
+
+        SOLOUD_TEST_BARRIER(deviceNotificationAdmitted);
+
+        SoLoud::Soloud *currentSoloud = pass.pass.soloud;
 
         switch (pNotification->type)
         {
@@ -281,11 +408,15 @@ namespace SoLoud
             gInitThread = nullptr;
         }
 
-        // Clear the global soloud pointer BEFORE uninitializing the device.
-        // This prevents any pending platform notifications (e.g. iOS route
-        // changes delivered on the main thread) from dereferencing a
-        // destroyed SoLoud instance through the on_notification callback.
-        gSoloud.store(nullptr, std::memory_order_release);
+        // Close notification admission and wait for any notification already
+        // inside the engine to finish, BEFORE uninitializing the device.
+        // Clearing the pointer alone only stops notifications that have not
+        // started yet; this also waits out the ones that already hold it, which
+        // is what lets the caller destroy the Soloud and its owning Player
+        // afterwards. Released before ma_device_uninit() below, so a "stopped"
+        // notification delivered inline from it finds admission closed and
+        // returns rather than deadlocking on the gate.
+        retireNotificationsAndDrain();
 
         if (gDeviceInitialized.load(std::memory_order_acquire))
         {
@@ -502,7 +633,9 @@ namespace SoLoud
     result miniaudio_init(SoLoud::Soloud *aSoloud, unsigned int aFlags, unsigned int aSamplerate, unsigned int aBuffer, unsigned int aChannels, void *pPlaybackInfos_id)
     {
         std::unique_lock<std::recursive_mutex> operationLock(gDeviceOperationMutex);
-        gSoloud.store(aSoloud, std::memory_order_release);
+        // Opens notification admission as well as publishing the pointer.
+        // Retired again by the guard on any failure return below.
+        NotificationPublishGuard notificationGuard(aSoloud);
         ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
         if (pPlaybackInfos_id != NULL)
         {
@@ -641,6 +774,9 @@ namespace SoLoud
         gDeviceStartDeferred = false;
 #endif
 
+        // The engine now owns a teardown hook that will retire notifications,
+        // so the guard must not do it on the way out.
+        notificationGuard.commit();
         aSoloud->mBackendCleanupFunc = soloud_miniaudio_deinit;
         aSoloud->mBackendPauseFunc   = soloud_miniaudio_pause;
         aSoloud->mBackendResumeFunc  = soloud_miniaudio_resume;

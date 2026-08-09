@@ -32,6 +32,7 @@
 //   ./test/run_device_coordinator_test.sh
 
 #include "device_lifecycle_test_hooks.h"
+#include "mixeroutput/mixer_output.h"
 #include "enums.h"
 #include "soloud/include/soloud_internal.h"
 
@@ -41,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <vector>
 
 extern "C"
 {
@@ -83,6 +85,13 @@ extern "C"
                                     double duration, unsigned int busId,
                                     float volume, float pan,
                                     unsigned int *handle);
+
+    enum PlayerErrors startMixerCapture(int format, int sampleRate,
+                                        int channels, int bufferSizeBytes,
+                                        int notificationThresholdBytes,
+                                        int chunkPCMFrames);
+    void stopMixerCapture();
+    int isMixerCaptureRunning();
 
     // Test-only hooks (SOLOUD_LIFECYCLE_TEST_HOOKS).
     bool requestEngineTeardownForEngine(int64_t engine_id);
@@ -922,6 +931,249 @@ void testStateCallbackRetirementRacesDispatch()
     tearDownEngine();
 }
 
+
+/// Feeds the mixer capture the way the real-time audio callback does.
+void feedCapture(int frames)
+{
+    std::vector<float> block(static_cast<size_t>(frames) * 2, 0.25f);
+    MixerOutput::instance().onAudioData(block.data(),
+                                        static_cast<unsigned int>(frames));
+}
+
+/// stop() must not destroy capture state while an audio callback is inside it.
+///
+/// onAudioData() used to test `m_running` once and then keep using
+/// non-atomic capture state, so a callback preempted right after that check
+/// resumed inside buffers stop() had already released.
+void testMixerStopWaitsForInFlightPcmCallback()
+{
+    std::printf("mixer PCM stop vs in-flight audio callback\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 65536, 4096,
+                             -1) == PlayerErrors::noError,
+           "the PCM capture should start");
+
+    soloud_test::armBarrier(DeviceBarrier::mixerCaptureCallbackAdmitted);
+
+    std::atomic<bool> callbackReturned{false};
+    std::thread audio([&] {
+        feedCapture(256);
+        callbackReturned.store(true, std::memory_order_release);
+    });
+
+    soloud_test::waitBarrierReached(DeviceBarrier::mixerCaptureCallbackAdmitted);
+
+    std::atomic<bool> stopReturned{false};
+    std::thread stopper([&] {
+        stopMixerCapture();
+        stopReturned.store(true, std::memory_order_release);
+    });
+
+    // The capture is still being written to. stop() must not get as far as
+    // releasing the buffers, the encoder or the queue.
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT(!stopReturned.load(std::memory_order_acquire),
+           "stop() tore the capture down while an audio callback was inside it");
+
+    soloud_test::releaseBarrier(DeviceBarrier::mixerCaptureCallbackAdmitted);
+    audio.join();
+    stopper.join();
+
+    EXPECT(callbackReturned.load(std::memory_order_acquire),
+           "the audio callback should have completed");
+    EXPECT(isMixerCaptureRunning() == 0, "the capture should be stopped");
+
+    tearDownEngine();
+    std::printf("  ok: stop waited for the callback to leave\n");
+}
+
+/// The same guarantee for a compressed capture, which is the path that pushes
+/// into m_pcmQueue -- the object stop() resets.
+void testMixerStopWaitsForInFlightCompressedCallback()
+{
+    std::printf("mixer compressed stop vs in-flight audio callback\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    // WAV needs no Xiph libraries, so this path is available in every build.
+    const PlayerErrors started =
+        startMixerCapture(MIXER_OUTPUT_WAV, 44100, 2, 262144, 8192, -1);
+    if (started != PlayerErrors::noError)
+    {
+        std::printf("  skipped: compressed capture unavailable (%d)\n",
+                    (int)started);
+        tearDownEngine();
+        return;
+    }
+
+    soloud_test::armBarrier(DeviceBarrier::mixerCaptureCallbackAdmitted);
+
+    std::thread audio([&] { feedCapture(256); });
+    soloud_test::waitBarrierReached(DeviceBarrier::mixerCaptureCallbackAdmitted);
+
+    std::atomic<bool> stopReturned{false};
+    std::thread stopper([&] {
+        stopMixerCapture();
+        stopReturned.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT(!stopReturned.load(std::memory_order_acquire),
+           "stop() released the encoder/queue while a callback was pushing "
+           "into it");
+
+    soloud_test::releaseBarrier(DeviceBarrier::mixerCaptureCallbackAdmitted);
+    audio.join();
+    stopper.join();
+
+    EXPECT(isMixerCaptureRunning() == 0, "the capture should be stopped");
+    tearDownEngine();
+    std::printf("  ok: stop waited for the queue push to finish\n");
+}
+
+/// A callback admitted to capture A must never write into capture B.
+///
+/// The session id is monotonic precisely so an "inactive -> active"
+/// transition cannot be mistaken for the session the callback first observed.
+void testMixerStopThenStartDoesNotAdmitOldCallback()
+{
+    std::printf("mixer stop then immediate start vs a parked callback\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 65536, 4096,
+                             -1) == PlayerErrors::noError,
+           "capture A should start");
+
+    soloud_test::armBarrier(DeviceBarrier::mixerCaptureCallbackAdmitted);
+    std::thread audio([&] { feedCapture(256); });
+    soloud_test::waitBarrierReached(DeviceBarrier::mixerCaptureCallbackAdmitted);
+
+    // Stop A and start B while the old callback is parked. stop() cannot
+    // complete until it leaves, so release it first and only then swap --
+    // which is itself the guarantee: the swap is serialized behind the
+    // callback rather than racing it.
+    std::atomic<bool> swapDone{false};
+    std::thread swapper([&] {
+        stopMixerCapture();
+        startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 22050, 2, 65536, 4096, -1);
+        swapDone.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT(!swapDone.load(std::memory_order_acquire),
+           "the capture was replaced while a callback was still inside the "
+           "old one");
+
+    soloud_test::releaseBarrier(DeviceBarrier::mixerCaptureCallbackAdmitted);
+    audio.join();
+    swapper.join();
+
+    EXPECT(isMixerCaptureRunning() == 1, "capture B should be running");
+    stopMixerCapture();
+    tearDownEngine();
+    std::printf("  ok: the swap was serialized behind the old callback\n");
+}
+
+/// Teardown must not free the engine while a device notification is inside it.
+///
+/// Storing nullptr into the backend's engine pointer only stops notifications
+/// that have not started; one that already loaded it goes on to dereference a
+/// destroyed Soloud -- and, on the interruption branch, a freed Player*.
+void testTeardownWaitsForInFlightNotification(bool interruption)
+{
+    std::printf("teardown vs in-flight %s notification\n",
+                interruption ? "interruption" : "state-change");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    soloud_test::armBarrier(DeviceBarrier::deviceNotificationAdmitted);
+
+    std::atomic<bool> notificationReturned{false};
+    std::thread notifier([&] {
+        // Both go through the real backend notification path. The
+        // interruption branch is the one carrying the raw Player* context.
+        SoLoud::miniaudio_debugTriggerAudioInterruption(interruption);
+        notificationReturned.store(true, std::memory_order_release);
+    });
+
+    soloud_test::waitBarrierReached(DeviceBarrier::deviceNotificationAdmitted);
+
+    std::atomic<bool> teardownReturned{false};
+    std::thread teardown([&] {
+        dispose();
+        teardownReturned.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT(!teardownReturned.load(std::memory_order_acquire),
+           "teardown ran to completion while a notification was inside the "
+           "engine");
+
+    soloud_test::releaseBarrier(DeviceBarrier::deviceNotificationAdmitted);
+    notifier.join();
+    teardown.join();
+
+    EXPECT(notificationReturned.load(std::memory_order_acquire),
+           "the notification should have completed");
+    EXPECT(isInited() == 0, "the engine should be torn down");
+    std::printf("  ok: teardown waited the notification out\n");
+}
+
+/// A notification from a retired session must not act on the engine that
+/// replaced it.
+void testRetiredNotificationCannotReachReplacementEngine()
+{
+    std::printf("retired notification vs replacement engine\n");
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: no usable output device\n");
+        return;
+    }
+
+    dispose();
+    EXPECT(isInited() == 0, "the first engine should be torn down");
+
+    // Delivered while nothing is published: admission is closed, so this must
+    // be a no-op rather than a dispatch into whatever comes next.
+    gStateEvents.store(0, std::memory_order_release);
+    SoLoud::miniaudio_debugTriggerAudioInterruption(true);
+    SoLoud::miniaudio_debugTriggerAudioInterruption(false);
+    EXPECT(gStateEvents.load(std::memory_order_acquire) == 0,
+           "a notification with no engine published dispatched %d event(s)",
+           gStateEvents.load(std::memory_order_acquire));
+
+    if (!bringUpEngine())
+    {
+        std::printf("  skipped: replacement engine unavailable\n");
+        return;
+    }
+    gStateEvents.store(0, std::memory_order_release);
+
+    // The replacement engine is live, so its own notifications work normally.
+    SoLoud::miniaudio_debugTriggerAudioInterruption(true);
+    SoLoud::miniaudio_debugTriggerAudioInterruption(false);
+    EXPECT(gStateEvents.load(std::memory_order_acquire) > 0,
+           "the replacement engine should receive its own notifications");
+
+    tearDownEngine();
+    std::printf("  ok: retired session dispatched nothing\n");
+}
+
 } // namespace
 
 int main()
@@ -940,6 +1192,12 @@ int main()
     testIdleTimeoutApplyIsCoalesced();
     testIdleTimeoutPublicationRacingWorkerExitIsApplied();
     testStateCallbackRetirementRacesDispatch();
+    testMixerStopWaitsForInFlightPcmCallback();
+    testMixerStopWaitsForInFlightCompressedCallback();
+    testMixerStopThenStartDoesNotAdmitOldCallback();
+    testTeardownWaitsForInFlightNotification(/*interruption*/ false);
+    testTeardownWaitsForInFlightNotification(/*interruption*/ true);
+    testRetiredNotificationCannotReachReplacementEngine();
 
     std::printf("\n%d assertions, %d failures\n", gAssertions, gFailures);
     return gFailures == 0 ? 0 : 1;

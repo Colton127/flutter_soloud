@@ -54,7 +54,13 @@ namespace soloud_test
   {
     std::unique_lock<std::mutex> lock(gMutex);
     Barrier &b = slot(barrier);
-    if (!b.armed)
+    // One-shot: only the *first* thread to arrive parks. Later arrivals pass
+    // straight through. Without this a barrier catches every thread reaching
+    // the point, including ones the test itself set in motion -- a teardown
+    // parking on the "device stopped" notification it just caused, for
+    // instance, which makes the test pass no matter what the code under test
+    // does.
+    if (!b.armed || b.reached)
       return;
 
     b.reached = true;
