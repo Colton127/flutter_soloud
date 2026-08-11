@@ -20,6 +20,10 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin;
  * control it. Only the embedder can observe that transition: Dart's
  * {@code detached} lifecycle state is not guaranteed to arrive first, and there
  * is no reliable root-isolate exit hook.
+ *
+ * <p>This tracks the FlutterEngine, not the Activity. A cached engine
+ * deliberately outlives Activity recreation, and tearing the audio engine down
+ * because the user rotated the screen would be a bug.
  */
 public final class FlutterSoloudPlugin implements FlutterPlugin {
     private static final String TAG = "FlutterSoloudPlugin";
@@ -74,11 +78,13 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         }
     }
 
+    // getFlutterEngine() is deprecated in favour of the binary messenger /
+    // texture registry / platform view registry accessors, but this plugin
+    // wants none of those: it needs the engine itself, for its id and for its
+    // lifecycle listener, and no other accessor exposes them.
     @SuppressWarnings("deprecation")
     @Override
-    public void onAttachedToEngine(
-        @NonNull FlutterPluginBinding binding
-    ) {
+    public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
         // Deliberately does no native work. This runs during app launch for
         // every app that depends on the plugin, whether or not it ever uses
         // SoLoud, so it must stay pure Java bookkeeping: read the engine id and
@@ -89,31 +95,33 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         engineId = engine.getEngineId();
         teardownRequested = false;
 
-        lifecycleListener = new FlutterEngine.EngineLifecycleListener() {
-            @Override
-            public void onPreEngineRestart() {
-                // Hot restart replaces the Dart isolate but does not detach
-                // plugins, and the engine id is unchanged -- so without this the
-                // registered NativeCallables silently go stale. Only the bridges
-                // are cleared: the new isolate's init() finds the native engine
-                // still initialized and deinits it itself.
-                clearDartCallbackRegistrations();
-            }
+        final FlutterEngine.EngineLifecycleListener listener =
+            new FlutterEngine.EngineLifecycleListener() {
+                @Override
+                public void onPreEngineRestart() {
+                    // Hot restart replaces the Dart isolate but does not detach
+                    // plugins, and the engine id is unchanged -- so without this
+                    // the registered NativeCallables silently go stale. Only the
+                    // bridges are cleared: the engine itself is still owned by
+                    // this FlutterEngine, and the new isolate's init() finds the
+                    // native engine initialized and deinits it itself.
+                    clearDartCallbackRegistrations();
+                }
 
-            @Override
-            public void onEngineWillDestroy() {
-                // Fires just before the plugin registry is destroyed. The engine
-                // is still valid here, so this is the earliest safe point.
-                requestEngineTeardown();
-            }
-        };
-        engine.addEngineLifecycleListener(lifecycleListener);
+                @Override
+                public void onEngineWillDestroy() {
+                    // Fires just before the plugin registry is destroyed. The
+                    // engine is still valid here, so this is the earliest safe
+                    // point.
+                    requestEngineTeardown();
+                }
+            };
+        lifecycleListener = listener;
+        engine.addEngineLifecycleListener(listener);
     }
 
     @Override
-    public void onDetachedFromEngine(
-        @NonNull FlutterPluginBinding binding
-    ) {
+    public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
         final FlutterEngine engine = flutterEngine;
         final FlutterEngine.EngineLifecycleListener listener = lifecycleListener;
 
@@ -139,11 +147,7 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         try {
             nativeClearDartCallbackRegistrationsForEngine(id);
         } catch (UnsatisfiedLinkError error) {
-            Log.w(
-                TAG,
-                "Unable to clear Dart callback registrations",
-                error
-            );
+            Log.w(TAG, "Unable to clear Dart callback registrations", error);
         }
     }
 
@@ -175,11 +179,7 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         try {
             teardownRequested = nativeRequestEngineTeardownForEngine(id);
         } catch (UnsatisfiedLinkError error) {
-            Log.w(
-                TAG,
-                "Unable to request native engine teardown",
-                error
-            );
+            Log.w(TAG, "Unable to request native engine teardown", error);
         }
     }
 }

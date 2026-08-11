@@ -174,7 +174,8 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
       'After schedulePause(1000ms), expected handle to be paused.',
     );
     strBuf.writeln(
-        'Handle paused after schedulePause: $pausedAfterSchedulePause');
+      'Handle paused after schedulePause: $pausedAfterSchedulePause',
+    );
 
     // 10) Wait idle timeout again and verify stopped.
     await Future<void>.delayed(idleTimeout);
@@ -263,11 +264,7 @@ Future<StringBuffer> testAudioDeviceIdleTimeout() async {
     );
 
     // 15) Play unpaused and non-looping, then wait for started (max 1000 ms).
-    final explosionHandle = SoLoud.instance.play(
-      explosion,
-      paused: false,
-      looping: false,
-    );
+    final explosionHandle = SoLoud.instance.play(explosion);
     var stateDuringExplosionStart = SoLoud.instance.getAudioDeviceState();
     final startedExplosionDeadline =
         DateTime.now().add(const Duration(milliseconds: 1000));
