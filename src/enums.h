@@ -121,6 +121,7 @@ typedef enum PlayerStateEvents {
 /// directly from the backend without translation.
 ///
 /// WARNING: Keep these in sync with `lib/src/enums.dart`.
+/// WARNING: Keep these in sync with `lib/src/enums.dart`.
 typedef enum AudioDeviceState {
   /// The device is uninitialized. Also returned before the engine is
   /// initialized or after it has been deinitialized.
