@@ -27,8 +27,6 @@
 - fix: deferred idle-timeout application is now genuinely coalesced. The previous bookkeeping cleared its "queued" flag before waiting on the lifecycle mutex, so during a slow `init()` every call spawned another detached waiter thread. Publication is now sequenced, exactly one worker runs at a time, and it re-checks for a newer publication before going idle — so repeated updates collapse onto one worker and the last value always wins. Thanks to @Colton127
 - fix: a data race on `mPostClipScaler`. `init()` sets it after `soloud.init()` has already started the device, and `clip_internal()` reads it on the audio thread *after* releasing the audio mutex, so the mutex does not order the two. ThreadSanitizer flags it in `clip_internal()`; the field is now atomic and each clip pass snapshots it once. Thanks to @Colton127
 
-**Known limitation (web)**: the checked-in `web/libflutter_soloud_plugin.{js,wasm}` artifacts have not been regenerated for this release, so `startAudioDevice()`, `stopAudioDevice()` and `getAudioDeviceState()` are not yet callable on web — the Dart bindings reference exports the shipped WASM module does not contain. Every other platform is unaffected. Run `web/compile_wasm.sh` with the project's emscripten toolchain and commit the artifacts to close this.
-
 ##### 4.1.7 (8 Aug 2026)
 - fix: a device change that still fails now reports `SoLoudAudioDeviceFailedToStartCppException` instead of hanging. Thanks to @Colton127 #533
 - fix: `changeDevice()` now selects the system default device when called without an argument and reports device-change failures instead of silently succeeding. Thanks to @Colton127 #533
