@@ -4,15 +4,13 @@ project(${PROJECT_NAME} LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ─── Always compile in Release mode for maximum performance ───
+# Keep the Android plugin optimized in Release mode, but retain DWARF in the
+# unstripped build output so crash reporters can symbolize production crashes.
+# Android packaging still strips the shipped .so; the debug metadata is kept
+# separately by the app build for Sentry/Play uploads.
 set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-set(CMAKE_C_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
-set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
-
-# ─── Always compile in Release mode for maximum performance ───
-set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-set(CMAKE_C_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
-set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_RELEASE "-g -DNDEBUG" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELEASE "-g -DNDEBUG" CACHE STRING "" FORCE)
 
 set(PLUGIN_NAME "${PROJECT_NAME}_plugin")
 
