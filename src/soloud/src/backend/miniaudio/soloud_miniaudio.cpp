@@ -766,12 +766,9 @@ namespace SoLoud
             deviceConfig.aaudio.allowedCapturePolicy = ma_aaudio_allow_capture_by_all;
         }
 
-        ma_backend backends[] = { ma_backend_aaudio, ma_backend_opensl };
-        ma_uint32 backendCount = 2;
-        if (android_get_device_api_level() <= 29) {
-            backends[0] = ma_backend_opensl;
-            backendCount = 1;
-        }
+        // AAudio is disabled on every Android device: always use OpenSL ES.
+        ma_backend backends[] = { ma_backend_opensl };
+        ma_uint32 backendCount = 1;
 
         ma_context_config contextConfig = ma_context_config_init();
         if (ma_context_init(backends, backendCount, &contextConfig, &context) != MA_SUCCESS) {
