@@ -1,4 +1,11 @@
 ##### Unreleased
+- feat: per-bus visualization. `Bus.setVisualizationEnabled`, `Bus.isVisualizationEnabled`, `Bus.getLevel` (RMS, peak and frame count of every frame mixed since the previous call; `frames == 0` while the bus isn't mixed), `Bus.getWave` and `Bus.getFft`. The data is taken before the bus's own filters, volume and pan.
+- fix: `Bus.getChannelVolume` always returned 0 because nothing could enable the bus's visualization data; it now works after `Bus.setVisualizationEnabled(true)`.
+- fix: bus wave data covered only the first 256 frames of each mixed block with channels summed; it is now the latest 256 frames with channels averaged.
+- fix: out-of-bounds read in the native `Bus::getApproximateVolume` when the channel equals the channel count.
+- fix: use-after-free in `Bus.getChannelVolume` and bus filter changes after the bus voice was stopped by `stopAll`, `stop`, or its outer bus stopping.
+- fix: stopping a bus that never had a sound played through it, or a bus `play` that failed because every voice was protected, stopped every voice on the main bus.
+- fix: replaying a bus that had no sound played through it left the previous bus voice playing.
 - fix: loading a long M4A/MP4, AAC, AC-3, E-AC-3 or Ogg Opus/FLAC file blocked `disposeSource`, `disposeAllSources`, `loadMem`, device start/stop and other calls until its decode finished, freezing the UI and causing ANRs on Android. `loadFile`, `loadMem` and `joinTwoSources` now decode outside the engine locks.
 
 ##### 5.2.1 (13 Oct 2026)

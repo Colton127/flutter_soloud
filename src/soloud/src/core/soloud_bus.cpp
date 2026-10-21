@@ -32,10 +32,7 @@ namespace SoLoud
 	{
 		mParent = aParent;
 		mFlags |= PROTECTED | INAUDIBLE_TICK;		
-		for (int i = 0; i < MAX_CHANNELS; i++)
-			mVisualizationChannelVolume[i] = 0;
-		for (int i = 0; i < 256; i++)
-			mVisualizationWaveData[i] = 0;
+		clearVisualization();
 		mScratchSize = SAMPLE_GRANULARITY;
 		mScratch.init(mScratchSize * MAX_CHANNELS);
 	}
@@ -56,47 +53,47 @@ namespace SoLoud
 		
 		s->mixBus_internal(aBuffer, aSamplesToRead, aBufferSize, mScratch.mData, handle, mSamplerate, mChannels, mParent->mResampler);
 
-		int i;
 		if (mParent->mFlags & AudioSource::VISUALIZATION_DATA)
 		{
-			for (i = 0; i < MAX_CHANNELS; i++)
-				mVisualizationChannelVolume[i] = 0;
+			unsigned int i, j;
+			for (j = 0; j < MAX_CHANNELS; j++)
+				mVisualizationChannelVolume[j] = 0;
 
-			if (aSamplesToRead > 255)
+			float invChannels = 1.0f / mChannels;
+			for (i = 0; i < aSamplesToRead; i++)
 			{
-				for (i = 0; i < 256; i++)
+				float sum = 0;
+				float sumSquares = 0;
+				for (j = 0; j < mChannels; j++)
 				{
-					int j;
-					mVisualizationWaveData[i] = 0;
-					for (j = 0; j < (signed)mChannels; j++)
-					{
-						float sample = aBuffer[i + aBufferSize * j];
-						float absvol = (float)fabs(sample);
-						if (absvol > mVisualizationChannelVolume[j])
-							mVisualizationChannelVolume[j] = absvol;
-						mVisualizationWaveData[i] += sample;
-					}
+					float sample = aBuffer[i + aBufferSize * j];
+					float absvol = (float)fabs(sample);
+					if (absvol > mVisualizationChannelVolume[j])
+						mVisualizationChannelVolume[j] = absvol;
+					if (absvol > mLevelPeak)
+						mLevelPeak = absvol;
+					sum += sample;
+					sumSquares += sample * sample;
 				}
+				mLevelSumSquares += sumSquares * invChannels;
+				mVisualizationWaveData[mVisualizationWavePos] = sum * invChannels;
+				mVisualizationWavePos = (mVisualizationWavePos + 1) & 255;
 			}
-			else
-			{
-				// Very unlikely failsafe branch
-				for (i = 0; i < 256; i++)
-				{
-					int j;
-					mVisualizationWaveData[i] = 0;
-					for (j = 0; j < (signed)mChannels; j++)
-					{
-						float sample = aBuffer[(i % aSamplesToRead) + aBufferSize * j];
-						float absvol = (float)fabs(sample);
-						if (absvol > mVisualizationChannelVolume[j])
-							mVisualizationChannelVolume[j] = absvol;
-						mVisualizationWaveData[i] += sample;
-					}
-				}
-			}
+			mLevelFrames += aSamplesToRead;
 		}
 		return aSamplesToRead;
+	}
+
+	void BusInstance::clearVisualization()
+	{
+		for (int i = 0; i < MAX_CHANNELS; i++)
+			mVisualizationChannelVolume[i] = 0;
+		for (int i = 0; i < 256; i++)
+			mVisualizationWaveData[i] = 0;
+		mVisualizationWavePos = 0;
+		mLevelSumSquares = 0;
+		mLevelPeak = 0;
+		mLevelFrames = 0;
 	}
 
 	bool BusInstance::hasEnded()
@@ -107,6 +104,19 @@ namespace SoLoud
 
 	BusInstance::~BusInstance()
 	{
+		// The voice is deleted by the engine (stopAll, stop, an outer bus
+		// stopping, ...) without going through Bus, so drop the parent's
+		// pointer here. Runs under the audio mutex. On the web the delete can
+		// be deferred until after the bus was replayed, so only clear it if
+		// it still points at this instance.
+		if (mParent->mInstance == this)
+			mParent->mInstance = 0;
+		// mChannelHandle is only found lazily (findBusHandle) and is reset
+		// by createInstance, so it can be 0 here. 0 is the main bus's handle:
+		// without this check stopping a bus that never had anything played
+		// on it, or a failed play() of a bus, stopped every main bus voice.
+		if (mParent->mChannelHandle == 0)
+			return;
 		Soloud *s = mParent->mSoloud;
 		int i;
 		for (i = 0; i < (signed)s->mHighestVoice; i++)
@@ -133,14 +143,21 @@ namespace SoLoud
 	
 	BusInstance * Bus::createInstance()
 	{
-		if (mChannelHandle)
-		{
-			stop();
-			mChannelHandle = 0;
-			mInstance = 0;
-		}
-		mInstance = new BusInstance(this);
-		return mInstance;
+		// Stop the previous voice even if nothing was played through it yet
+		// (mChannelHandle still 0). stop() finds it by audio source id, and
+		// an orphaned instance would later stop the new bus's voices.
+		stop();
+		BusInstance *instance = new BusInstance(this);
+		// The getters, filter changes and ~BusInstance (on the audio thread
+		// too) access mInstance under the audio mutex, so publish it there.
+		// play() sets mSoloud before calling this.
+		if (mSoloud)
+			mSoloud->lockAudioMutex_internal();
+		mChannelHandle = 0;
+		mInstance = instance;
+		if (mSoloud)
+			mSoloud->unlockAudioMutex_internal();
+		return instance;
 	}
 
 	void Bus::findBusHandle()
@@ -273,15 +290,18 @@ namespace SoLoud
 
 		mFilter[aFilterId] = aFilter;
 
-		if (mInstance)
+		if (mSoloud)
 		{
 			mSoloud->lockAudioMutex_internal();
-			delete mInstance->mFilter[aFilterId];
-			mInstance->mFilter[aFilterId] = 0;
-		
-			if (aFilter)
+			if (mInstance)
 			{
-				mInstance->mFilter[aFilterId] = mFilter[aFilterId]->createInstance();
+				delete mInstance->mFilter[aFilterId];
+				mInstance->mFilter[aFilterId] = 0;
+			
+				if (aFilter)
+				{
+					mInstance->mFilter[aFilterId] = mFilter[aFilterId]->createInstance();
+				}
 			}
 			mSoloud->unlockAudioMutex_internal();
 		}
@@ -295,12 +315,15 @@ namespace SoLoud
 		mFilter[aToSlot] = mFilter[aFromSlot];
 		mFilter[aFromSlot] = 0;
 
-		if (mInstance)
+		if (mSoloud)
 		{
 			mSoloud->lockAudioMutex_internal();
-			delete mInstance->mFilter[aToSlot];
-			mInstance->mFilter[aToSlot] = mInstance->mFilter[aFromSlot];
-			mInstance->mFilter[aFromSlot] = 0;
+			if (mInstance)
+			{
+				delete mInstance->mFilter[aToSlot];
+				mInstance->mFilter[aToSlot] = mInstance->mFilter[aFromSlot];
+				mInstance->mFilter[aFromSlot] = 0;
+			}
 			mSoloud->unlockAudioMutex_internal();
 		}
 	}
@@ -315,26 +338,41 @@ namespace SoLoud
 
 	void Bus::setVisualizationEnable(bool aEnable)
 	{
+		// mInstance is cleared under the audio mutex when the voice is
+		// deleted, so it is only checked while the lock is held.
+		if (mSoloud)
+			mSoloud->lockAudioMutex_internal();
 		if (aEnable)
 		{
+			// Start from a clean slate so earlier captures aren't reported.
+			if (mInstance)
+				mInstance->clearVisualization();
 			mFlags |= AudioSource::VISUALIZATION_DATA;
 		}
 		else
 		{
 			mFlags &= ~AudioSource::VISUALIZATION_DATA;
 		}
+		if (mSoloud)
+			mSoloud->unlockAudioMutex_internal();
 	}
 		
 	float * Bus::calcFFT()
 	{
-		if (mInstance && mSoloud)
+		if (mSoloud)
 		{
-			mSoloud->lockAudioMutex_internal();
 			float temp[1024];
 			int i;
+			mSoloud->lockAudioMutex_internal();
+			if (!mInstance)
+			{
+				mSoloud->unlockAudioMutex_internal();
+				return mFFTData;
+			}
+			unsigned int pos = mInstance->mVisualizationWavePos;
 			for (i = 0; i < 256; i++)
 			{
-				temp[i*2] = mInstance->mVisualizationWaveData[i];
+				temp[i*2] = mInstance->mVisualizationWaveData[(pos + i) & 255];
 				temp[i*2+1] = 0;
 				temp[i+512] = 0;
 				temp[i+768] = 0;
@@ -356,12 +394,17 @@ namespace SoLoud
 
 	float * Bus::getWave()
 	{
-		if (mInstance && mSoloud)
+		if (mSoloud)
 		{
 			int i;
 			mSoloud->lockAudioMutex_internal();
-			for (i = 0; i < 256; i++)
-				mWaveData[i] = mInstance->mVisualizationWaveData[i];
+			if (mInstance)
+			{
+				// Unroll the ring, oldest frame first.
+				unsigned int pos = mInstance->mVisualizationWavePos;
+				for (i = 0; i < 256; i++)
+					mWaveData[i] = mInstance->mVisualizationWaveData[(pos + i) & 255];
+			}
 			mSoloud->unlockAudioMutex_internal();
 		}
 		return mWaveData;
@@ -369,16 +412,41 @@ namespace SoLoud
 
 	float Bus::getApproximateVolume(unsigned int aChannel)
 	{
-		if (aChannel > mChannels)
+		if (aChannel >= mChannels)
 			return 0;
 		float vol = 0;
-		if (mInstance && mSoloud)
+		if (mSoloud)
 		{
 			mSoloud->lockAudioMutex_internal();
-			vol = mInstance->mVisualizationChannelVolume[aChannel];
+			if (mInstance)
+				vol = mInstance->mVisualizationChannelVolume[aChannel];
 			mSoloud->unlockAudioMutex_internal();
 		}
 		return vol;
+	}
+
+	void Bus::getLevel(float *aRms, float *aPeak, unsigned long long *aFrames)
+	{
+		double sumSquares = 0;
+		float peak = 0;
+		unsigned long long frames = 0;
+		if (mSoloud)
+		{
+			mSoloud->lockAudioMutex_internal();
+			if (mInstance)
+			{
+				sumSquares = mInstance->mLevelSumSquares;
+				peak = mInstance->mLevelPeak;
+				frames = mInstance->mLevelFrames;
+				mInstance->mLevelSumSquares = 0;
+				mInstance->mLevelPeak = 0;
+				mInstance->mLevelFrames = 0;
+			}
+			mSoloud->unlockAudioMutex_internal();
+		}
+		*aRms = frames ? (float)sqrt(sumSquares / (double)frames) : 0;
+		*aPeak = peak;
+		*aFrames = frames;
 	}
 
 	unsigned int Bus::getActiveVoiceCount()
