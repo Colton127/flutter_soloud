@@ -2549,6 +2549,8 @@ PlayerErrors Player::play(
                     soloud.mVoice[ch]->mLoopStartFrame = loopingStartOffsetAt;
                 if (loopingEndOffsetAt >= 0)
                     soloud.mVoice[ch]->mLoopEndFrame = loopingEndOffsetAt;
+                // Not journaled: keep rollbacks from undoing it.
+                soloud.voiceStateChanged_internal(ch);
             }
             soloud.unlockAudioMutex_internal();
         }
@@ -3583,6 +3585,8 @@ PlayerErrors Player::play3d(
                     soloud.mVoice[ch]->mLoopStartFrame = loopingStartOffsetAt;
                 if (loopingEndOffsetAt >= 0)
                     soloud.mVoice[ch]->mLoopEndFrame = loopingEndOffsetAt;
+                // Not journaled: keep rollbacks from undoing it.
+                soloud.voiceStateChanged_internal(ch);
             }
             soloud.unlockAudioMutex_internal();
         }
