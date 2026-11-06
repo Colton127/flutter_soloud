@@ -67,17 +67,22 @@ namespace SoLoud
 		FOR_ALL_VOICES_POST
 	}
 
+	// ###### flutter_soloud local patch (non-blocking voice control) ######
+	// setPause, setPan and setVolume queue the change for the mixer instead
+	// of waiting for the audio mutex (see VoiceCommand in soloud.h). They
+	// apply it here, under the mutex, only when queueVoiceCommand_internal()
+	// hands the mutex back: the mutex was free and either the render-ahead
+	// ring is on or no mixer is running, or the queue is full.
+	// The per-voice body, retroactive placement included, is
+	// applyVoiceCommand_internal().
 	void Soloud::setPause(handle aVoiceHandle, bool aPause)
 	{
-		FOR_ALL_VOICES_PRE
-			// ###### flutter_soloud local patch (retroactive re-mix) ######
-			// Retroactive only for pausing; unpausing keeps legacy placement.
-			if (!aPause ||
-				!retroactiveParam_internal(ch, RetroJournalEntry::PARAM_PAUSE, 1.0f, 0, playheadTimeLocked_internal()))
-			{
-				setVoicePause_internal(ch, aPause);
-			}
-		FOR_ALL_VOICES_POST
+		if (queueVoiceCommand_internal(VoiceCommand::PAUSE, aVoiceHandle, aPause ? 1.0 : 0.0))
+			return;
+		FOR_ALL_VOICES_LOCKED_PRE
+			applyVoiceCommand_internal(VoiceCommand::PAUSE, ch, aPause ? 1.0 : 0.0);
+		FOR_ALL_VOICES_LOCKED_POST
+		unlockAudioMutex_internal();
 	}
 
 	result Soloud::setMaxActiveVoiceCount(unsigned int aVoiceCount)
@@ -140,14 +145,13 @@ namespace SoLoud
 
 	void Soloud::setPan(handle aVoiceHandle, float aPan)
 	{
-		FOR_ALL_VOICES_PRE
-			// ###### flutter_soloud local patch (retroactive re-mix) ######
-			if (!retroactiveParam_internal(ch, RetroJournalEntry::PARAM_PAN, aPan, 0, playheadTimeLocked_internal()))
-			{
-				mVoice[ch]->mPanFader.mActive = 0;
-				setVoicePan_internal(ch, aPan);
-			}
-		FOR_ALL_VOICES_POST
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		if (queueVoiceCommand_internal(VoiceCommand::PAN, aVoiceHandle, aPan))
+			return;
+		FOR_ALL_VOICES_LOCKED_PRE
+			applyVoiceCommand_internal(VoiceCommand::PAN, ch, aPan);
+		FOR_ALL_VOICES_LOCKED_POST
+		unlockAudioMutex_internal();
 	}
 
 	void Soloud::setChannelVolume(handle aVoiceHandle, unsigned int aChannel, float aVolume)
@@ -263,14 +267,13 @@ namespace SoLoud
 
 	void Soloud::setVolume(handle aVoiceHandle, float aVolume)
 	{
-		FOR_ALL_VOICES_PRE
-			// ###### flutter_soloud local patch (retroactive re-mix) ######
-			if (!retroactiveParam_internal(ch, RetroJournalEntry::PARAM_VOLUME, aVolume, 0, playheadTimeLocked_internal()))
-			{
-				mVoice[ch]->mVolumeFader.mActive = 0;
-				setVoiceVolume_internal(ch, aVolume);
-			}
-		FOR_ALL_VOICES_POST
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		if (queueVoiceCommand_internal(VoiceCommand::VOLUME, aVoiceHandle, aVolume))
+			return;
+		FOR_ALL_VOICES_LOCKED_PRE
+			applyVoiceCommand_internal(VoiceCommand::VOLUME, ch, aVolume);
+		FOR_ALL_VOICES_LOCKED_POST
+		unlockAudioMutex_internal();
 	}
 
 	void Soloud::setDelaySamples(handle aVoiceHandle, unsigned int aSamples)

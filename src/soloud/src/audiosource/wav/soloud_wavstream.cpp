@@ -167,6 +167,12 @@ namespace SoLoud
 						delete mFile;
 					mFile = 0;
 				}
+				// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+				// Seek through the source's table (see WavStream::loadmp3).
+				else if (mParent->mMp3SeekPoints)
+				{
+					drmp3_bind_seek_table(mCodec.mMp3, mParent->mMp3SeekPointCount, mParent->mMp3SeekPoints);
+				}
 			}
 			else
 			{
@@ -314,6 +320,79 @@ namespace SoLoud
 		return aSamplesToRead;
 	}
 
+	// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+	// Decodes and drops aFrames PCM frames. Returns how many it decoded.
+	static drmp3_uint64 mp3Skip(drmp3 *aMp3, drmp3_uint64 aFrames)
+	{
+		float tmp[512 * 2]; // MP3 has at most two channels
+		drmp3_uint64 done = 0;
+		while (done < aFrames)
+		{
+			drmp3_uint64 n = aFrames - done > 512 ? 512 : aFrames - done;
+			drmp3_uint64 got = drmp3_read_pcm_frames_f32(aMp3, n, tmp);
+			done += got;
+			if (got < n)
+				break;
+		}
+		return done;
+	}
+
+	// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+	// Seeks to PCM frame aFrame (counted from the start of the stream, encoder
+	// delay included) through the bound seek table, sample exact. dr_mp3's own
+	// table seek is not: it restarts the decoder at a seek point and drops,
+	// without counting them, the first MP3 frames whose bit reservoir is gone,
+	// so it lands a frame or two late and the voice never reaches its end.
+	// Instead jump to a seek point well before the target, decode on to the
+	// byte offset of the seek point serving the target, whose frame index the
+	// table gives, set the frame count there and decode on to the target. A
+	// target at or past the end of the stream leaves the decoder at the end.
+	// Returns false if the target is too close to the start for this or the
+	// stream does not line up with the table.
+	static bool mp3SeekThroughTable(drmp3 *aMp3, drmp3_uint64 aFrame)
+	{
+		const drmp3_uint64 lead = 16 * 1152; // dropped frames and decoder warm-up
+		drmp3_seek_point *points = aMp3->pSeekPoints;
+		drmp3_uint32 i = 0;
+		while (i + 1 < aMp3->seekPointCount && points[i + 1].pcmFrameIndex <= aFrame)
+			i++;
+		// The MP3 frame at points[i].seekPosInBytes is the first of the
+		// mp3FramesToDiscard frames before the one holding
+		// points[i].pcmFrameIndex; the last of them starts at PCM frame next.
+		// That count is DRMP3_SEEK_LEADING_MP3_FRAMES (2 by default) as the
+		// table was built with; the macro itself is only defined where dr_mp3's
+		// implementation is compiled, so read it from the table.
+		drmp3_uint64 next = points[i].pcmFrameIndex - points[i].pcmFramesToDiscard;
+		if (aFrame < points[0].pcmFrameIndex || next < points[0].pcmFrameIndex + lead)
+			return false;
+		if (!drmp3_seek_to_pcm_frame(aMp3, next - lead))
+			return false;
+		for (;;)
+		{
+			drmp3_uint64 left = aMp3->pcmFramesRemainingInMP3Frame;
+			if (mp3Skip(aMp3, left) != left)
+				return false;
+			drmp3_uint64 at = aMp3->streamCursor - aMp3->dataSize;
+			if (at == points[i].seekPosInBytes)
+				break;
+			if (at > points[i].seekPosInBytes || mp3Skip(aMp3, 1) != 1)
+				return false;
+		}
+		// Decode the leading frames up to the one starting at next.
+		for (drmp3_uint32 k = 1; k < points[i].mp3FramesToDiscard; k++)
+		{
+			drmp3_uint64 left = aMp3->pcmFramesRemainingInMP3Frame;
+			if (mp3Skip(aMp3, left) != left || mp3Skip(aMp3, 1) != 1)
+				return false;
+		}
+		aMp3->currentPCMFrame = next - aMp3->pcmFramesRemainingInMP3Frame;
+		// The frame count is in sync now, so this comes up short only when the
+		// decoder runs out of frames: the target is at or past the end, and the
+		// decoder is at the end, as decoding from the start would leave it.
+		mp3Skip(aMp3, aFrame - aMp3->currentPCMFrame);
+		return true;
+	}
+
 	result WavStreamInstance::seek(double aSeconds, float *mScratch, unsigned int mScratchSize)
 	{
 		if (mCodec.mOgg)
@@ -338,13 +417,24 @@ namespace SoLoud
 				mStreamPosition = float(pos / mBaseSamplerate);
 				return 0;
 			case WAVSTREAM_MP3:
-				// When using TYPE_WAVSTREAM for mp3 and seeking backward,
-				// dr_mp3.h uses `drmp3_seek_to_pcm_frame__brute_force()` function which
-				// move to the start of the stream and then move forward to [time]. This
-				// implies some lag and queue subsequent seeks request if the previous seek is not yet
-				// complete (especially when using a slider) impacting the main UI thread.
-				// To have no lags, please use TYPE_WAV instead if possible!
-				drmp3_seek_to_pcm_frame(mCodec.mMp3, pos);
+				// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+				// Without a seek table dr_mp3 seeks backward by decoding from the
+				// start of the stream, here under the audio mutex, so on a long
+				// file every voice stalls. With the source's table bound, decode
+				// from a seek point near the target instead. pos counts output
+				// frames, the table counts from the start of the stream with the
+				// encoder delay included.
+				if (!mCodec.mMp3->pSeekPoints)
+				{
+					drmp3_seek_to_pcm_frame(mCodec.mMp3, pos);
+				}
+				else if (!mp3SeekThroughTable(mCodec.mMp3, (drmp3_uint64)pos + mCodec.mMp3->delayInPCMFrames))
+				{
+					// Near the start, or the stream did not line up with the
+					// table: decode from the start of the stream.
+					drmp3_seek_to_pcm_frame(mCodec.mMp3, 0);
+					mp3Skip(mCodec.mMp3, pos);
+				}
 				mOffset = pos;
 				mStreamPosition = float(pos / mBaseSamplerate);
 				return 0;
@@ -426,6 +516,9 @@ namespace SoLoud
 		mFiletype = WAVSTREAM_WAV;
 		mMemFile = 0;
 		mStreamFile = 0;
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		mMp3SeekPoints = 0;
+		mMp3SeekPointCount = 0;
 	}
 	
 	WavStream::~WavStream()
@@ -433,8 +526,24 @@ namespace SoLoud
 		stop();
 		delete[] mFilename;
 		delete mMemFile;
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		delete[] mMp3SeekPoints;
 	}
 	
+	// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+	// Instances bind the seek table, so stop them before freeing it (as the
+	// destructor does) instead of leaving them pointing at freed memory.
+	void WavStream::freeMp3SeekTable()
+	{
+		if (mMp3SeekPoints)
+		{
+			stop();
+			delete[] mMp3SeekPoints;
+			mMp3SeekPoints = 0;
+			mMp3SeekPointCount = 0;
+		}
+	}
+
 #define MAKEDWORD(a,b,c,d) (((d) << 24) | ((c) << 16) | ((b) << 8) | (a))
 
 	result WavStream::loadwav(File * fp)
@@ -526,6 +635,25 @@ namespace SoLoud
 		mBaseSamplerate = (float)decoder.sampleRate;
 		mSampleCount = (unsigned int)samples;
 		mFiletype = WAVSTREAM_MP3;
+
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		// Build the seek table once per source, here on the loading thread
+		// rather than under the audio mutex, for every instance to bind (see
+		// mp3SeekThroughTable). It costs two header-only passes over the file
+		// and at most 4096 points (96 KiB). Points hold byte offsets and frame
+		// indices from the start of the file, so they suit any decoder reading
+		// the same bytes. With no table, seeks work as before.
+		freeMp3SeekTable();
+		drmp3_uint32 count = 4096;
+		drmp3_seek_point *points = new drmp3_seek_point[count];
+		if (drmp3_calculate_seek_points(&decoder, &count, points) && count > 0)
+		{
+			mMp3SeekPoints = new drmp3_seek_point[count];
+			memcpy(mMp3SeekPoints, points, count * sizeof(drmp3_seek_point));
+			mMp3SeekPointCount = count;
+		}
+		delete[] points;
+
 		drmp3_uninit(&decoder);
 
 		return SO_NO_ERROR;
@@ -533,6 +661,8 @@ namespace SoLoud
 
 	result WavStream::load(const char *aFilename)
 	{
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		freeMp3SeekTable();
 		delete[] mFilename;
 		delete mMemFile;
 		mMemFile = 0;
@@ -562,6 +692,8 @@ namespace SoLoud
 
 	result WavStream::loadMem(const unsigned char *aData, unsigned int aDataLen, bool aCopy, bool aTakeOwnership)
 	{
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		freeMp3SeekTable();
 		delete[] mFilename;
 		delete mMemFile;
 		mStreamFile = 0;
@@ -606,6 +738,8 @@ namespace SoLoud
 
 	result WavStream::loadFile(File *aFile)
 	{
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		freeMp3SeekTable();
 		delete[] mFilename;
 		delete mMemFile;
 		mStreamFile = 0;
@@ -627,6 +761,8 @@ namespace SoLoud
 
 	result WavStream::loadFileToMem(File *aFile)
 	{
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		freeMp3SeekTable();
 		delete[] mFilename;
 		delete mMemFile;
 		mStreamFile = 0;
