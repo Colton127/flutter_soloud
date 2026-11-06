@@ -681,6 +681,19 @@ interface class SoLoud {
       }
     }
 
+    // Android only: tell the plugin this isolate uses the native library, so
+    // its engine-teardown hooks never skip the claim and the callbacks about
+    // to be created. Sent here: isInited() above has loaded the library, so
+    // the plugin's later load is a refcount bump, and nothing that a teardown
+    // must undo exists yet. Once acknowledged on this isolate it is not sent
+    // again, and off Android it never is, so neither suspends here.
+    if (_controller.soLoudFFI.needsNativeLibraryInUseSignal) {
+      await _controller.soLoudFFI.markNativeLibraryInUse();
+      if (initializationGeneration != _lifecycleGeneration) {
+        await _waitForInitializationTeardownAndThrow();
+      }
+    }
+
     // Claims the native engine for this FlutterEngine before the device open is
     // dispatched. Only iOS has to go through the platform to do it, and only
     // there does this become a suspension point -- everywhere else the claim is

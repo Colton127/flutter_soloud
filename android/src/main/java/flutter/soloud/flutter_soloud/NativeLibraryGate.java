@@ -19,8 +19,36 @@ package flutter.soloud.flutter_soloud;
  *       load on the platform thread only to learn that, so it is skipped.
  * </ul>
  *
+ * <p>Two signals tell the cases apart, and only the second can ever skip a
+ * hook:
+ *
+ * <ul>
+ *   <li>{@link #markInUse}: Dart says so. Before it creates any state a
+ *       teardown has to undo -- the engine claim, the callback registration --
+ *       a Dart isolate on Android tells the plugin over the engine-local
+ *       {@code flutter_soloud/engine_lifecycle} channel, after its own first
+ *       native call has loaded the library. From then on every hook loads and
+ *       calls in without asking the {@link Probe}. The signal is sticky and
+ *       process-wide: the native state outlives the isolate and the
+ *       FlutterEngine that created it, so nothing short of the process ending
+ *       makes skipping safe again.
+ *   <li>The {@link Probe}: the library says so, with a marker it leaves in
+ *       /proc/self/maps when it is loaded. It covers an isolate that could not
+ *       send the signal: one with no Flutter messaging, or one whose engine
+ *       does not have the plugin registered.
+ * </ul>
+ *
+ * <p>The marker alone is not enough because publishing it can fail. It takes
+ * an {@code mmap} and a {@code prctl}, and either can fail (out of memory, a
+ * process at {@code vm.max_map_count}) while the library loads all the same:
+ * the library cannot refuse to load over its marker. An unmarked library
+ * looks exactly like an absent one, and a hook skipped on that answer leaves
+ * the engine claim and the Dart callbacks of a destroyed FlutterEngine behind.
+ * Native code retries the marker at the points where Dart creates that state,
+ * but a retry can fail too. The Dart signal depends on none of that.
+ *
  * <p>Skipping reports "not loaded" without caching it: Dart can still load the
- * library later (before the next hook), and the next hook probes again.
+ * library later (before the next hook), and the next hook asks again.
  * Loading successfully is cached for good: ART keeps every library it loads
  * for the lifetime of the class loader.
  *
@@ -36,7 +64,8 @@ final class NativeLibraryGate {
          * thread and must never load the library itself.
          *
          * <p>A false answer is what allows a hook to be skipped, so it must
-         * mean "definitely not loaded".
+         * mean "definitely not loaded". Only asked until Dart has called
+         * {@link #markInUse}.
          */
         boolean mayBeLoaded();
     }
@@ -53,20 +82,39 @@ final class NativeLibraryGate {
     /** Guarded by this. */
     private boolean loaded = false;
 
+    /** Set by {@link #markInUse}, never cleared. Guarded by this. */
+    private boolean inUse = false;
+
     NativeLibraryGate(Probe probe, Loader loader) {
         this.probe = probe;
         this.loader = loader;
     }
 
     /**
-     * Returns true when the library is loaded and its JNI entry points may be
-     * called. Loads it from Java only when the probe says something in the
-     * process already has, so this never performs a real load.
+     * Records that Dart in this process uses the library, so that from now on
+     * no hook skips its native call, whatever the {@link Probe} says.
      *
-     * <p>Returns false, without loading anything, when the library is
-     * definitely not in the process -- the caller then has nothing to do --
-     * or when the load fails. Neither is cached, so a later hook tries again.
-     * Never throws.
+     * <p>Dart sends this before it creates any state a teardown has to undo,
+     * and after its own first native call has loaded the library, so a later
+     * {@link #loadIfAlreadyInProcess} is still only a refcount bump.
+     *
+     * <p>Pure bookkeeping: it loads nothing, so it is safe on the platform
+     * thread at any time. Idempotent, and never undone.
+     */
+    synchronized void markInUse() {
+        inUse = true;
+    }
+
+    /**
+     * Returns true when the library is loaded and its JNI entry points may be
+     * called. Loads it from Java only when Dart has said it uses the library
+     * ({@link #markInUse}) or the probe says something in the process already
+     * has it, so this never performs a real load.
+     *
+     * <p>Returns false, without loading anything, when Dart has not said so
+     * and the library is definitely not in the process -- the caller then has
+     * nothing to do -- or when the load fails. Neither is cached, so a later
+     * hook tries again. Never throws.
      */
     synchronized boolean loadIfAlreadyInProcess() {
         if (loaded) {
@@ -74,13 +122,21 @@ final class NativeLibraryGate {
         }
 
         boolean mayBeLoaded;
-        try {
-            mayBeLoaded = probe.mayBeLoaded();
-        } catch (Throwable error) {
-            // A probe that cannot answer must not turn into "not loaded": that
-            // is the answer that skips a teardown. Fall back to loading, which
-            // is what the plugin always did before it had a probe.
+        if (inUse) {
+            // Dart has created native state, or is about to. All the probe
+            // could add is a wrong "absent" from a marker that failed to
+            // publish, so it is not asked.
             mayBeLoaded = true;
+        } else {
+            try {
+                mayBeLoaded = probe.mayBeLoaded();
+            } catch (Throwable error) {
+                // A probe that cannot answer must not turn into "not loaded":
+                // that is the answer that skips a teardown. Fall back to
+                // loading, which is what the plugin always did before it had
+                // a probe.
+                mayBeLoaded = true;
+            }
         }
 
         if (!mayBeLoaded) {

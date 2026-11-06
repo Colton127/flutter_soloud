@@ -17,6 +17,18 @@ import java.nio.charset.StandardCharsets;
  * exported function can run, so the marker exists before Dart can have created
  * any native state that a teardown would act on.
  *
+ * <p>This is the fallback of the two signals {@link NativeLibraryGate} uses,
+ * and it is not asked once Dart has told the plugin it uses the library. It
+ * cannot be the only one, because publishing the marker can fail: the
+ * {@code mmap} or the {@code prctl} can fail (out of memory, a process at
+ * {@code vm.max_map_count}), and the library is loaded anyway, unmarked. Then
+ * this reports {@link Result#ABSENT} for a library that is in the process.
+ * Native code retries publishing at the two points where Dart creates the
+ * state a teardown undoes (the engine claim and the callback registration),
+ * which covers an isolate that cannot send the Dart signal, but a retry can
+ * fail too. So PRESENT is reliable, while ABSENT means "not loaded, or loaded
+ * but unmarked".
+ *
  * <p>Why a marker and not the library's own mapping: with the default
  * packaging (uncompressed libraries, {@code extractNativeLibs=false}) the
  * linker maps the library straight out of the APK, so its segments are listed
@@ -36,7 +48,12 @@ final class ProcessMapsProbe implements NativeLibraryGate.Probe {
     enum Result {
         /** The marker is mapped: the library is loaded. */
         PRESENT,
-        /** The kernel names anonymous mappings, and the marker is not among them. */
+        /**
+         * The kernel names anonymous mappings, and the marker is not among
+         * them: the library is not loaded, or it is loaded but its marker
+         * failed to publish. The gate only acts on it while Dart has not said
+         * it uses the library.
+         */
         ABSENT,
         /**
          * No anonymous mapping is named at all, so this kernel cannot name
