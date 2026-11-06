@@ -44,6 +44,9 @@
 
 #if defined(__ANDROID__)
 #include <jni.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 #endif
 
 // Defined below with the other C-linkage globals. Declared here so the engine
@@ -1883,6 +1886,36 @@ extern "C"
 #endif
 
 #if defined(__ANDROID__)
+  /// Leaves a marker FlutterSoloudPlugin can find in /proc/self/maps, so Java
+  /// can tell this library is already loaded without loading it. The name
+  /// must match ProcessMapsProbe.MARKER_NAME.
+  ///
+  /// This runs inside dlopen() -- whether Dart's first @Native call or
+  /// System.loadLibrary caused it -- before any exported function can run, so
+  /// the marker is in place before Dart can create native state that an
+  /// engine teardown would have to undo.
+  ///
+  /// A named mapping, not an environment variable: setenv() here would race
+  /// every other thread's getenv()/setenv(), since bionic's environment has no
+  /// lock and this runs on whichever Dart thread first calls in. The kernel
+  /// serializes the name against readers of /proc/self/maps.
+  ///
+  /// One PROT_NONE page: address space only, never touched and never unmapped.
+  /// A marker that outlived the library would only cost the plugin a load,
+  /// never a skipped teardown. The name is a string literal because older
+  /// Android kernels keep a pointer to it rather than a copy.
+  __attribute__((constructor)) static void publishLoadedMarker()
+  {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *marker = mmap(nullptr, page, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (marker == MAP_FAILED)
+      return;
+    if (prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, marker, page,
+              "flutter_soloud_plugin") != 0)
+      munmap(marker, page);
+  }
+
   /// JNI entry points for FlutterSoloudPlugin. The names must match
   /// `flutter.soloud.flutter_soloud.FlutterSoloudPlugin` exactly (an underscore
   /// in a package or class name is escaped as `_1`); verify them with
