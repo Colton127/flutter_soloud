@@ -93,7 +93,9 @@ namespace
   /// Lock ordering: this is a leaf, like the Dart callback gate, and the two
   /// are never held together. It is never held across a device operation, a
   /// thread join, or any other blocking work. The rest of the file nests as
-  /// `init_deinit_mutex -> loadMutex -> dart callback gate`.
+  /// `init_deinit_mutex -> loadMutex -> dart callback gate`, with the Player
+  /// pin (player_pin_mutex, see PlayerPin) a leaf that teardown waits on while
+  /// holding the first two.
   /// Serializes mixer-capture lifecycle transitions: MixerOutput::start() and
   /// stop() share buffers, encoder/queue unique_ptrs and two std::thread
   /// objects, and guard themselves with nothing but an atomic `m_running` flag
@@ -211,7 +213,16 @@ extern "C"
 {
 #endif
 
-  /// mutex to lock the init and dispose methods.
+  /// Serializes engine initialization and teardown, and pins the global
+  /// `player` for the exports that still take it to read Player state.
+  ///
+  /// It is held across blocking device work by exactly three callers:
+  /// initEngine() (the device open), dispose()/the teardown worker (which also
+  /// wait out pinned operations, join the lifecycle scheduler and close the
+  /// device) and setLinuxAudioBackend() (a backend switch). The explicit device
+  /// operations -- startAudioDevice(), stopAudioDevice(), changeDevice() -- and
+  /// the sound disposal exports do NOT take it; they pin the Player with a
+  /// PlayerPin instead, so nothing that waits for this mutex waits for them.
   std::mutex init_deinit_mutex;
 
   /// Set by Dart as soon as a shutdown is requested, so worker scheduling
@@ -221,8 +232,12 @@ extern "C"
   /// Lock-free readiness publication for UI-side isInitialized queries.
   std::atomic<bool> engine_initialized{false};
 
-  /// mutex to lock the loading audio methods and make safe operations on
-  /// player.sounds list.
+  /// Serializes the exports that add sounds to the Player (so a hash's
+  /// uniqueness check and its registration are not interleaved with another
+  /// registration) against each other and against init/teardown. Always taken
+  /// after init_deinit_mutex. Removing sounds does not take it:
+  /// disposeSound()/disposeAllSound() rely on Player's own sounds_mutex and a
+  /// PlayerPin, because initEngine() and teardown hold this across device work.
   std::mutex loadMutex;
 
 #if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
@@ -234,6 +249,127 @@ extern "C"
   [[clang::no_destroy]]
 #endif
   std::unique_ptr<Player> player = std::make_unique<Player>();
+
+  /// Pins the global `player` for exports that must not be serialized behind
+  /// init_deinit_mutex: the explicit device operations, whose backend call can
+  /// block for tens of seconds (a device rebuild has been seen to take 46 s),
+  /// and disposeSound()/disposeAllSound(), which Dart calls synchronously on
+  /// the UI thread -- on Android a wait there is an ANR.
+  ///
+  /// A pin keeps the Player it captured alive and installed: disposeLocked()
+  /// waits for every pin to be released before it disposes, destroys or
+  /// replaces that Player (see PlayerPinExclusion). It excludes nothing else,
+  /// so a pinned device operation no longer makes a sound operation -- or any
+  /// other caller of init_deinit_mutex -- wait for the device.
+  ///
+  /// There are two kinds because teardown drains them in two steps:
+  ///   * device pins last as long as a backend call. Teardown refuses new ones
+  ///     and waits for the ones in flight first. It is not touching the Player
+  ///     yet, so sound operations keep running normally meanwhile.
+  ///   * sound pins never wait on device work (see disposeSound()), so they
+  ///     are short. Teardown refuses new ones only once the device pins have
+  ///     drained and it is about to dispose the Player, then waits out the
+  ///     ones in flight.
+  /// A refused pin means teardown already owns the Player: the caller returns
+  /// without touching it, which is the state it would find after the teardown.
+  ///
+  /// initEngine() needs no exclusion: it never destroys or replaces a Player
+  /// (it installs one only where `player` is null, which no pin can hold), and
+  /// every pinned operation re-checks Player::isInited() itself.
+  ///
+  /// Lock ordering: player_pin_mutex is a leaf, held only to read `player` and
+  /// update the counters below. A pin holder must never take
+  /// init_deinit_mutex or loadMutex -- teardown waits for pins while holding
+  /// both -- nor wait for a teardown to finish.
+  enum class PlayerPinKind
+  {
+    device,
+    sound,
+  };
+
+  static std::mutex player_pin_mutex;
+  static std::condition_variable player_pin_released;
+  // Guarded by player_pin_mutex.
+  static int player_device_pins = 0;
+  static int player_sound_pins = 0;
+  static bool player_device_pins_refused = false;
+  static bool player_sound_pins_refused = false;
+
+  class PlayerPin
+  {
+  public:
+    explicit PlayerPin(PlayerPinKind kind) : mKind(kind)
+    {
+      std::lock_guard<std::mutex> guard(player_pin_mutex);
+      const bool refused = kind == PlayerPinKind::device
+                               ? player_device_pins_refused
+                               : player_sound_pins_refused;
+      if (refused || player.get() == nullptr)
+        return;
+      mPlayer = player.get();
+      ++count(kind);
+    }
+
+    ~PlayerPin()
+    {
+      if (mPlayer == nullptr)
+        return;
+      {
+        std::lock_guard<std::mutex> guard(player_pin_mutex);
+        --count(mKind);
+      }
+      player_pin_released.notify_all();
+    }
+
+    PlayerPin(const PlayerPin &) = delete;
+    PlayerPin &operator=(const PlayerPin &) = delete;
+
+    /// The pinned Player, or nullptr when there is none or teardown refused
+    /// the pin.
+    Player *get() const { return mPlayer; }
+
+  private:
+    static int &count(PlayerPinKind kind)
+    {
+      return kind == PlayerPinKind::device ? player_device_pins
+                                           : player_sound_pins;
+    }
+
+    const PlayerPinKind mKind;
+    Player *mPlayer = nullptr;
+  };
+
+  /// Held by disposeLocked() for as long as it may dispose, destroy or replace
+  /// the Player. Constructing it refuses new device pins and waits out the
+  /// in-flight ones, then does the same for sound pins; destroying it accepts
+  /// pins again, against whichever Player is installed by then.
+  ///
+  /// Only ever constructed with init_deinit_mutex held, so there is never more
+  /// than one.
+  class PlayerPinExclusion
+  {
+  public:
+    PlayerPinExclusion()
+    {
+      std::unique_lock<std::mutex> lock(player_pin_mutex);
+      player_device_pins_refused = true;
+      player_pin_released.wait(lock, []
+                               { return player_device_pins == 0; });
+      player_sound_pins_refused = true;
+      player_pin_released.wait(lock, []
+                               { return player_sound_pins == 0; });
+    }
+
+    ~PlayerPinExclusion()
+    {
+      std::lock_guard<std::mutex> guard(player_pin_mutex);
+      player_device_pins_refused = false;
+      player_sound_pins_refused = false;
+    }
+
+    PlayerPinExclusion(const PlayerPinExclusion &) = delete;
+    PlayerPinExclusion &operator=(const PlayerPinExclusion &) = delete;
+  };
 
   typedef void (*dartVoiceEndedCallback_t)(unsigned int *);
   typedef void (*dartFileLoadedCallback_t)(enum PlayerErrors *, char *completeFileName, unsigned int *, uint64_t *counter);
@@ -1136,7 +1272,14 @@ extern "C"
     }
 
     if (player.get() == nullptr)
-      player = std::make_unique<Player>();
+    {
+      // Published under player_pin_mutex, which is what PlayerPin reads
+      // `player` under: pins are not excluded here (see PlayerPin), and with
+      // `player` null none can be holding one.
+      std::unique_ptr<Player> created = std::make_unique<Player>();
+      std::lock_guard<std::mutex> pinGuard(player_pin_mutex);
+      player = std::move(created);
+    }
 
     player.get()->setStateChangedCallback(stateChangedCallback);
     PlayerErrors res = (PlayerErrors)player.get()->init(
@@ -1336,25 +1479,35 @@ extern "C"
   /// Stop the audio output device without deinitializing the engine. By default
   /// this is a successful no-op while voices are active. [force] stops the
   /// device even during active playback without mutating any voice.
+  ///
+  /// Pinned with a device PlayerPin rather than init_deinit_mutex, exactly as
+  /// changeDevice() is -- see there for why and for the lock order. A pin
+  /// refused because teardown has begun reports backendNotInited.
   FFI_PLUGIN_EXPORT enum PlayerErrors stopAudioDevice(unsigned int force)
   {
-    std::lock_guard<std::mutex> guard(init_deinit_mutex);
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::device);
+    if (pin.get() == nullptr)
       return backendNotInited;
 
-    return player.get()->stopAudioDevice(force != 0);
+    SOLOUD_TEST_BARRIER(stopAudioDeviceEntered);
+
+    return pin.get()->stopAudioDevice(force != 0);
   }
 
   /// Restart the audio output device previously stopped by stopAudioDevice(),
   /// so existing voices and loaded sounds keep operating. Idempotent: a no-op
   /// if the device is already started.
+  ///
+  /// Pinned like stopAudioDevice().
   FFI_PLUGIN_EXPORT enum PlayerErrors startAudioDevice()
   {
-    std::lock_guard<std::mutex> guard(init_deinit_mutex);
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::device);
+    if (pin.get() == nullptr)
       return backendNotInited;
 
-    return player.get()->startAudioDevice();
+    SOLOUD_TEST_BARRIER(startAudioDeviceEntered);
+
+    return pin.get()->startAudioDevice();
   }
 
   /// Get the current state of the audio output device. Returns
@@ -1435,18 +1588,22 @@ extern "C"
     // window is wide on this path because device enumeration deliberately
     // happens before Player::mDeviceLifecycleOperationMutex is taken.
     //
-    // Holding init_deinit_mutex across enumeration and device replacement is
-    // affordable only because Dart runs changeDevice() on a worker isolate, so
-    // the blocking is never on Flutter's UI isolate.
+    // The pin is a device PlayerPin, not init_deinit_mutex. Holding that mutex
+    // across enumeration and device replacement made every other caller of it
+    // wait for the device, and through the sound exports that took it, the UI
+    // thread too. A pin only holds off teardown, which waits for it; a pin
+    // refused because teardown has begun reports backendNotInited.
     //
-    // Lock order. init_deinit_mutex is strictly outermost -- no Player member
-    // function acquires it -- and below that it is a partial order, not a
+    // Lock order. The pin is not a lock: it is taken first and held throughout,
+    // and teardown waits for it while holding init_deinit_mutex and loadMutex,
+    // so nothing below may take either. Below it is a partial order, not a
     // chain:
     //
-    //   init_deinit_mutex
-    //     -> Player::mDeviceLifecycleOperationMutex
-    //          -> Player::mInterruptionMutex -> Player::mPauseMutex
-    //          -> SoLoud::gDeviceOperationMutex        (backend device call)
+    //   Player::mDeviceLifecycleOperationMutex
+    //     -> Player::mInterruptionMutex -> Player::mPauseMutex
+    //     -> SoLoud::gDeviceOperationMutex        (backend device call)
+    //          -> the backend's own: notification-gate drain, AAudio reroute
+    //             hold, miniaudio's per-device locks
     //
     //   SoLoud::gDeviceOperationMutex
     //     -> Player::mInterruptionMutex -> Player::mPauseMutex
@@ -1454,16 +1611,24 @@ extern "C"
     //           inline from a backend device call)
     //
     // gDeviceOperationMutex and mInterruptionMutex are therefore both reachable
-    // from the operation mutex, but never in opposite orders: no Player mutex
-    // is ever held across a backend device call. mPauseMutex is a leaf --
-    // nothing blocking runs under it.
-    std::lock_guard<std::mutex> guard(init_deinit_mutex);
-    if (player.get() == nullptr)
+    // from the operation mutex, but never in opposite orders: neither
+    // mInterruptionMutex nor mPauseMutex is ever held across a backend device
+    // call. mPauseMutex is a leaf -- nothing blocking runs under it.
+    //
+    // The sound exports stay off all of this. disposeSound() and
+    // disposeAllSound() take Player::sounds_mutex -> SoLoud's audio mutex, and
+    // post idle work through mInterruptionMutex -> mPauseMutex. None of those is
+    // held across a backend device call -- the audio mutex included, which
+    // miniaudio_changeDevice_impl() and Soloud::deinit() deliberately release
+    // before stopping or uninitializing the device -- so a sound operation
+    // never waits for this one.
+    const PlayerPin pin(PlayerPinKind::device);
+    if (pin.get() == nullptr)
       return backendNotInited;
 
     SOLOUD_TEST_BARRIER(changeDeviceEntered);
 
-    return player.get()->changeDevice(deviceID);
+    return pin.get()->changeDevice(deviceID);
   }
 
   /// Free the list of playback devices.
@@ -1481,6 +1646,15 @@ extern "C"
 
   /// Teardown body. The caller must hold init_deinit_mutex and loadMutex.
   ///
+  /// It first waits out every pinned operation (see PlayerPin): in-flight
+  /// device operations, then in-flight sound operations. Holding
+  /// init_deinit_mutex no longer excludes the device operations, so this wait
+  /// is what keeps a device change from running inside a Player that teardown
+  /// is destroying. While it waits for a device operation, sound operations
+  /// still run normally against the live Player; once it moves on, they are
+  /// refused and return at once, and the Player::dispose() below destroys
+  /// every sound.
+  ///
   /// [ownedClaim] is the claim this teardown is entitled to retire, or nullptr
   /// for an unscoped teardown that retires whatever claim is current. A scoped
   /// caller must not strip a claim that has moved on: doing so would leave the
@@ -1491,6 +1665,12 @@ extern "C"
     // An in-flight init may have published readiness before releasing the
     // lifecycle lock. Reassert shutdown after acquiring it.
     engine_initialized.store(false, std::memory_order_release);
+
+    // Taken before anything is torn down, so teardown still starts only once
+    // the device operation in flight has finished -- the order it had when
+    // that operation held init_deinit_mutex. Held to the end: the Player must
+    // not be pinned again until its replacement is installed.
+    const PlayerPinExclusion pinExclusion;
 
     // Make every callable inert first, waiting out any invocation currently
     // executing. The gate is not retained past this point: what follows stops
@@ -1515,11 +1695,11 @@ extern "C"
 
     clearPlayerDartCallbackRegistrationsLocked();
     // Deliberately NOT disposeAllSound(): that is a runtime operation which
-    // honours the configured idle policy, so with an indefinite keep-alive it
-    // ends by queueing a device *start*. Running it here would have teardown
-    // ask the scheduler to start the device microseconds before joining that
-    // same scheduler -- an entirely pointless ma_device_start() that deinit()
-    // then has to wait out, on exactly the backends where starting is slow.
+    // leaves the device to the configured idle policy and posts work to the
+    // lifecycle scheduler for it. Teardown is about to join that scheduler and
+    // close the device, and any device work it queued first (with an
+    // indefinite keep-alive, a pointless ma_device_start()) is work deinit()
+    // then has to wait out, on exactly the backends where it is slow.
     // Player::dispose() destroys the sounds itself, as the sole owner of native
     // sound destruction during teardown.
     player.get()->dispose();
@@ -1686,6 +1866,13 @@ extern "C"
 
         // A replacement engine claimed the native engine while this worker was
         // waiting for the mutex. Its engine is live and must not be torn down.
+        //
+        // disposeLocked() can still wait for an in-flight device operation
+        // after this check, and a replacement can claim meanwhile. The Player
+        // it then disposes is still this engine's: the replacement's
+        // initEngine() needs the mutex held here, and its Dart side registers
+        // callbacks only after that returns. The claim itself is released only
+        // if it is still this one.
         if (!engineLifecycleClaimIsCurrent(claim))
           return;
 
@@ -1777,6 +1964,9 @@ extern "C"
   /// so this is what proves the generation gate covers them.
   ///
   /// Returns false when [hash] names no buffer-backed sound.
+  ///
+  /// loadMutex keeps teardown off the Player, but no longer keeps
+  /// disposeSound() off the sound: a test must not dispose [hash] concurrently.
   FFI_PLUGIN_EXPORT bool soloudTestInvokeStreamCallbacks(unsigned int hash)
   {
     std::lock_guard<std::mutex> guard_load(loadMutex);
@@ -1883,6 +2073,37 @@ extern "C"
     std::lock_guard<std::mutex> guard(init_deinit_mutex);
     return (player.get() != nullptr && player.get()->isInited()) ? 1 : 0;
   }
+
+  /// Which pins teardown is refusing right now (see PlayerPin): bit 0 device
+  /// pins, bit 1 sound pins. Lets a test tell that a teardown has reached its
+  /// drain without sleeping and hoping.
+  FFI_PLUGIN_EXPORT int soloudTestRefusedPlayerPins()
+  {
+    std::lock_guard<std::mutex> guard(player_pin_mutex);
+    return (player_device_pins_refused ? 1 : 0) |
+           (player_sound_pins_refused ? 2 : 0);
+  }
+
+  /// Whether [hash] is loaded in the current Player. Reached through a sound
+  /// pin, as disposeSound() reaches it, so it never waits for
+  /// init_deinit_mutex. -1 when teardown refused the pin.
+  FFI_PLUGIN_EXPORT int soloudTestSoundIsLoaded(unsigned int hash)
+  {
+    const PlayerPin pin(PlayerPinKind::sound);
+    if (pin.get() == nullptr)
+      return -1;
+    return pin.get()->findByHash(hash) != nullptr ? 1 : 0;
+  }
+
+  /// Whether [handle] is a live voice in the current Player, reached like
+  /// soloudTestSoundIsLoaded(). -1 when teardown refused the pin.
+  FFI_PLUGIN_EXPORT int soloudTestVoiceIsValid(unsigned int handle)
+  {
+    const PlayerPin pin(PlayerPinKind::sound);
+    if (pin.get() == nullptr)
+      return -1;
+    return (pin.get()->isInited() && pin.get()->isValidHandle(handle)) ? 1 : 0;
+  }
 #endif
 
 #if defined(__ANDROID__)
@@ -1960,9 +2181,9 @@ extern "C"
   /// Loads take the lifecycle locks only around this and [finishSoundLoad],
   /// never across the decode between them. A decode can take seconds — M4A/MP4,
   /// AAC, AC-3, E-AC-3 and Ogg Opus/FLAC are decoded in full even for
-  /// LoadMode.disk — and every lifecycle call, including the disposeSound()
-  /// Dart makes synchronously on the UI thread, would otherwise wait for it
-  /// (an ANR on Android).
+  /// LoadMode.disk — and every lifecycle call, including the ones Dart makes
+  /// synchronously on the UI thread, would otherwise wait for it (an ANR on
+  /// Android).
   static bool beginSoundLoad(SoundLoadTicket &ticket)
   {
     std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
@@ -2777,15 +2998,31 @@ extern "C"
   /// dispose it
   ///
   /// [soundHash]
+  ///
+  /// Dart calls this synchronously on the UI thread, so it must never wait for
+  /// a device operation. It therefore takes neither init_deinit_mutex nor
+  /// loadMutex -- initEngine() and teardown hold both across device work --
+  /// and pins the Player with a sound PlayerPin instead. Below the pin it takes
+  /// only Player::sounds_mutex, SoLoud's audio mutex and the lifecycle
+  /// scheduler's request locks, none of which is held across a backend device
+  /// call (see changeDevice() for the lock order).
+  ///
+  /// When it returns, the sound's voices are stopped and [soundHash] is gone,
+  /// with one exception, deferred to a teardown that is already running: once
+  /// teardown has started disposing the Player, the pin is refused and this
+  /// returns without touching it, and that teardown's Player::dispose() stops
+  /// every voice and destroys every sound instead. Nothing is queued, so
+  /// nothing can apply to a later engine whose sound happens to have the same
+  /// hash.
   FFI_PLUGIN_EXPORT void disposeSound(unsigned int soundHash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::sound);
+    Player *const p = pin.get();
+    if (p == nullptr || !p->isInited())
       return;
-    std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
-    std::lock_guard<std::mutex> guard_load(loadMutex);
     try
     {
-      player.get()->disposeSound(soundHash);
+      p->disposeSound(soundHash);
     }
     catch (const std::exception &e)
     {
@@ -2799,13 +3036,15 @@ extern "C"
 
   /// Dispose all sounds already loaded
   ///
+  /// Pinned and non-blocking exactly like disposeSound(), with the same
+  /// guarantee on return and the same single exception.
   FFI_PLUGIN_EXPORT void disposeAllSound()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::sound);
+    Player *const p = pin.get();
+    if (p == nullptr || !p->isInited())
       return;
-    std::lock_guard<std::mutex> guard_init(init_deinit_mutex);
-    std::lock_guard<std::mutex> guard_load(loadMutex);
-    player.get()->disposeAllSound();
+    p->disposeAllSound();
   }
 
   /// Query whether a sound is set to loop.

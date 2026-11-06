@@ -2786,18 +2786,27 @@ void Player::stopDeviceAndDestroyAllSounds()
     // Stop all voices first. This stops all active audio processing.
     soloud.stopAll();
 
-    // Pause the audio device BEFORE destroying sounds to ensure the audio thread
-    // is not accessing filter memory. This prevents race conditions where the
-    // audio thread crashes trying to access freed filter instances.
+    // Teardown is about to close the device anyway, so pause it BEFORE
+    // destroying sounds as well, as a second guard against the audio thread
+    // touching filter memory. Runtime disposal (disposeAllSound()) cannot
+    // afford this: it would put a device stop, and a wait for any device
+    // operation in flight, on the UI thread.
     soloud.pause();
 
+    destroyAllSounds();
+}
+
+void Player::destroyAllSounds()
+{
     std::vector<std::unique_ptr<ActiveSound>> soundsToDestroy;
 
     {
         std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
 
-        // First, remove all filters from sounds while the audio thread is paused.
-        // This prevents the audio thread from accessing filter instances during destruction.
+        // First, remove all filters from the sounds. Their voices have been
+        // stopped under the audio mutex, so the audio thread holds no filter
+        // instance of theirs any more; this keeps it from creating one while
+        // the sounds are destroyed.
         for (auto &sound : sounds)
         {
             if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
@@ -2841,22 +2850,23 @@ void Player::stopDeviceAndDestroyAllSounds()
 
 void Player::disposeAllSound()
 {
-    {
-        // Stopping the device is a real backend operation, so serialize it
-        // with automatic/explicit lifecycle work and teardown.
-        std::lock_guard<std::mutex> operationLock(
-            mDeviceLifecycleOperationMutex);
-        stopDeviceAndDestroyAllSounds();
-    }
+    // Dart calls this synchronously on the UI thread, so it must not operate
+    // the device: pausing it here meant taking mDeviceLifecycleOperationMutex
+    // and the backend's device lock, i.e. waiting for whatever device start,
+    // stop or rebuild was in flight (tens of seconds on some Android devices),
+    // and then running ma_device_stop() on the UI thread.
+    //
+    // The device does not need to be stopped for the sounds to be destroyed
+    // safely. stopAll() removes every voice under the audio mutex, which is
+    // the same guarantee disposeSound() relies on, and the global filter
+    // instances are swapped out under that mutex too.
+    soloud.stopAll();
+    destroyAllSounds();
 
+    // The engine is idle now. As after disposeSound(), the idle policy decides
+    // when the device stops, on the lifecycle scheduler; an indefinite
+    // keep-alive simply leaves it running.
     evaluateAudioDeviceIdle();
-
-    // The unconditional soloud.pause() above may have stopped the device. If
-    // the app asked for the device to stay alive while idle (indefinite
-    // timeout), restart it (off the UI thread) now that the sounds have been
-    // destroyed.
-    if (mIdleTimeoutMs.load() < 0)
-        resumeEngine();
 }
 
 void Player::clearDartCallbackRegistrations()
