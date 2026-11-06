@@ -395,7 +395,8 @@ public:
 
   /// Apply the currently published policy to this Player and post whatever
   /// lifecycle request it implies. The caller must keep this Player alive for
-  /// the duration (in practice: hold init_deinit_mutex).
+  /// the duration (in practice: hold init_deinit_mutex, or a PlayerPin -- see
+  /// bindings.cpp).
   void applyPublishedAudioDeviceIdleTimeout();
 
   /// The idle-timeout policy this Player is currently running with, in
@@ -624,10 +625,17 @@ public:
 
   /// @brief Stop all handles of the already loaded sound identified by
   /// [soundHash] and clear it.
+  ///
+  /// Never operates the device and never takes mDeviceLifecycleOperationMutex
+  /// or the backend's device lock, so it does not wait for a device operation
+  /// in flight; the idle policy stops the device later, on the scheduler.
   /// @param soundHash hash of the sound.
   void disposeSound(unsigned int soundHash);
 
   /// @brief Dispose all sounds already loaded.
+  ///
+  /// Like disposeSound(), it never operates the device or waits for a device
+  /// operation: Dart calls both synchronously on the UI thread.
   void disposeAllSound();
 
   /// @brief Clear every native->Dart callback pointer held by the player.
@@ -1115,7 +1123,10 @@ private:
   std::thread mPauseThread;
   std::mutex mPauseMutex;
   // Serializes the actual blocking device operations performed by both the
-  // scheduler and the explicit lifecycle APIs.
+  // scheduler and the explicit lifecycle APIs, and teardown's own. It is held
+  // across backend device calls, so the sound operations (disposeSound(),
+  // disposeAllSound()) must never take it. Lock order: see the changeDevice()
+  // export in bindings.cpp.
   std::mutex mDeviceLifecycleOperationMutex;
   std::condition_variable mPauseCv;
   enum class DeviceLifecycleRequest : uint8_t {
@@ -1212,7 +1223,11 @@ private:
   bool requestDeviceLifecycle(DeviceLifecycleRequest request);
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();
+  /// Teardown only: stops every voice, pauses the device, destroys the sounds.
   void stopDeviceAndDestroyAllSounds();
+  /// Destroy every loaded sound and clear the global filters. Every voice must
+  /// already have been stopped; the device is not touched.
+  void destroyAllSounds();
   void handleAudioInterruption(bool began);
   static void audioInterruptionCallback(void *context, bool began);
 };

@@ -23,8 +23,9 @@ namespace soloud_test
   enum class DeviceBarrier
   {
     /// Inside the native changeDevice() export, after the global `player` has
-    /// been read but before Player::changeDevice() runs. Parks a change worker
-    /// against a concurrent teardown.
+    /// been pinned but before Player::changeDevice() runs. Parks a change
+    /// worker against a concurrent teardown, or against the calls that must
+    /// not wait for it.
     changeDeviceEntered = 0,
     /// In Player::changeDevice(), after `shouldStartReplacement` has been
     /// decided from the active-voice count and device state.
@@ -60,6 +61,12 @@ namespace soloud_test
     /// released the gate, before it stops the mixer capture and the
     /// visualizations. A newer registration can be claimed in this window.
     retiredCaptureStopEntered,
+    /// Inside the native startAudioDevice() export, after the global `player`
+    /// has been pinned but before Player::startAudioDevice() runs.
+    startAudioDeviceEntered,
+    /// Inside the native stopAudioDevice() export, after the global `player`
+    /// has been pinned but before Player::stopAudioDevice() runs.
+    stopAudioDeviceEntered,
     barrierCount
   };
 
