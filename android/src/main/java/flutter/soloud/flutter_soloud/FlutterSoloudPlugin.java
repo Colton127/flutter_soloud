@@ -29,21 +29,29 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
     private static final String TAG = "FlutterSoloudPlugin";
 
     /**
-     * Guarded by the class monitor.
-     *
-     * <p>The native library is loaded lazily, at the first point one of the
+     * The native library is loaded lazily, at the first point one of the
      * hooks below actually needs to call into it -- never from a static
      * initializer and never from {@link #onAttachedToEngine}. Both of those run
      * at engine startup (GeneratedPluginRegistrant instantiates and attaches
      * every plugin), which would drag the whole multi-megabyte library onto the
      * main thread during app launch even for an app that never plays a sound.
      *
-     * <p>By the time a hook fires, an app that uses SoLoud has already loaded
-     * the same library from Dart via {@code DynamicLibrary.open}, so
-     * {@code System.loadLibrary} is a refcount bump rather than a real load.
-     * Successful loads are cached; failed loads can be retried by a later hook.
+     * <p>Nor is it loaded by a hook unless something in the process already
+     * has. An app that uses SoLoud has loaded it from Dart (its first
+     * {@code @Native} call) by the time a hook fires, so
+     * {@code System.loadLibrary} is a refcount bump and the hook calls into it
+     * synchronously, as it must. An app that never touched SoLoud in this
+     * process has not, and then there is nothing for a hook to do -- see
+     * {@link NativeLibraryGate} -- so it skips the load instead of doing a real
+     * one on the main thread mid-teardown.
+     *
+     * <p>Successful loads are cached; a skipped or failed load is retried by
+     * the next hook.
      */
-    private static boolean nativeLibraryLoaded = false;
+    private static final NativeLibraryGate NATIVE_LIBRARY =
+        new NativeLibraryGate(
+            new ProcessMapsProbe(),
+            () -> System.loadLibrary("flutter_soloud_plugin"));
 
     private static native boolean
         nativeClearDartCallbackRegistrationsForEngine(long engineId);
@@ -60,23 +68,6 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
      * engine destroy; the teardown must only be requested once.
      */
     private boolean teardownRequested = false;
-
-    private static synchronized boolean ensureNativeLibraryLoaded() {
-        if (nativeLibraryLoaded) {
-            return true;
-        }
-
-        try {
-            System.loadLibrary("flutter_soloud_plugin");
-            nativeLibraryLoaded = true;
-            return true;
-        } catch (UnsatisfiedLinkError error) {
-            // Never fail engine teardown over this. The FFI layer opens the
-            // same library from Dart and surfaces the error there, where it is
-            // catchable and actionable.
-            return false;
-        }
-    }
 
     // getFlutterEngine() is deprecated in favour of the binary messenger /
     // texture registry / platform view registry accessors, but this plugin
@@ -150,7 +141,9 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
 
     private void clearDartCallbackRegistrations() {
         final Long id = engineId;
-        if (id == null || !ensureNativeLibraryLoaded()) {
+        // Not loaded means no isolate in this process has registered a
+        // callback, so there is nothing to clear.
+        if (id == null || !NATIVE_LIBRARY.loadIfAlreadyInProcess()) {
             return;
         }
 
@@ -182,7 +175,12 @@ public final class FlutterSoloudPlugin implements FlutterPlugin {
         // A native `false` is not always retryable -- it also means another
         // engine owns the native engine, or nothing is claimed -- but retrying
         // those costs one rejected call and keeps the recoverable cases working.
-        if (!ensureNativeLibraryLoaded()) {
+        //
+        // A library that is not loaded yet is the same "nothing is claimed"
+        // case, answered without loading it: the claim and the callbacks are
+        // only ever created by Dart calling into the library. It is left
+        // retryable too, since Dart can still load it before the next hook.
+        if (!NATIVE_LIBRARY.loadIfAlreadyInProcess()) {
             return;
         }
 
