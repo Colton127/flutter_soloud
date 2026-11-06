@@ -113,14 +113,15 @@ namespace SoLoud
 		if ((aVoiceHandle & 0xfffff000) == 0xfffff000)
 			return 0;
 
-		lockAudioMutex_internal();
-		if (getVoiceFromHandle_internal(aVoiceHandle) != -1)
-		{
-			unlockAudioMutex_internal();
-			return 1;
-		}
-		unlockAudioMutex_internal();
-		return 0;
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// Lock-free: the published handle of the slot changes exactly when
+		// insertVoice_internal() / stopVoice_internal() change the voice in
+		// it, so this agrees with getVoiceFromHandle_internal() without
+		// waiting for a mix block (see PublishedVoiceState).
+		const unsigned int ch = (aVoiceHandle & 0xfff) - 1;
+		if (aVoiceHandle == 0 || ch >= VOICE_COUNT)
+			return 0;
+		return mPublishedVoice[ch].mHandle.load(std::memory_order_acquire) == aVoiceHandle;
 	}
 
 
@@ -194,18 +195,16 @@ namespace SoLoud
 		return v;
 	}
 
+	// ###### flutter_soloud local patch (non-blocking voice control) ######
+	// getVolume, getPan, getStreamPosition and getPause read the published
+	// voice state without the audio mutex (see readVoiceState_internal()),
+	// and return the same defaults as before for a handle that names no voice.
 	float Soloud::getVolume(handle aVoiceHandle)
 	{
-		lockAudioMutex_internal();
-		int ch = getVoiceFromHandle_internal(aVoiceHandle);
-		if (ch == -1) 
-		{
-			unlockAudioMutex_internal();
+		VoiceStateSnapshot state;
+		if (!readVoiceState_internal(aVoiceHandle, state))
 			return 0;
-		}
-		float v = mVoice[ch]->mSetVolume;
-		unlockAudioMutex_internal();
-		return v;
+		return state.mVolume;
 	}
 
 	float Soloud::getOverallVolume(handle aVoiceHandle)
@@ -224,16 +223,10 @@ namespace SoLoud
 
 	float Soloud::getPan(handle aVoiceHandle)
 	{
-		lockAudioMutex_internal();
-		int ch = getVoiceFromHandle_internal(aVoiceHandle);
-		if (ch == -1) 
-		{
-			unlockAudioMutex_internal();
+		VoiceStateSnapshot state;
+		if (!readVoiceState_internal(aVoiceHandle, state))
 			return 0;
-		}
-		float v = mVoice[ch]->mPan;
-		unlockAudioMutex_internal();
-		return v;
+		return state.mPan;
 	}
 
 	time Soloud::getStreamTime(handle aVoiceHandle)
@@ -252,16 +245,10 @@ namespace SoLoud
 
 	time Soloud::getStreamPosition(handle aVoiceHandle)
 	{
-		lockAudioMutex_internal();
-		int ch = getVoiceFromHandle_internal(aVoiceHandle);
-		if (ch == -1)
-		{
-			unlockAudioMutex_internal();
+		VoiceStateSnapshot state;
+		if (!readVoiceState_internal(aVoiceHandle, state))
 			return 0;
-		}
-		double v = mVoice[ch]->mStreamPosition;
-		unlockAudioMutex_internal();
-		return v;
+		return state.mPosition;
 	}
 
 	float Soloud::getRelativePlaySpeed(handle aVoiceHandle)
@@ -294,16 +281,10 @@ namespace SoLoud
 
 	bool Soloud::getPause(handle aVoiceHandle)
 	{
-		lockAudioMutex_internal();
-		int ch = getVoiceFromHandle_internal(aVoiceHandle);
-		if (ch == -1) 
-		{
-			unlockAudioMutex_internal();
+		VoiceStateSnapshot state;
+		if (!readVoiceState_internal(aVoiceHandle, state))
 			return 0;
-		}
-		int v = !!(mVoice[ch]->mFlags & AudioSourceInstance::PAUSED);
-		unlockAudioMutex_internal();
-		return v != 0;
+		return state.mPaused;
 	}
 
 	bool Soloud::getProtectVoice(handle aVoiceHandle)

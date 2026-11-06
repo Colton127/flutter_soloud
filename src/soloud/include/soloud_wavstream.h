@@ -35,6 +35,8 @@ struct drflac;
 #endif
 #ifndef dr_mp3_h
 struct drmp3;
+// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+struct drmp3_seek_point;
 #endif
 #ifndef dr_wav_h
 struct drwav;
@@ -82,12 +84,18 @@ namespace SoLoud
 		result loadogg(File *fp);
 		result loadflac(File *fp);
 		result loadmp3(File *fp);
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		void freeMp3SeekTable();
 	public:
 		int mFiletype;
 		char *mFilename;
 		File *mMemFile;
 		File *mStreamFile;
 		unsigned int mSampleCount;
+		// ###### flutter_soloud local patch (wavstream mp3 seek table) ######
+		// MP3 seek table built once by loadmp3() and bound by every instance.
+		drmp3_seek_point *mMp3SeekPoints;
+		unsigned int mMp3SeekPointCount;
 
 		WavStream();
 		virtual ~WavStream();

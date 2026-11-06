@@ -148,6 +148,25 @@ namespace SoLoud
 		} \
 		unlockAudioMutex_internal();
 
+// ###### flutter_soloud local patch (non-blocking voice control) ######
+// FOR_ALL_VOICES_PRE/POST for a caller that already holds the audio mutex
+// (see Soloud::queueVoiceCommand_internal); POST does not unlock it.
+#define FOR_ALL_VOICES_LOCKED_PRE \
+		handle *h_ = NULL; \
+		handle th_[2] = { aVoiceHandle, 0 }; \
+		h_ = voiceGroupHandleToArray_internal(aVoiceHandle); \
+		if (h_ == NULL) h_ = th_; \
+		while (*h_) \
+		{ \
+			int ch = getVoiceFromHandle_internal(*h_); \
+			if (ch != -1)  \
+			{
+
+#define FOR_ALL_VOICES_LOCKED_POST \
+			} \
+			h_++; \
+		}
+
 #define FOR_ALL_VOICES_PRE_3D \
 		handle *h_ = NULL; \
 		handle th_[2] = { aVoiceHandle, 0 }; \
