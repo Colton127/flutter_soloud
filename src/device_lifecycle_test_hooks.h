@@ -67,6 +67,11 @@ namespace soloud_test
     /// Inside the native stopAudioDevice() export, after the global `player`
     /// has been pinned but before Player::stopAudioDevice() runs.
     stopAudioDeviceEntered,
+    /// In the device-callback stall watchdog, each time it wakes, before it
+    /// reads the clock and samples the device. Parking it here is a watchdog
+    /// frozen by a process suspension: when released, its wake-up is far
+    /// later than scheduled.
+    stallWatchdogWoke,
     barrierCount
   };
 
@@ -105,6 +110,22 @@ namespace soloud_test
   /// can drive rebuild/retry deterministically rather than by unplugging
   /// hardware. Returns true when this start must be failed.
   bool consumeForcedDeviceStartFailure();
+
+  /// Make the device data callback return silence without reaching the
+  /// engine, while the device itself keeps running and reporting started:
+  /// nothing is mixed, voices do not advance, and the callback heartbeat the
+  /// stall watchdog reads stops moving. That is the field failure the
+  /// watchdog exists to report, without needing an OS that misbehaves.
+  void setDeviceCallbackStalled(bool stalled);
+
+  /// Called on the audio callback path, so lock-free: a relaxed atomic load.
+  bool deviceCallbackStalled();
+
+  /// Override the stall watchdog threshold picked up by the next
+  /// Player::init(), so a test runs in seconds. 0 restores the computed
+  /// production threshold.
+  void setDeviceStallThresholdMs(long long thresholdMs);
+  long long deviceStallThresholdOverrideMs();
 } // namespace soloud_test
 
 #define SOLOUD_TEST_BARRIER(name)                                              \

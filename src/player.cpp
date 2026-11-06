@@ -41,6 +41,37 @@ namespace
     constexpr int64_t kDefaultIdleTimeoutMs = 500;
     constexpr int64_t kMaxIdleWaitChunkMs = 24LL * 60 * 60 * 1000;
 
+    // Device-callback stall watchdog (see Player::stallWatchdogLoop()).
+    //
+    // A started device calls its data callback about once per device period:
+    // tens of milliseconds at the configured buffer sizes. Legitimate gaps are
+    // a few periods at most -- a backend that batches periods (Bluetooth, an
+    // OS that raises the IO buffer duration in the background), or a reroute
+    // reopening its stream -- and stay well under a second. So a started
+    // device is reported once its callback has been silent for
+    // kDeviceStallThresholdPeriods periods, but never sooner than
+    // kMinDeviceStallThresholdMs: the floor is what keeps scheduling hiccups
+    // and backend quirks from ever looking like a stall, and is still short
+    // enough that an app returning to the foreground learns within seconds.
+    // The period term only matters for very large buffers (2 s / 8 = 250 ms
+    // per period), where a fixed floor would undercut the cadence itself.
+    constexpr int64_t kMinDeviceStallThresholdMs = 2000;
+    constexpr int64_t kDeviceStallThresholdPeriods = 8;
+#ifndef __EMSCRIPTEN__
+    // (The web build has no watchdog thread; see stallWatchdogLoop().)
+    //
+    // The watchdog samples this many times per threshold, so a stall is
+    // reported between one threshold and one threshold plus a sample interval
+    // after the last callback, and has been seen by several consecutive
+    // samples by then.
+    constexpr int64_t kDeviceStallSamplesPerThreshold = 4;
+    // A wake-up later than its interval plus this slack (and never less than
+    // this floor) is taken for a frozen watchdog: a suspended process, not a
+    // scheduling delay. Ordinary wake-up jitter, even under load, is far
+    // below it; an iOS or Android process freeze is seconds to hours.
+    constexpr int64_t kMinDeviceStallWakeSlackMs = 250;
+#endif
+
     // Device lifecycle configuration outlives each Player instance so a native
     // deinit/reinit cycle preserves the user's timeout policy.
     std::atomic<int64_t> gAudioDeviceIdleTimeoutMs{kDefaultIdleTimeoutMs};
@@ -297,6 +328,13 @@ Player::~Player()
         {
         }
     }
+    try
+    {
+        stopStallWatchdog();
+    }
+    catch (...)
+    {
+    }
 #endif
 }
 
@@ -313,6 +351,10 @@ void Player::dispose()
     mInterruptionActive.store(false, std::memory_order_release);
     mInited.store(false, std::memory_order_release);
     stopPauseEngineScheduler();
+    // Joined before the backend goes away, so no sample or event can outlive
+    // the engine. Never blocks for long: the watchdog only ever waits on its
+    // own condition variable.
+    stopStallWatchdog();
 
     // The scheduler join above waits for any device operation it was already
     // performing. Keep the same serialization lock held through the remaining
@@ -357,6 +399,7 @@ namespace SoLoud { ma_result miniaudio_listPlaybackDevices(std::vector<ma_device
 namespace SoLoud { SoLoud::result miniaudio_stopAudioDevice(); }
 namespace SoLoud { SoLoud::result miniaudio_startAudioDevice(); }
 namespace SoLoud { unsigned int miniaudio_getAudioDeviceState(); }
+namespace SoLoud { bool miniaudio_sampleDataCallbackLiveness(unsigned int *aState, unsigned int *aCallbackCount, unsigned int *aRunGeneration); }
 
 PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsigned int channels, int deviceID, bool lowLatency, unsigned int devicePeriodFrames, unsigned int renderAheadFrames)
 {
@@ -430,12 +473,17 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
         mSampleRate = sampleRate;
         mBufferSize = bufferSize;
         mChannels = channels;
-        // Start the deferred-pause scheduler now that the engine is in use.
-        // Thread creation is part of initialization: if it fails, leave no
-        // initialized backend or partially published lifecycle state behind.
+        // Before the watchdog thread exists: it reads this without a lock.
+        mStallThresholdMs = computeDeviceStallThresholdMs();
+        // Start the deferred-pause scheduler and the device-callback stall
+        // watchdog now that the engine is in use. Thread creation is part of
+        // initialization: if it fails, leave no initialized backend or
+        // partially published lifecycle state behind.
         try {
             startPauseEngineScheduler();
+            startStallWatchdog();
         } catch (...) {
+            stopStallWatchdog();
             stopPauseEngineScheduler();
             soloud.deinit();
             return backendNotInited;
@@ -1687,6 +1735,19 @@ PlayerErrors Player::performAudioDeviceStart()
 
     SOLOUD_TEST_BARRIER(performAudioDeviceStartEntered);
 
+    // This is the only way the device goes from stopped to started after
+    // init() -- the scheduler, startAudioDevice(), changeDevice() and the
+    // rebuild below all come through here, and miniaudio never starts a
+    // stopped device on its own (a reroute only restarts the streams of a
+    // device that is still started) -- so it is what wakes a stall watchdog
+    // parked on a stopped device. On every exit, whatever the outcome: a
+    // failed start can still have rebuilt the device.
+    struct StallWatchdogKick
+    {
+        Player *player;
+        ~StallWatchdogKick() { player->kickStallWatchdog(); }
+    } stallWatchdogKick{this};
+
     // Use the normal resume hook so iOS reactivates AVAudioSession before the
     // Audio Unit is restarted.
     SoLoud::result result = soloud.resume();
@@ -1724,6 +1785,222 @@ void Player::reportAutomaticDeviceStartFailure()
 {
     soloud.notifyStateChanged(
         (unsigned int)PlayerStateEvents::event_audio_device_start_failed);
+}
+
+int64_t Player::computeDeviceStallThresholdMs() const
+{
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+    // Lets a test exercise detection, re-arming and suspension handling in
+    // seconds instead of with the production threshold.
+    const long long overrideMs = soloud_test::deviceStallThresholdOverrideMs();
+    if (overrideMs > 0)
+        return overrideMs;
+#endif
+    // The longest gap between two device callbacks a healthy device produces
+    // is about one device period. With the render-ahead ring the device runs
+    // a small period of its own, decoupled from the engine quantum; take the
+    // larger of the two so the estimate errs towards a longer threshold.
+    unsigned int periodFrames = soloud.mBufferSize;
+    if (soloud.isRenderAheadEnabled() &&
+        soloud.mDevicePeriodFrames > periodFrames)
+        periodFrames = soloud.mDevicePeriodFrames;
+    const unsigned int sampleRate =
+        soloud.mSamplerate != 0 ? soloud.mSamplerate : mSampleRate;
+    int64_t periodMs = 0;
+    if (sampleRate != 0)
+        periodMs = ((int64_t)periodFrames * 1000 + sampleRate - 1) / sampleRate;
+    return std::max(kMinDeviceStallThresholdMs,
+                    kDeviceStallThresholdPeriods * periodMs);
+}
+
+void Player::reportDeviceCallbackStall()
+{
+    soloud_platform_log(
+        "flutter_soloud: the audio output device reports started but its data "
+        "callback has not run for %lld ms\n",
+        (long long)mStallThresholdMs);
+    soloud.notifyStateChanged(
+        (unsigned int)PlayerStateEvents::event_audio_device_stalled);
+}
+
+void Player::startStallWatchdog()
+{
+#ifndef __EMSCRIPTEN__
+    // Created under the lock, as the scheduler is: the thread's first act is
+    // to take it, so it cannot observe a half-reset state.
+    std::lock_guard<std::mutex> lock(mStallWatchdogMutex);
+    if (mStallWatchdogThread.joinable())
+        return;
+    mStallWatchdogStop = false;
+    mStallWatchdogThread = std::thread(&Player::stallWatchdogLoop, this);
+#endif
+}
+
+void Player::stopStallWatchdog()
+{
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(mStallWatchdogMutex);
+        mStallWatchdogStop = true;
+    }
+    mStallWatchdogCv.notify_all();
+    // Prompt: the watchdog never blocks on anything but its own condition
+    // variable, which the stop flag above wakes. At worst it finishes one
+    // non-blocking sample, or one event dispatch, first.
+    if (mStallWatchdogThread.joinable())
+        mStallWatchdogThread.join();
+#endif
+}
+
+void Player::kickStallWatchdog()
+{
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(mStallWatchdogMutex);
+        ++mStallWatchdogWakeEpoch;
+    }
+    mStallWatchdogCv.notify_all();
+#endif
+}
+
+// Watches the device data callback while the backend reports the device
+// started, and reports a callback that has stopped running.
+//
+// The signal is the backend's callback heartbeat, never the mixer: see
+// gDataCallbackCount in soloud_miniaudio.cpp. A stall is a started device
+// whose heartbeat has not moved for mStallThresholdMs, as seen by consecutive
+// on-time samples. Everything that is not "started, and nobody is operating
+// it" discards the baseline instead of counting towards a stall:
+//
+//   * a stopped, starting, stopping or uninitialized device, and a sample the
+//     backend refused because a device operation was in flight;
+//   * an OS interruption (mInterruptionActive), during which a silent device
+//     is expected, and an engine that is not initialized or is shutting down;
+//   * a device transition between two samples (start, stop, reroute, rebuild:
+//     gDeviceRunGeneration moved), which also re-arms a reported stall;
+//   * a late wake-up of the watchdog itself. iOS suspends every thread of a
+//     backgrounded app, and Android freezes cached apps: the audio callback
+//     and this thread stop together, and on resume this thread can run before
+//     the callback has had a chance to. A sample that comes much later than
+//     scheduled therefore restarts the observation rather than counting the
+//     frozen time as silence. (A system-wide sleep needs no handling: the
+//     steady clock does not advance through it.)
+//
+// One event per stall. It re-arms once the heartbeat moves again, or once the
+// device has been stopped, restarted or rebuilt.
+void Player::stallWatchdogLoop()
+{
+#ifndef __EMSCRIPTEN__
+    using Clock = std::chrono::steady_clock;
+    const std::chrono::milliseconds threshold(mStallThresholdMs);
+    const std::chrono::milliseconds interval(std::max<int64_t>(
+        1, mStallThresholdMs / kDeviceStallSamplesPerThreshold));
+    // A sample further than this from the previous one means the watchdog
+    // was frozen in between.
+    const std::chrono::milliseconds maxSampleGap =
+        interval + std::chrono::milliseconds(std::max<int64_t>(
+                       interval.count(), kMinDeviceStallWakeSlackMs));
+
+    // Watchdog-thread state only.
+    bool haveBaseline = false;
+    unsigned int baselineCount = 0;
+    Clock::time_point lastProgress;
+    Clock::time_point lastSample;
+    bool haveGeneration = false;
+    unsigned int lastGeneration = 0;
+    bool reported = false;
+
+    std::unique_lock<std::mutex> lock(mStallWatchdogMutex);
+    while (!mStallWatchdogStop)
+    {
+        // Read before sampling, so a start that lands after the sample has
+        // already moved it and a park below cannot miss the kick.
+        const uint64_t wakeEpoch = mStallWatchdogWakeEpoch;
+        lock.unlock();
+
+        SOLOUD_TEST_BARRIER(stallWatchdogWoke);
+
+        // The clock is read before the sample: a freeze between the two then
+        // shows up as a late *next* sample, instead of as silence here.
+        const Clock::time_point now = Clock::now();
+        unsigned int state = audioDeviceUninitialized;
+        unsigned int callbackCount = 0;
+        unsigned int generation = 0;
+        const bool sampled = SoLoud::miniaudio_sampleDataCallbackLiveness(
+            &state, &callbackCount, &generation);
+
+        if (sampled)
+        {
+            if (haveGeneration && generation != lastGeneration)
+            {
+                // Stopped, restarted, rerouted or rebuilt since the last
+                // sample: whatever is observed from here on is a new episode.
+                haveBaseline = false;
+                reported = false;
+            }
+            haveGeneration = true;
+            lastGeneration = generation;
+            if (state != audioDeviceStarted)
+                reported = false;
+        }
+
+        const bool monitorable =
+            sampled && state == audioDeviceStarted &&
+            mInited.load(std::memory_order_acquire) &&
+            mLifecycleRequestsAccepted.load(std::memory_order_acquire) &&
+            !mInterruptionActive.load(std::memory_order_acquire);
+
+        bool park = false;
+        if (!monitorable)
+        {
+            haveBaseline = false;
+            // Nothing to watch until something starts the device, and that
+            // kicks. Everything else is transient, so keep polling.
+            park = sampled && (state == audioDeviceStopped ||
+                               state == audioDeviceUninitialized);
+        }
+        else if (!haveBaseline || now - lastSample > maxSampleGap)
+        {
+            haveBaseline = true;
+            baselineCount = callbackCount;
+            lastProgress = now;
+            lastSample = now;
+        }
+        else
+        {
+            lastSample = now;
+            if (callbackCount != baselineCount)
+            {
+                baselineCount = callbackCount;
+                lastProgress = now;
+                reported = false;
+            }
+            else if (!reported && now - lastProgress >= threshold)
+            {
+                reported = true;
+                reportDeviceCallbackStall();
+            }
+        }
+
+        lock.lock();
+        if (park)
+        {
+            mStallWatchdogCv.wait(lock, [this, wakeEpoch] {
+                return mStallWatchdogStop ||
+                       mStallWatchdogWakeEpoch != wakeEpoch;
+            });
+        }
+        else
+        {
+            // Kicks do not cut this short: only stopping does. A burst of
+            // start requests against a device that is already started (every
+            // play() posts one) must neither busy-loop the watchdog nor keep
+            // resetting what it has observed.
+            mStallWatchdogCv.wait_for(lock, interval,
+                                      [this] { return mStallWatchdogStop; });
+        }
+    }
+#endif
 }
 
 void Player::invalidatePendingDeviceRequest()
