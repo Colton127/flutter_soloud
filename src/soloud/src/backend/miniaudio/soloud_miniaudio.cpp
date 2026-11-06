@@ -105,6 +105,29 @@ namespace SoLoud
     ma_context context;
     std::atomic<bool> gDeviceStopped{true};
 
+    // Liveness of the device data callback, read by Player's stall watchdog
+    // through miniaudio_sampleDataCallbackLiveness().
+    //
+    // gDataCallbackCount is bumped once per soloud_miniaudio_audiomixer() call,
+    // which is once per *device* callback, in both mixing modes. It is
+    // deliberately not bumped by the mixer, nor derived from the mix clock: the
+    // mixer also runs off the device callback (with the render-ahead ring, the
+    // retroactive re-mix mixes on API threads and moves the mix clock), so a
+    // mixer-side heartbeat could keep moving while the device has gone silent.
+    // Relaxed and lock-free, because it is the only thing the audio thread does
+    // for the watchdog; the watchdog only ever compares two samples for
+    // inequality, so neither ordering nor wrap-around matters.
+    //
+    // gDeviceRunGeneration is bumped by every started, stopped and rerouted
+    // notification: every real transition of the device, including the ones
+    // miniaudio makes on its own (an iOS interruption stops the device inside
+    // miniaudio, an AAudio reroute reopens its stream). It lets the watchdog
+    // tell a device that was stopped, restarted or rebuilt between two of its
+    // samples from one that simply kept reporting started, which is what
+    // re-arms a stall it already reported.
+    static std::atomic<uint32_t> gDataCallbackCount{0};
+    static std::atomic<uint32_t> gDeviceRunGeneration{0};
+
     // Every operation that can initialize, start, stop, uninitialize, or
     // replace gDevice passes through this mutex. It is recursive because some
     // miniaudio backends can deliver notifications inline from an operation.
@@ -751,6 +774,15 @@ namespace SoLoud
         else if (pNotification->type == ma_device_notification_type_stopped)
             gDeviceStopped.store(true, std::memory_order_release);
 
+        // A device transition, for the stall watchdog. Device-level like the
+        // flag above, so counted before admission: it says nothing about the
+        // engine, and must not be lost while notifications are retired across
+        // a device swap.
+        if (pNotification->type == ma_device_notification_type_started ||
+            pNotification->type == ma_device_notification_type_stopped ||
+            pNotification->type == ma_device_notification_type_rerouted)
+            gDeviceRunGeneration.fetch_add(1, std::memory_order_relaxed);
+
         // Admit and pin the engine for the whole dispatch. A bare load of
         // gSoloud only rules out notifications that have not started; one that
         // already read the pointer would go on to dereference a destroyed
@@ -1193,6 +1225,21 @@ namespace SoLoud
         // ended-voice queue is drained with correct bookkeeping.
         soloud->unlockAudioMutex_internal();
 #else
+        // Heartbeat for the stall watchdog: this device callback ran. Taken
+        // before either mixing mode, because it is the device that is being
+        // watched, not the mixer (see gDataCallbackCount).
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        if (soloud_test::deviceCallbackStalled())
+        {
+            // A device that keeps reporting started while no callback reaches
+            // the engine: nothing is mixed and the heartbeat does not move.
+            std::memset(pOutput, 0,
+                        (size_t)frameCount * outChannels * sizeof(float));
+            return;
+        }
+#endif
+        gDataCallbackCount.fetch_add(1, std::memory_order_relaxed);
+
         if (soloud->isRenderAheadEnabled())
         {
             // Render-ahead ring path: the engine has already mixed
@@ -1451,6 +1498,29 @@ namespace SoLoud
         if (!gDeviceInitialized.load(std::memory_order_acquire))
             return ma_device_state_uninitialized;
         return (unsigned int)ma_device_get_state(&gDevice);
+    }
+
+    bool miniaudio_sampleDataCallbackLiveness(unsigned int *aState,
+                                              unsigned int *aCallbackCount,
+                                              unsigned int *aRunGeneration)
+    {
+        // Only try the lock: the watchdog must never wait behind a device
+        // operation, which can block for seconds. A busy lock means the device
+        // is being opened, started, stopped or replaced, which is not a
+        // stalled started device, so the caller skips the sample.
+        //
+        // Taken at all because ma_device_uninit() ends by zeroing gDevice,
+        // state included, with a plain memset, and every caller of it holds
+        // this lock. Reading the state without it races that memset.
+        std::unique_lock<std::recursive_mutex> operationLock(
+            gDeviceOperationMutex, std::try_to_lock);
+        if (!operationLock.owns_lock())
+            return false;
+
+        *aState = miniaudio_getAudioDeviceState();
+        *aRunGeneration = gDeviceRunGeneration.load(std::memory_order_relaxed);
+        *aCallbackCount = gDataCallbackCount.load(std::memory_order_relaxed);
+        return true;
     }
 
     // Engine mix quantum to hand to postinit_internal. With the render-ahead

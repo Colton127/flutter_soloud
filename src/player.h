@@ -1177,6 +1177,50 @@ private:
   /// milliseconds. Read by the scheduler thread, written from the FFI thread.
   std::atomic<int64_t> mIdleTimeoutMs;
 
+  // Output-device callback stall watchdog.
+  //
+  // Some devices keep reporting `ma_device_state_started` while the OS has
+  // stopped calling their data callback -- mostly with the app in the
+  // background. Nothing is mixed, voices stay valid and unpaused but never
+  // advance, and nothing else tells the app. This thread watches the device
+  // callback's heartbeat (see miniaudio_sampleDataCallbackLiveness()) and
+  // reports a stall once, as `event_audio_device_stalled`. Report only: it
+  // never operates the device.
+  //
+  // It runs from init() to dispose(), but only polls while the device is not
+  // stopped. While the device is stopped or uninitialized it is parked on
+  // mStallWatchdogCv with no timeout, and only a device start
+  // (performAudioDeviceStart()) wakes it, through kickStallWatchdog(). No
+  // thread exists before init() or after dispose().
+  //
+  // Lock ordering: mStallWatchdogMutex is a leaf. It guards only the stop flag
+  // and the wake epoch, nothing blocking runs under it, and the watchdog
+  // releases it before sampling the backend or dispatching the event. Kicks
+  // may arrive with mDeviceLifecycleOperationMutex held. The watchdog takes no
+  // other Player mutex and never init_deinit_mutex; its backend sample only
+  // try-locks gDeviceOperationMutex, so it can never wait behind a device
+  // operation either.
+  std::thread mStallWatchdogThread;
+  std::mutex mStallWatchdogMutex;
+  std::condition_variable mStallWatchdogCv;
+  // Protected by mStallWatchdogMutex.
+  bool mStallWatchdogStop = false;
+  // Protected by mStallWatchdogMutex. Advanced by every kick; a parked
+  // watchdog waits for it to move.
+  uint64_t mStallWatchdogWakeEpoch = 0;
+  // How long a started device may go without a data callback before it is
+  // reported. Written by init() before the watchdog thread is created, and
+  // read only by that thread, so the thread creation orders it.
+  int64_t mStallThresholdMs = 0;
+
+  void startStallWatchdog();
+  void stopStallWatchdog();
+  /// Wake a parked watchdog so it samples the device again. Cheap and
+  /// non-blocking; called after anything that may have started the device.
+  void kickStallWatchdog();
+  void stallWatchdogLoop();
+  void reportDeviceCallbackStall();
+
   void pauseEngineScheduler();
   /// Apply a pause/unpause to [handle] and post the matching device
   /// lifecycle request. [isUserAction] is false for automatic buffering
@@ -1193,6 +1237,9 @@ private:
   /// out. Explicit starts return the error to their caller instead and do not
   /// go through here.
   void reportAutomaticDeviceStartFailure();
+
+  /// The stall watchdog's threshold for the device init() has just opened.
+  int64_t computeDeviceStallThresholdMs() const;
 
   /// The generation a later cancellation can be compared against.
   ///

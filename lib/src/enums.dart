@@ -382,6 +382,18 @@ enum PlayerStateNotification {
   /// plugin's own lifecycle scheduler and is reliable on every backend. It is
   /// surfaced publicly as `SoLoud.audioDeviceStartFailures`.
   audioDeviceStartFailed,
+
+  /// The output device has kept reporting itself started while its data
+  /// callback stopped being called, for longer than the stall threshold.
+  ///
+  /// Like [audioDeviceStartFailed] this is emitted by the plugin itself (a
+  /// watchdog on the device callback), not by the OS, and is reliable on
+  /// every native backend. Never emitted on the web. It is surfaced publicly
+  /// as `SoLoud.audioDeviceStalls`.
+  ///
+  /// WARNING: Keep in sync with `PlayerStateEvents` in `src/enums.h`; native
+  /// code sends the ordinal. Append new values after this one, never before.
+  audioDeviceStalled,
 }
 
 /// Why an automatic output-device start failed.
@@ -395,6 +407,20 @@ enum AudioDeviceStartFailure {
   /// resumes if the device can later be started (for example by awaiting
   /// `SoLoud.startAudioDevice`).
   deviceUnavailable,
+}
+
+/// How the output device stalled.
+///
+/// Delivered by `SoLoud.audioDeviceStalls`.
+enum AudioDeviceStall {
+  /// The output device keeps reporting [AudioDeviceState.started], but the
+  /// operating system has stopped calling its data callback: nothing is
+  /// mixed, and voices stay valid and unpaused but do not advance.
+  ///
+  /// The device is not recovered automatically. Awaiting
+  /// `SoLoud.changeDevice()` rebuilds it (with no argument, on the current
+  /// default output) while keeping loaded sounds and playing voices.
+  dataCallbackStopped,
 }
 
 /// The state of the audio output device, as reported by
