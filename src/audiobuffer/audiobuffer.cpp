@@ -3,6 +3,7 @@
 #include <thread>
 #include <chrono>
 
+#include "../device_lifecycle_test_hooks.h"
 #include "../soloud_common.h"
 #include "audiobuffer.h"
 #include "metadata_ffi.h"
@@ -481,6 +482,7 @@ void BufferStream::setDataIsEnded() {
                                            decoded.size(), &allDataAdded) *
                            sizeof(float);
           }
+          SOLOUD_TEST_BARRIER(bufferStreamBackgroundDecoded);
           checkBuffering(static_cast<unsigned int>(bytesWritten));
           mUncompressedBytesReceived += bytesWritten;
           mSampleCount += static_cast<unsigned int>(bytesWritten / sizeof(float));

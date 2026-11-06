@@ -1147,6 +1147,10 @@ void PullBufferStream::checkBuffering() {
       // be backlogged for a short time. Do not pause while we still have a
       // backlog that is being drained, otherwise playback never starts.
       backlogSamples == 0) {
+    // An automatic pause: clear the user-paused flag here, as BufferStream
+    // does, so the resume below can unpause the voice. Player::setPause()
+    // leaves the flag to automatic callers.
+    mParent->handle[0].isUserPaused = false;
     mThePlayer->setPause(handle, true, false);
     mIsBuffering.store(true);
     callOnBufferingCallback(true, handle, availableTime);

@@ -1108,7 +1108,26 @@ public:
 
 private:
   std::mutex remove_handle_mutex;
-  mutable std::recursive_mutex sounds_mutex; // Protects the sounds vector (recursive to avoid deadlock in destructors)
+  // Protects the sounds vector (recursive to avoid deadlock in destructors).
+  //
+  // findByHash()/findByHandle() return a raw ActiveSound* and take this only
+  // for the lookup. disposeSound()/disposeAllSound() stop a sound's voices
+  // and take it out of `sounds` under this mutex and destroy it right after,
+  // so a caller that goes on to use the result must hold this mutex from
+  // before the lookup to its last use (see SoundsLock in player.cpp).
+  //
+  // Lock order: sounds_mutex -> SoLoud's audio mutex. It must never be taken
+  // with the audio mutex held, held across a backend device call, or held
+  // while taking mDeviceLifecycleOperationMutex (teardown takes that one
+  // first). No lifecycle request (resumeEngine(), pauseEngine(),
+  // evaluateAudioDeviceIdle()) is posted while it is held, since those take
+  // mInterruptionMutex: a path that holds it across something that can pause
+  // or unpause a voice (a buffer stream's checkBuffering(), a stop(), a call
+  // into SoLoud that can mix ahead) takes it through a SoundsLock, which
+  // defers those requests to its release. An automatic (buffering)
+  // setPause() does not take it at all, so a stream's decode thread can pause
+  // a voice while a play() of that stream holds it.
+  mutable std::recursive_mutex sounds_mutex;
   unsigned int mBufferSize;
 
   std::map<unsigned int, BusData> busMap;
@@ -1272,8 +1291,9 @@ private:
   void stopPauseEngineScheduler();
   /// Teardown only: stops every voice, pauses the device, destroys the sounds.
   void stopDeviceAndDestroyAllSounds();
-  /// Destroy every loaded sound and clear the global filters. Every voice must
-  /// already have been stopped; the device is not touched.
+  /// Stop every voice, take every loaded sound out and clear the global
+  /// filters, all in one sounds_mutex critical section, then destroy the
+  /// sounds after releasing it. The device is not touched.
   void destroyAllSounds();
   void handleAudioInterruption(bool began);
   static void audioInterruptionCallback(void *context, bool began);

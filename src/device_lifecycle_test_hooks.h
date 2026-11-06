@@ -72,8 +72,30 @@ namespace soloud_test
     /// frozen by a process suspension: when released, its wake-up is far
     /// later than scheduled.
     stallWatchdogWoke,
+    /// In every Player::play* variant, right after the sound has been looked
+    /// up by hash and before it is used. A disposeSound()/disposeAllSound()
+    /// started while a play is parked here must neither free the sound under
+    /// it nor leave the voice it goes on to create alive.
+    playSoundLookedUp,
+    /// In a BufferStream's background decode thread (started by
+    /// setDataIsEnded() while the decoder still holds data), after a chunk has
+    /// been decoded into the buffer and before checkBuffering() runs for it.
+    /// That checkBuffering() can pause or unpause voices automatically, from
+    /// a thread holding check_buffer_mutex.
+    bufferStreamBackgroundDecoded,
+    /// At the top of Player::resumeEngine() and
+    /// Player::evaluateAudioDeviceIdle() when they actually post (a request
+    /// deferred to a SoundsLock release does not get here), before
+    /// mInterruptionMutex is taken. Only threads that set
+    /// tObserveLifecyclePosts reach it, so a test can tell its own thread's
+    /// posts from the mixer's and the scheduler's.
+    lifecyclePostEntered,
     barrierCount
   };
+
+  /// Set on a thread a test drives, so that thread's lifecycle posts hit the
+  /// lifecyclePostEntered barrier (see SOLOUD_TEST_LIFECYCLE_POST()).
+  inline thread_local bool tObserveLifecyclePosts = false;
 
   /// Arm [barrier]. The *next* thread reaching it parks until released; any
   /// thread arriving after that passes straight through, so a barrier cannot
@@ -131,8 +153,17 @@ namespace soloud_test
 #define SOLOUD_TEST_BARRIER(name)                                              \
   ::soloud_test::hitBarrier(::soloud_test::DeviceBarrier::name)
 
+/// A lifecycle request is about to be posted on this thread.
+#define SOLOUD_TEST_LIFECYCLE_POST()                                           \
+  do                                                                           \
+  {                                                                            \
+    if (::soloud_test::tObserveLifecyclePosts)                                 \
+      SOLOUD_TEST_BARRIER(lifecyclePostEntered);                               \
+  } while (0)
+
 #else
 
 #define SOLOUD_TEST_BARRIER(name) ((void)0)
+#define SOLOUD_TEST_LIFECYCLE_POST() ((void)0)
 
 #endif // SOLOUD_LIFECYCLE_TEST_HOOKS
