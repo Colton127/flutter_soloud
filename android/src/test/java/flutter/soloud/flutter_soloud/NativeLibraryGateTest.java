@@ -119,4 +119,78 @@ public class NativeLibraryGateTest {
 
         assertFalse(gate.loadIfAlreadyInProcess());
     }
+
+    @Test
+    public void markedInUseLoadsEvenWhenTheMarkerIsAbsent() {
+        // The marker failed to publish: the library is loaded but the probe
+        // reads ABSENT. Dart has said it uses the library, so the hook must
+        // not be skipped.
+        probe.loadedInProcess = false;
+        gate.markInUse();
+
+        assertTrue(gate.loadIfAlreadyInProcess());
+        assertEquals(1, loader.calls);
+        assertEquals("the probe is not asked once Dart has spoken", 0, probe.calls);
+    }
+
+    @Test
+    public void markInUseDoesNoNativeWork() {
+        gate.markInUse();
+        gate.markInUse();
+
+        assertEquals("marking must stay pure bookkeeping", 0, loader.calls);
+        assertEquals(0, probe.calls);
+    }
+
+    @Test
+    public void markInUseIsStickyAcrossSkipsAndFailures() {
+        // Before Dart speaks, an absent marker still skips.
+        probe.loadedInProcess = false;
+        assertFalse(gate.loadIfAlreadyInProcess());
+        assertEquals(1, probe.calls);
+
+        gate.markInUse();
+
+        // A failed load is not cached, and does not clear the mark either:
+        // the next hook loads again without probing.
+        loader.fail = true;
+        assertFalse(gate.loadIfAlreadyInProcess());
+        assertFalse(gate.loadIfAlreadyInProcess());
+        assertEquals(2, loader.calls);
+
+        loader.fail = false;
+        assertTrue(gate.loadIfAlreadyInProcess());
+        assertTrue(gate.loadIfAlreadyInProcess());
+        assertEquals("a successful load is still cached", 3, loader.calls);
+        assertEquals("never probed after the mark", 1, probe.calls);
+    }
+
+    @Test
+    public void markedInUseIgnoresAProbeThatWouldThrow() {
+        probe.failure = new IllegalStateException("maps unreadable");
+        gate.markInUse();
+
+        assertTrue(gate.loadIfAlreadyInProcess());
+        assertEquals(0, probe.calls);
+    }
+
+    @Test
+    public void markedInUseAndFailedLoadNeverThrows() {
+        gate.markInUse();
+        loader.fail = true;
+
+        assertFalse(gate.loadIfAlreadyInProcess());
+    }
+
+    @Test
+    public void markAfterALoadChangesNothing() {
+        probe.loadedInProcess = true;
+        assertTrue(gate.loadIfAlreadyInProcess());
+
+        gate.markInUse();
+
+        assertTrue(gate.loadIfAlreadyInProcess());
+        assertEquals(1, loader.calls);
+        assertEquals(1, probe.calls);
+    }
 }
