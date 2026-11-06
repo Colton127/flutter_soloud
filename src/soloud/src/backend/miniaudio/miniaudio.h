@@ -35651,8 +35651,6 @@ static ma_result ma_device__untrack__coreaudio(ma_device* pDevice)
 
 -(void)handle_route_change:(NSNotification*)pNotification
 {
-    AVAudioSession* pSession = [AVAudioSession sharedInstance];
-
     NSInteger reason = [[[pNotification userInfo] objectForKey:AVAudioSessionRouteChangeReasonKey] integerValue];
     switch (reason)
     {
@@ -35693,7 +35691,16 @@ static ma_result ma_device__untrack__coreaudio(ma_device* pDevice)
         } break;
     }
 
-    ma_log_postf(ma_device_get_log(m_pDevice), MA_LOG_LEVEL_DEBUG, "[Core Audio] Changing Route. inputNumberChannels=%d; outputNumberOfChannels=%d\n", (int)pSession.inputNumberOfChannels, (int)pSession.outputNumberOfChannels);
+    /*
+    ###### flutter_soloud local patch (no AVAudioSession reads on the route-change path) ######
+    Upstream logged [AVAudioSession sharedInstance].inputNumberOfChannels and outputNumberOfChannels
+    here, at debug level. Each of those is a synchronous query of the audio server, made on the
+    thread delivering the notification, and the arguments were evaluated even when nothing was
+    listening to the log (flutter_soloud registers no log callback and builds without
+    MA_DEBUG_OUTPUT). The read is dropped rather than moved to another queue because a deferred
+    block would have nothing safe to log to: the log belongs to the device's context, which may
+    already be uninitialized by the time the block runs. The reason is still logged above.
+    */
 
     /* Let the application know about the route change. */
     ma_device__on_notification_rerouted(m_pDevice);
