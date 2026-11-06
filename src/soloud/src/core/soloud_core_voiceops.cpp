@@ -24,6 +24,7 @@ freely, subject to the following restrictions:
 
 #include "soloud.h"
 #include "soloud_internal.h"
+#include "soloud_thread.h" // mVoiceCommandMutex (voice control)
 #include <math.h> // floor (voice control)
 #include <chrono> // steady_clock (voice control)
 #include <thread> // yield (voice control)
@@ -222,7 +223,9 @@ namespace SoLoud
 //
 // - queueVoiceCommand_internal(): producer side, under mVoiceCommandMutex.
 // - applyVoiceCommands_internal(): consumer side for volume/pan/pause, run
-//   by lockAudioMutex_internal() under the audio mutex.
+//   by lockAudioMutex_internal() under the audio mutex; it copies the queue
+//   out under mVoiceCommandMutex and applies the copy
+//   (applyVoiceCommandBatch_internal()) after releasing it.
 // - applyQueuedSeeks_internal(): consumer side for seeks, run by the mixer
 //   at a block start and by a control call on the idle-mixer path; every
 //   other lock holder applies only seeks whose source opts in as cheap.
@@ -230,9 +233,11 @@ namespace SoLoud
 //   insertVoice_internal() and unlockAudioMutex_internal().
 // - readVoiceState_internal(): lock-free reader for the getters.
 //
-// The audio thread only ever takes the audio mutex. It never takes
-// mVoiceCommandMutex or mVoiceGroupMutex, and the seqlock writers it runs
-// never wait on a reader, so nothing here can stall a mix.
+// The audio thread blocks on nothing but the audio mutex. It never takes
+// mVoiceGroupMutex and only try-locks mVoiceCommandMutex (a control call
+// holds it for a few stores; the queue then waits for the next block), and
+// the seqlock writers it runs never wait on a reader, so nothing here can
+// stall a mix.
 
 namespace SoLoud
 {
@@ -253,6 +258,64 @@ namespace SoLoud
 			if (++aSpins > 64)
 				std::this_thread::yield();
 		}
+
+		// Scoped hold of mVoiceCommandMutex (a Thread mutex). With aTryOnly
+		// (the mixer), it may not be taken: check locked().
+		class VoiceCommandLock
+		{
+		public:
+			VoiceCommandLock(void *aMutex, bool aTryOnly) : mMutex(aMutex), mLocked(true)
+			{
+				if (aTryOnly)
+					mLocked = Thread::tryLockMutex(mMutex) == 0;
+				else
+					Thread::lockMutex(mMutex);
+			}
+			~VoiceCommandLock()
+			{
+				if (mLocked)
+					Thread::unlockMutex(mMutex);
+			}
+			bool locked() const { return mLocked; }
+
+		private:
+			VoiceCommandLock(const VoiceCommandLock &);
+			VoiceCommandLock &operator=(const VoiceCommandLock &);
+			void *mMutex;
+			bool mLocked;
+		};
+
+		// Ticket and value of one field of a slot's pending changes. Called
+		// with mVoiceCommandMutex held, so no producer is writing them.
+		inline unsigned long long pendingTicket(const PendingVoiceControl &aPending, unsigned int aType)
+		{
+			switch (aType)
+			{
+			case VoiceCommand::VOLUME: return aPending.mVolumeTicket.load(std::memory_order_relaxed);
+			case VoiceCommand::PAN: return aPending.mPanTicket.load(std::memory_order_relaxed);
+			case VoiceCommand::PAUSE: return aPending.mPauseTicket.load(std::memory_order_relaxed);
+			default: return aPending.mSeekTicket.load(std::memory_order_relaxed);
+			}
+		}
+
+		inline double pendingValue(const PendingVoiceControl &aPending, unsigned int aType)
+		{
+			switch (aType)
+			{
+			case VoiceCommand::VOLUME: return aPending.mVolume.load(std::memory_order_relaxed);
+			case VoiceCommand::PAN: return aPending.mPan.load(std::memory_order_relaxed);
+			case VoiceCommand::PAUSE: return aPending.mPause.load(std::memory_order_relaxed) ? 1.0 : 0.0;
+			default: return aPending.mSeek.load(std::memory_order_relaxed);
+			}
+		}
+
+		// States of a volume/pan/pause change while a batch is applied.
+		enum
+		{
+			BATCH_DROPPED = 0, // its voice is gone
+			BATCH_IMMEDIATE,   // applied to the live voice state
+			BATCH_RETROACTIVE  // placed at the playhead inside the re-mix
+		};
 	}
 
 	void Soloud::publishVoiceState_internal(unsigned int aVoice)
@@ -399,218 +462,333 @@ namespace SoLoud
 		return now - start > idle;
 	}
 
+	// The queue holds at most one entry per voice slot and type (volume,
+	// pan, pause, seek): which slot has a change of which type waiting. The
+	// value is the slot's PendingVoiceControl field, which every call
+	// overwrites with the newest value and ticket. A call whose voice already
+	// has an entry of its type only updates that field, so the newest value
+	// wins and the queue never holds more than VOICE_COUNT entries per type:
+	// a call never waits for room (there is no full-queue path), and a drain
+	// applies at most that many changes.
+	//
+	// Why coalescing keeps the call order:
+	// - A consumer copies the whole queue out at once (under
+	//   mVoiceCommandMutex, which every producer holds for its whole call)
+	//   and applies the copy under the audio mutex, before whatever runs
+	//   under that hold: a mix block, or a locking API call. Nothing runs in
+	//   between two changes of one drain, so only the state after all of them
+	//   can be observed, and that state does not depend on where in the queue
+	//   a change sits: changes to different voices, or to different fields
+	//   (volume, pan, pause, seek) of one voice, write disjoint state; for
+	//   one field of one voice, the newest value is the one it ends up with
+	//   either way.
+	// - A locking call (fadeVolume, stop, play, getActiveVoiceCount, ...)
+	//   drains the queue before it runs, and a change made after it returns
+	//   queues anew. Coalescing only merges changes queued before the same
+	//   drain, so no change moves across a locking call: setVolume(0) then
+	//   fadeVolume() fades from 0, and fadeVolume() then setVolume() stops
+	//   the fade, as before.
+	// - With the render-ahead ring, the changes of one drain are all placed
+	//   at the same playhead time (applyVoiceCommandBatch_internal()), so
+	//   their order among themselves does not matter there either.
+	// - The voice group of a call is expanded under both mutexes, and a
+	//   consumer takes mVoiceCommandMutex to copy the queue out, so a group
+	//   call is applied to all of its voices in one drain or not yet at all.
+	// - Handles: an entry is keyed on the slot, but the field carries the
+	//   handle of the voice it was set for. A call for a new voice in the
+	//   slot resets the slot's fields; an entry of the old voice whose field
+	//   was reset (ticket 0) is dropped, and the new voice's own change
+	//   takes over an entry still queued for its type. A consumer applies an
+	//   entry only to the voice whose handle the field carries, if it still
+	//   plays.
+	//
+	// What coalescing gives up is an intermediate value that never reached
+	// a mix block anyway: setPause(true) then setPause(false) before the next
+	// block leaves the voice playing, without the pause in between (with the
+	// render-ahead ring that pause used to be placed at the playhead and the
+	// resume at the end of the audio already mixed ahead, muting the voice in
+	// between; now it just keeps playing). Of several seeks of a voice, only
+	// the newest runs.
 	bool Soloud::queueVoiceCommand_internal(unsigned int aType, handle aVoiceHandle, double aValue)
 	{
 		const bool isSeek = aType == VoiceCommand::SEEK;
-		for (;;)
+		// With no mixer running (device stopped, or nobody calling mix()), a
+		// queued seek would wait for the next mix block: apply it now
+		// instead. The mutex is free then, unless a long block is in progress
+		// or another call holds it; the try-lock then fails and the seek is
+		// queued as usual. So a seek on a paused voice with the device stopped
+		// still reaches the source right away (e.g. to start prefetching the
+		// target). The seeks queued before (while a mixer still ran) go first:
+		// with no mixer, this is the only place they can run, and a later seek
+		// of the same voice must land after them.
+		if (isSeek && isMixerIdle_internal() && tryLockAudioMutex_internal())
 		{
-			// With no mixer running (device stopped, or nobody calling mix()), a
-			// queued command would wait for the next mix block: apply it now
-			// instead. The mutex is free then, unless a long block is in progress
-			// or another call holds it; the try-lock then fails and the command is
-			// queued as usual. So a seek on a paused voice with the device stopped
-			// still reaches the source right away (e.g. to start prefetching the
-			// target). The seeks queued before (while a mixer still ran) go first:
-			// with no mixer, this is the only place they can run, and a later seek
-			// of the same voice must land after them.
-			if (isMixerIdle_internal() && tryLockAudioMutex_internal())
-			{
-				applyQueuedSeeks_internal();
-				return false;
-			}
-			// With the render-ahead ring, a volume, pan or pause change normally
-			// lands retroactively at the playhead, inside audio already mixed
-			// ahead (retroactiveParam_internal), which a later mix block cannot
-			// do as well. Keep that when the mutex is free and no other volume,
-			// pan or pause change is queued (applying those here could re-mix the
-			// ring for each, on this caller); a hold in progress (a mix block) or
-			// queued changes send it to the queue, where the mixer still places
-			// it at the playhead of its next block. Queued seeks stay queued
-			// either way (see applyQueuedSeeks_internal). A seek does not rewrite
-			// the ring, so while the mixer runs it is always queued: a source seek
-			// would otherwise run on the caller.
-			if (!isSeek && isRenderAheadEnabled() && mRenderRing.isInited() &&
-				tryLockAudioMutex_internal(true))
-			{
-				return false;
-			}
-
-			{
-				// Lock order: mVoiceGroupMutex, then mVoiceCommandMutex. Neither
-				// is ever held while waiting for the audio mutex.
-				std::lock_guard<std::mutex> groupLock(mVoiceGroupMutex);
-				std::lock_guard<std::mutex> commandLock(mVoiceCommandMutex);
-
-				handle single[2] = { aVoiceHandle, 0 };
-				const handle *voices = voiceGroupHandleToArray_internal(aVoiceHandle);
-				if (voices == NULL)
-					voices = single;
-				unsigned int count = 0;
-				const handle *h;
-				for (h = voices; *h; h++)
-					count++;
-
-				// Seeks go to their own ring (see applyQueuedSeeks_internal).
-				VoiceCommand *ring = isSeek ? mSeekCommand : mVoiceCommand;
-				std::atomic<unsigned int> &ringHead = isSeek ? mSeekCommandHead : mVoiceCommandHead;
-				std::atomic<unsigned int> &ringTail = isSeek ? mSeekCommandTail : mVoiceCommandTail;
-				const unsigned int head = ringHead.load(std::memory_order_acquire);
-				unsigned int tail = ringTail.load(std::memory_order_relaxed);
-				// All of a voice group's commands or none: a group call is never
-				// half queued and half applied.
-				if (count <= VOICE_COMMAND_QUEUE_SIZE - (tail - head))
-				{
-					for (h = voices; *h; h++)
-					{
-						const handle voiceHandle = *h;
-						const unsigned int slot = voiceSlotOf(voiceHandle);
-						// Like FOR_ALL_VOICES_PRE, skip handles that do not name a
-						// live voice (a voice group handle never does).
-						if ((voiceHandle & 0xfffff000) == 0xfffff000 || slot >= VOICE_COUNT ||
-							mPublishedVoice[slot].mHandle.load(std::memory_order_acquire) != voiceHandle)
-						{
-							continue;
-						}
-
-						const unsigned long long ticket = ++mVoiceCommandTicket;
-
-						// Pending value first, so a get right after this set returns
-						// it; the mixer may apply the command as soon as it is queued.
-						PendingVoiceControl &q = mPendingVoice[slot];
-						const unsigned int seq = q.mSeq.load(std::memory_order_relaxed);
-						q.mSeq.store(seq + 1, std::memory_order_relaxed);
-						std::atomic_thread_fence(std::memory_order_release);
-						if (q.mHandle.load(std::memory_order_relaxed) != voiceHandle)
-						{
-							// The slot holds another voice now: its values are not
-							// this voice's.
-							q.mHandle.store(voiceHandle, std::memory_order_relaxed);
-							q.mVolumeTicket.store(0, std::memory_order_relaxed);
-							q.mPanTicket.store(0, std::memory_order_relaxed);
-							q.mPauseTicket.store(0, std::memory_order_relaxed);
-							q.mSeekTicket.store(0, std::memory_order_relaxed);
-						}
-						switch (aType)
-						{
-						case VoiceCommand::VOLUME:
-							q.mVolume.store((float)aValue, std::memory_order_relaxed);
-							q.mVolumeTicket.store(ticket, std::memory_order_relaxed);
-							break;
-						case VoiceCommand::PAN:
-							q.mPan.store((float)aValue, std::memory_order_relaxed);
-							q.mPanTicket.store(ticket, std::memory_order_relaxed);
-							break;
-						case VoiceCommand::PAUSE:
-							q.mPause.store(aValue != 0 ? 1 : 0, std::memory_order_relaxed);
-							q.mPauseTicket.store(ticket, std::memory_order_relaxed);
-							break;
-						case VoiceCommand::SEEK:
-							q.mSeek.store(aValue, std::memory_order_relaxed);
-							q.mSeekTicket.store(ticket, std::memory_order_relaxed);
-							break;
-						}
-						q.mSeq.store(seq + 2, std::memory_order_release);
-
-						VoiceCommand &command = ring[tail % VOICE_COMMAND_QUEUE_SIZE];
-						command.mTicket = ticket;
-						command.mHandle = voiceHandle;
-						command.mType = aType;
-						command.mValue = aValue;
-						tail++;
-					}
-					ringTail.store(tail, std::memory_order_release);
-					return true;
-				}
-			}
-
-			if (!isSeek)
-			{
-				// The queue is full (nothing has mixed for a long while, so
-				// nothing drained it): take the mutex like the original call did.
-				// Locking applies every volume/pan/pause change queued so far
-				// first, so the order holds.
-				lockAudioMutex_internal();
-				return false;
-			}
-			// VOICE_COMMAND_QUEUE_SIZE seeks queued since the last block start.
-			// Applying them here would run their source seeks on this caller, so
-			// wait for the mixer's next block to drain the queue instead; if the
-			// mixer has stopped meanwhile, the idle path above takes over. A UI
-			// cannot get here (it seeks a few times per block); a tight loop of
-			// seeks waits at most about a block per VOICE_COMMAND_QUEUE_SIZE.
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			applyQueuedSeeks_internal();
+			return false;
 		}
+
+		unsigned int queued = 0;
+		{
+			// Lock order: mVoiceGroupMutex, then mVoiceCommandMutex. Neither
+			// is ever held while waiting for the audio mutex.
+			std::lock_guard<std::mutex> groupLock(mVoiceGroupMutex);
+			VoiceCommandLock commandLock(mVoiceCommandMutex, false);
+
+			handle single[2] = { aVoiceHandle, 0 };
+			const handle *voices = voiceGroupHandleToArray_internal(aVoiceHandle);
+			if (voices == NULL)
+				voices = single;
+			const unsigned char bit = (unsigned char)(1u << aType);
+			const handle *h;
+			for (h = voices; *h; h++)
+			{
+				const handle voiceHandle = *h;
+				const unsigned int slot = voiceSlotOf(voiceHandle);
+				// Like FOR_ALL_VOICES_PRE, skip handles that do not name a
+				// live voice (a voice group handle never does).
+				if ((voiceHandle & 0xfffff000) == 0xfffff000 || slot >= VOICE_COUNT ||
+					mPublishedVoice[slot].mHandle.load(std::memory_order_acquire) != voiceHandle)
+				{
+					continue;
+				}
+
+				const unsigned long long ticket = ++mVoiceCommandTicket;
+
+				// The value, for the consumer and for a get right after this
+				// set.
+				PendingVoiceControl &q = mPendingVoice[slot];
+				const unsigned int seq = q.mSeq.load(std::memory_order_relaxed);
+				q.mSeq.store(seq + 1, std::memory_order_relaxed);
+				std::atomic_thread_fence(std::memory_order_release);
+				if (q.mHandle.load(std::memory_order_relaxed) != voiceHandle)
+				{
+					// The slot holds another voice now: its values are not
+					// this voice's, and its entries still queued are dropped.
+					q.mHandle.store(voiceHandle, std::memory_order_relaxed);
+					q.mVolumeTicket.store(0, std::memory_order_relaxed);
+					q.mPanTicket.store(0, std::memory_order_relaxed);
+					q.mPauseTicket.store(0, std::memory_order_relaxed);
+					q.mSeekTicket.store(0, std::memory_order_relaxed);
+				}
+				switch (aType)
+				{
+				case VoiceCommand::VOLUME:
+					q.mVolume.store((float)aValue, std::memory_order_relaxed);
+					q.mVolumeTicket.store(ticket, std::memory_order_relaxed);
+					break;
+				case VoiceCommand::PAN:
+					q.mPan.store((float)aValue, std::memory_order_relaxed);
+					q.mPanTicket.store(ticket, std::memory_order_relaxed);
+					break;
+				case VoiceCommand::PAUSE:
+					q.mPause.store(aValue != 0 ? 1 : 0, std::memory_order_relaxed);
+					q.mPauseTicket.store(ticket, std::memory_order_relaxed);
+					break;
+				case VoiceCommand::SEEK:
+					q.mSeek.store(aValue, std::memory_order_relaxed);
+					q.mSeekTicket.store(ticket, std::memory_order_relaxed);
+					break;
+				}
+				q.mSeq.store(seq + 2, std::memory_order_release);
+
+				// The entry, unless the slot already has one of this type: that
+				// one applies the value just stored.
+				if (!(mVoiceCommandQueued[slot] & bit))
+				{
+					mVoiceCommandQueued[slot] |= bit;
+					if (isSeek)
+					{
+						SOLOUD_ASSERT(mSeekCommandListCount < VOICE_COUNT);
+						mSeekCommandList[mSeekCommandListCount++] = (unsigned short)slot;
+					}
+					else
+					{
+						SOLOUD_ASSERT(mVoiceCommandListCount < VOICE_COUNT * 3);
+						mVoiceCommandList[mVoiceCommandListCount++] = (unsigned short)(slot * 4 + aType);
+					}
+				}
+				queued++;
+			}
+			mVoiceCommandPending.store(mVoiceCommandListCount, std::memory_order_release);
+			mSeekCommandPending.store(mSeekCommandListCount, std::memory_order_release);
+		}
+		if (queued == 0 || isSeek)
+			return true;
+
+		// Volume, pan and pause: apply at once when the mutex is free and
+		// either no mixer runs (nothing would apply them soon) or the
+		// render-ahead ring is on (a change normally lands retroactively at
+		// the playhead, inside audio already mixed ahead, which a later mix
+		// block cannot do as well). Taking the mutex applies everything
+		// queued, this change included, with one re-mix of the ring for all
+		// of it. A hold in progress (a mix block) leaves it to the next one,
+		// which places it at the playhead of its block. Queued seeks stay
+		// queued while a mixer runs (see applyQueuedSeeks_internal).
+		const bool idle = isMixerIdle_internal();
+		if ((idle || (isRenderAheadEnabled() && mRenderRing.isInited())) && tryLockAudioMutex_internal())
+		{
+			if (idle)
+				applyQueuedSeeks_internal();
+			unlockAudioMutex_internal();
+		}
+		return true;
 	}
 
-	result Soloud::applyVoiceCommand_internal(unsigned int aType, unsigned int aVoice, double aValue)
+	result Soloud::applySeek_internal(unsigned int aVoice, double aSeconds)
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
 		if (aVoice >= VOICE_COUNT || mVoice[aVoice] == NULL)
 			return INVALID_PARAMETER;
-		const float value = (float)aValue;
-		switch (aType)
+		const result res = mVoice[aVoice]->seek(aSeconds, mScratch.mData, mScratchSize);
+		if (res == SO_NO_ERROR)
 		{
-		case VoiceCommand::VOLUME:
-			// ###### flutter_soloud local patch (retroactive re-mix) ######
-			if (!retroactiveParam_internal(aVoice, RetroJournalEntry::PARAM_VOLUME, value, 0, playheadTimeLocked_internal()) &&
-				mVoice[aVoice] != NULL)
-			{
-				mVoice[aVoice]->mVolumeFader.mActive = 0;
-				setVoiceVolume_internal(aVoice, value);
-			}
-			break;
-		case VoiceCommand::PAN:
-			// ###### flutter_soloud local patch (retroactive re-mix) ######
-			if (!retroactiveParam_internal(aVoice, RetroJournalEntry::PARAM_PAN, value, 0, playheadTimeLocked_internal()) &&
-				mVoice[aVoice] != NULL)
-			{
-				mVoice[aVoice]->mPanFader.mActive = 0;
-				setVoicePan_internal(aVoice, value);
-			}
-			break;
-		case VoiceCommand::PAUSE:
-			// ###### flutter_soloud local patch (retroactive re-mix) ######
-			// Retroactive only for pausing; unpausing keeps legacy placement.
-			if (value == 0.0f ||
-				!retroactiveParam_internal(aVoice, RetroJournalEntry::PARAM_PAUSE, 1.0f, 0, playheadTimeLocked_internal()))
-			{
-				setVoicePause_internal(aVoice, value != 0.0f);
-			}
-			break;
-		case VoiceCommand::SEEK:
-		{
-			const result res = mVoice[aVoice]->seek(aValue, mScratch.mData, mScratchSize);
-			if (res == SO_NO_ERROR)
-			{
-				mVoice[aVoice]->mSourceSamplePosition = (uint64_t)floor(
-					aValue * mVoice[aVoice]->mBaseSamplerate);
-			}
-			return res;
+			mVoice[aVoice]->mSourceSamplePosition = (uint64_t)floor(
+				aSeconds * mVoice[aVoice]->mBaseSamplerate);
 		}
-		default:
-			return INVALID_PARAMETER;
-		}
-		return SO_NO_ERROR;
+		return res;
 	}
 
-	void Soloud::applyVoiceCommands_internal()
+	void Soloud::applyVoiceCommands_internal(bool aTryOnly)
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
-		unsigned int head = mVoiceCommandHead.load(std::memory_order_relaxed);
-		const unsigned int tail = mVoiceCommandTail.load(std::memory_order_acquire);
-		while (head != tail)
+		// A producer publishes the count before it releases the mutex, so a
+		// change made before this call on this thread is seen here.
+		if (mVoiceCommandPending.load(std::memory_order_acquire) == 0)
+			return;
+		unsigned int count = 0;
+		unsigned long long drained = 0;
 		{
-			const VoiceCommand command = mVoiceCommand[head % VOICE_COMMAND_QUEUE_SIZE];
-			head++;
-			// Hand the slot back before applying: applying can take a while
-			// (a retroactive re-mix), and producers may refill it meanwhile.
-			mVoiceCommandHead.store(head, std::memory_order_release);
+			VoiceCommandLock lock(mVoiceCommandMutex, aTryOnly);
+			if (!lock.locked())
+				return; // a control call holds it: the next block applies them
+			unsigned int i;
+			for (i = 0; i < mVoiceCommandListCount; i++)
+			{
+				const unsigned int slot = mVoiceCommandList[i] >> 2;
+				const unsigned int type = mVoiceCommandList[i] & 3;
+				mVoiceCommandQueued[slot] &= (unsigned char)~(1u << type);
+				const PendingVoiceControl &q = mPendingVoice[slot];
+				VoiceCommand &c = mVoiceCommandBatch[count];
+				c.mTicket = pendingTicket(q, type);
+				if (c.mTicket == 0)
+					continue; // reset for a newer voice in the slot
+				c.mHandle = q.mHandle.load(std::memory_order_relaxed);
+				c.mType = (unsigned short)type;
+				c.mValue = pendingValue(q, type);
+				count++;
+			}
+			mVoiceCommandListCount = 0;
+			mVoiceCommandPending.store(0, std::memory_order_relaxed);
+			// Every volume/pan/pause change with a ticket up to here is in the
+			// copy, or was replaced by a newer value that is.
+			drained = mVoiceCommandTicket;
+		}
+		applyVoiceCommandBatch_internal(mVoiceCommandBatch, count);
+		mVoiceCommandDrainedTicket = drained;
+	}
+
+	// One drain applies at most one change per voice and type. With the
+	// render-ahead ring, every change that can be placed retroactively at the
+	// playhead is placed in a single rollback: restore the checkpoint
+	// (retroactiveBegin_internal), schedule each change at the playhead
+	// (retroactiveParamInWindow_internal), re-mix the ring once
+	// (retroactiveEnd_internal). One by one, as a single call does it
+	// (retroactiveParam_internal), each change re-mixed the ring again, and a
+	// drain of a few hundred changes took as many re-mixes, on whichever
+	// thread drained: the mixer, or an unrelated locking call such as
+	// getActiveVoiceCount(). The result is the same either way: all of them
+	// land at the same playhead time, and each re-mix replays the journal of
+	// the ones placed before it. The changes that cannot be placed so (a
+	// paused voice, a resume, or the rollback declined) are applied to the
+	// live voice state afterwards, as the legacy setters do, so the restore
+	// cannot undo them.
+	void Soloud::applyVoiceCommandBatch_internal(VoiceCommand *aBatch, unsigned int aCount)
+	{
+		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+		unsigned int retroactive = 0;
+		unsigned int i;
+		for (i = 0; i < aCount; i++)
+		{
+			VoiceCommand &c = aBatch[i];
 			// The voice may have ended, or its slot been reused, since the
-			// command was queued: the handle check drops the command then.
-			const int ch = getVoiceFromHandle_internal(command.mHandle);
-			if (ch >= 0)
-				applyVoiceCommand_internal(command.mType, (unsigned int)ch, command.mValue);
-			mVoiceCommandDrainedTicket = command.mTicket;
+			// change was queued: the handle check drops the change then.
+			const int ch = getVoiceFromHandle_internal(c.mHandle);
+			if (ch < 0)
+			{
+				c.mState = BATCH_DROPPED;
+				continue;
+			}
+			const int param = c.mType == VoiceCommand::VOLUME ? RetroJournalEntry::PARAM_VOLUME :
+				c.mType == VoiceCommand::PAN ? RetroJournalEntry::PARAM_PAN : RetroJournalEntry::PARAM_PAUSE;
+			if (retroactiveParamEligible_internal((unsigned int)ch, param, (float)c.mValue))
+			{
+				c.mState = BATCH_RETROACTIVE;
+				retroactive++;
+			}
+			else
+			{
+				c.mState = BATCH_IMMEDIATE;
+			}
+		}
+
+		if (retroactive > 0)
+		{
+			const time playhead = playheadTimeLocked_internal();
+			const int ci = retroactiveBegin_internal(playhead);
+			for (i = 0; i < aCount; i++)
+			{
+				VoiceCommand &c = aBatch[i];
+				if (c.mState != BATCH_RETROACTIVE)
+					continue;
+				const int ch = ci >= 0 ? getVoiceFromHandle_internal(c.mHandle) : -1;
+				bool placed = false;
+				if (ch >= 0)
+				{
+					switch (c.mType)
+					{
+					case VoiceCommand::VOLUME:
+						placed = retroactiveParamInWindow_internal((unsigned int)ch, mVoice[ch]->mPlayIndex,
+							RetroJournalEntry::PARAM_VOLUME, (float)c.mValue, 0, playhead);
+						break;
+					case VoiceCommand::PAN:
+						placed = retroactiveParamInWindow_internal((unsigned int)ch, mVoice[ch]->mPlayIndex,
+							RetroJournalEntry::PARAM_PAN, (float)c.mValue, 0, playhead);
+						break;
+					case VoiceCommand::PAUSE:
+						placed = retroactiveParamInWindow_internal((unsigned int)ch, mVoice[ch]->mPlayIndex,
+							RetroJournalEntry::PARAM_PAUSE, 1.0f, 0, playhead);
+						break;
+					}
+				}
+				if (!placed)
+					c.mState = BATCH_IMMEDIATE;
+			}
+			if (ci >= 0)
+				retroactiveEnd_internal(ci);
+		}
+
+		for (i = 0; i < aCount; i++)
+		{
+			const VoiceCommand &c = aBatch[i];
+			if (c.mState != BATCH_IMMEDIATE)
+				continue;
+			const int ch = getVoiceFromHandle_internal(c.mHandle);
+			if (ch < 0)
+				continue;
+			switch (c.mType)
+			{
+			case VoiceCommand::VOLUME:
+				mVoice[ch]->mVolumeFader.mActive = 0;
+				setVoiceVolume_internal((unsigned int)ch, (float)c.mValue);
+				break;
+			case VoiceCommand::PAN:
+				mVoice[ch]->mPanFader.mActive = 0;
+				setVoicePan_internal((unsigned int)ch, (float)c.mValue);
+				break;
+			case VoiceCommand::PAUSE:
+				setVoicePause_internal((unsigned int)ch, c.mValue != 0);
+				break;
+			}
 		}
 	}
 
@@ -619,9 +797,10 @@ namespace SoLoud
 	// in mix_internal()), and a control call on the idle-mixer path
 	// (queueVoiceCommand_internal()), where no mixer would run them. Every
 	// other call that takes the audio mutex applies the queued
-	// volume/pan/pause changes but leaves those seeks queued, so a source's seek work (decoding, file reads) never lands on a
-	// thread that merely locked after it -- play() on the UI thread, or
-	// getActiveVoiceCount() under the plugin's device-lifecycle mutex.
+	// volume/pan/pause changes but leaves those seeks queued, so a source's
+	// seek work (decoding, file reads) never lands on a thread that merely
+	// locked after it -- play() on the UI thread, or getActiveVoiceCount()
+	// under the plugin's device-lifecycle mutex.
 	//
 	// Leaving them queued is order-safe because a seek writes only its own
 	// voice's source state (decoder, file position) and play position
@@ -652,74 +831,67 @@ namespace SoLoud
 	//   queued seek then lands on the target at the new rate. The plugin
 	//   never calls it on a voice.
 	//
-	// Only the newest seek queued for a voice runs: one with a newer seek
-	// queued after it (its slot's pending seek ticket is newer) is skipped.
-	// Nothing plays between two seeks applied at the same block start, so the
-	// older one could only cost time inside the block. The newer one is
-	// already queued, or about to be (its producer publishes the ticket
-	// before the command); in that case it runs at the next block.
+	// A voice has at most one seek queued: a newer one replaces its target
+	// (see queueVoiceCommand_internal()), so only the newest runs. Nothing
+	// plays between two seeks applied at the same block start, so the older
+	// one could only cost time inside the block.
 	//
 	// The one exception to "mixer only": a voice whose instance reports
 	// hasCheapSeek() (NativeStream: its seek only posts a request to its
 	// decoder thread). Every other lock holder applies those seeks too
 	// (aOnlyCheap), so the decoder starts on the target as soon as anything
-	// takes the mutex. They are consumed in place and the rest stay queued
-	// in order; all seeks of one voice share its instance, so a voice's seeks
-	// are either all cheap or all left for the mixer, and their order holds.
-	// Seek-cost-wise this is safe for any caller; order-wise the reasoning
-	// above holds either way, since a seek applied earlier is just what a
-	// locking call used to see before seeks were queued.
-	void Soloud::applyQueuedSeeks_internal(bool aOnlyCheap)
+	// takes the mutex; the rest stay queued, in order. Seek-cost-wise this is
+	// safe for any caller; order-wise the reasoning above holds either way,
+	// since a seek applied earlier is just what a locking call used to see
+	// before seeks were queued.
+	void Soloud::applyQueuedSeeks_internal(bool aOnlyCheap, bool aTryOnly)
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
-		unsigned int head = mSeekCommandHead.load(std::memory_order_relaxed);
-		const unsigned int tail = mSeekCommandTail.load(std::memory_order_acquire);
-		// Entries in [head, tail) belong to the consumer (the audio mutex
-		// holder): producers only write at and past tail. Cheap seeks applied
-		// in place below are marked consumed with handle 0, which no voice has.
-		bool leading = true;
-		unsigned int i;
-		for (i = head; i != tail; i++)
+		if (mSeekCommandPending.load(std::memory_order_acquire) == 0)
+			return;
+		unsigned int count = 0;
 		{
-			VoiceCommand &entry = mSeekCommand[i % VOICE_COMMAND_QUEUE_SIZE];
-			const VoiceCommand command = entry;
-			bool consumed = true;
-			const unsigned int slot = voiceSlotOf(command.mHandle);
-			// A single atomic load, never the seqlock: the mixer must not spin
-			// on a producer. A newer ticket was written for this slot after
-			// this command's either for this voice (superseded) or for a voice
-			// that replaced it (this one is gone); skip it either way.
-			if (slot < VOICE_COUNT &&
-				mPendingVoice[slot].mSeekTicket.load(std::memory_order_acquire) <= command.mTicket)
+			VoiceCommandLock lock(mVoiceCommandMutex, aTryOnly);
+			if (!lock.locked())
+				return; // a control call holds it: the next block applies them
+			unsigned int kept = 0;
+			unsigned int i;
+			for (i = 0; i < mSeekCommandListCount; i++)
 			{
-				const int ch = getVoiceFromHandle_internal(command.mHandle);
-				if (ch >= 0)
+				const unsigned int slot = mSeekCommandList[i];
+				const PendingVoiceControl &q = mPendingVoice[slot];
+				const unsigned long long ticket = q.mSeekTicket.load(std::memory_order_relaxed);
+				const handle voiceHandle = q.mHandle.load(std::memory_order_relaxed);
+				if (ticket != 0 && aOnlyCheap)
 				{
-					if (aOnlyCheap && !mVoice[ch]->hasCheapSeek())
+					const int ch = getVoiceFromHandle_internal(voiceHandle);
+					if (ch >= 0 && !mVoice[ch]->hasCheapSeek())
 					{
-						consumed = false; // left for the mixer
-					}
-					else
-					{
-						applyVoiceCommand_internal(VoiceCommand::SEEK, (unsigned int)ch, command.mValue);
-						mVoiceSeekAppliedTicket[ch] = command.mTicket;
+						mSeekCommandList[kept++] = (unsigned short)slot; // left for the mixer
+						continue;
 					}
 				}
+				mVoiceCommandQueued[slot] &= (unsigned char)~(1u << VoiceCommand::SEEK);
+				if (ticket == 0)
+					continue; // reset for a newer voice in the slot
+				VoiceCommand &c = mSeekCommandBatch[count++];
+				c.mTicket = ticket;
+				c.mHandle = voiceHandle;
+				c.mType = VoiceCommand::SEEK;
+				c.mValue = q.mSeek.load(std::memory_order_relaxed);
 			}
-			if (!consumed)
-			{
-				leading = false;
+			mSeekCommandListCount = kept;
+			mSeekCommandPending.store(kept, std::memory_order_relaxed);
+		}
+		unsigned int i;
+		for (i = 0; i < count; i++)
+		{
+			const VoiceCommand &c = mSeekCommandBatch[i];
+			const int ch = getVoiceFromHandle_internal(c.mHandle);
+			if (ch < 0)
 				continue;
-			}
-			if (leading)
-			{
-				// Hand the slot back to the producers.
-				mSeekCommandHead.store(i + 1, std::memory_order_release);
-			}
-			else
-			{
-				entry.mHandle = 0;
-			}
+			applySeek_internal((unsigned int)ch, c.mValue);
+			mVoiceSeekAppliedTicket[ch] = c.mTicket;
 		}
 	}
 }

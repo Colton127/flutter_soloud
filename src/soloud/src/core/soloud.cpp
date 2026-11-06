@@ -207,11 +207,13 @@ namespace SoLoud
 			q.mPan.store(0, std::memory_order_relaxed);
 			q.mPause.store(0, std::memory_order_relaxed);
 			q.mSeek.store(0, std::memory_order_relaxed);
+			mVoiceCommandQueued[i] = 0;
 		}
-		mVoiceCommandHead.store(0, std::memory_order_relaxed);
-		mVoiceCommandTail.store(0, std::memory_order_relaxed);
-		mSeekCommandHead.store(0, std::memory_order_relaxed);
-		mSeekCommandTail.store(0, std::memory_order_relaxed);
+		mVoiceCommandListCount = 0;
+		mSeekCommandListCount = 0;
+		mVoiceCommandPending.store(0, std::memory_order_relaxed);
+		mSeekCommandPending.store(0, std::memory_order_relaxed);
+		mVoiceCommandMutex = Thread::createMutex();
 		mVoiceCommandTicket = 0;
 		mVoiceCommandDrainedTicket = 0;
 		mVoiceCommandAppliedTicket.store(0, std::memory_order_relaxed);
@@ -234,6 +236,9 @@ namespace SoLoud
 		delete[] mVoiceGroup;
 		delete[] mResampleData;
 		delete[] mResampleDataOwner;
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		Thread::destroyMutex(mVoiceCommandMutex);
+		mVoiceCommandMutex = NULL;
 	}
 
 	void Soloud::deinit()
@@ -2639,35 +2644,24 @@ namespace SoLoud
 		// at a mix block start; anywhere else only those of sources whose seek
 		// is cheap (hasCheapSeek), as the others would run a source's seek
 		// work on an unrelated caller (see applyQueuedSeeks_internal). The
-		// flag is already set only on a same-thread re-entry of the web's
-		// recursive mutex (from inside a mix or another hold); the outer hold
-		// applies them.
+		// mixer never waits for the queue's own mutex: when a control call
+		// holds it, the queue waits for the next block. The flag is already
+		// set only on a same-thread re-entry of the web's recursive mutex
+		// (from inside a mix or another hold); the outer hold applies them.
 		const bool reentered = mInsideAudioThreadMutex;
 		mInsideAudioThreadMutex = true;
 		if (!reentered)
 		{
-			applyVoiceCommands_internal();
-			applyQueuedSeeks_internal(!aMixBlockStart);
+			applyVoiceCommands_internal(aMixBlockStart);
+			applyQueuedSeeks_internal(!aMixBlockStart, aMixBlockStart);
 		}
 	}
 
 	// ###### flutter_soloud local patch (non-blocking voice control) ######
-	bool Soloud::tryLockAudioMutex_internal(bool aOnlyWithEmptyQueue)
+	bool Soloud::tryLockAudioMutex_internal()
 	{
 		if (mAudioThreadMutex && Thread::tryLockMutex(mAudioThreadMutex) != 0)
 			return false;
-		// With the mutex held the consumer side (head) cannot move. A command
-		// queued after this check was issued concurrently with the caller's
-		// call, and applying it after that call is a valid order. Queued
-		// seeks do not count: this applies only cheap ones.
-		if (aOnlyWithEmptyQueue &&
-			mVoiceCommandHead.load(std::memory_order_relaxed) !=
-				mVoiceCommandTail.load(std::memory_order_acquire))
-		{
-			if (mAudioThreadMutex)
-				Thread::unlockMutex(mAudioThreadMutex);
-			return false;
-		}
 		const bool reentered = mInsideAudioThreadMutex;
 		mInsideAudioThreadMutex = true;
 		if (!reentered)
