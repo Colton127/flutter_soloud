@@ -98,9 +98,6 @@ freely, subject to the following restrictions:
 #define SOLOUD_DEFAULT_RESAMPLER SoLoud::Soloud::RESAMPLER_LINEAR
 
 // ###### flutter_soloud local patch (non-blocking voice control) ######
-// Capacity of the voice control queue (see Soloud::setVolume). A power of
-// two. When it is full, control calls fall back to taking the audio mutex.
-#define VOICE_COMMAND_QUEUE_SIZE 1024
 // No mix block for this long (and for 4 block lengths): the mixer counts as
 // idle, and voice control calls apply at once instead of queueing.
 #define VOICE_COMMAND_MIXER_IDLE_MS 100
@@ -172,12 +169,17 @@ namespace SoLoud
 	// its own decoding under the mutex. The voice control calls below no
 	// longer take the audio mutex:
 	//
-	// - setVolume/setPan/setPause push a VoiceCommand onto a bounded queue.
+	// - setVolume/setPan/setPause queue the change for the voice.
 	//   lockAudioMutex_internal() applies everything queued before whatever
-	//   runs under the mutex, so the mixer applies a command at the start of
+	//   runs under the mutex, so the mixer applies a change at the start of
 	//   its next block, and any API call that still locks sees every earlier
-	//   command applied first: commands and locking calls stay in call order.
-	// - seek pushes onto a queue of its own that only the mixer drains, at the
+	//   change applied first: changes and locking calls stay in call order.
+	//   The queue holds at most one change per voice and kind (volume, pan,
+	//   pause, seek): a newer one replaces the value of one still queued
+	//   (last value wins). So it never fills up, a call never waits for room
+	//   in it, and draining it is bounded (see queueVoiceCommand_internal()
+	//   for why that keeps the call order).
+	// - seek queues in a list of its own that only the mixer drains, at the
 	//   start of its next block (before the voice's next getAudio()), so a
 	//   source seek's own work never lands on a thread that merely takes the
 	//   mutex after it (play(), stop(), getActiveVoiceCount(), ...). Leaving
@@ -188,14 +190,17 @@ namespace SoLoud
 	// - With no mixer running (device stopped, or a backend driven by hand)
 	//   there is no next block, so a control call made while no block has
 	//   started for a while applies everything queued, seeks included, and
-	//   then its own change at once under the free mutex instead
+	//   its own change at once under the free mutex instead
 	//   (isMixerIdle_internal).
 	// - getVolume/getPan/getPause/getStreamPosition/isValidVoiceHandle read a
 	//   per-voice PublishedVoiceState, refreshed under the mutex whenever it is
 	//   released, overlaid with the newest still-queued value from
 	//   PendingVoiceControl, so a get right after a set returns the new value.
 	// - Voice groups get their own small mutex (mVoiceGroupMutex), which the
-	//   audio thread never takes; see soloud_core_voicegroup.cpp.
+	//   audio thread never takes; see soloud_core_voicegroup.cpp. The queue
+	//   has one too (mVoiceCommandMutex), which the audio thread only ever
+	//   try-locks: when a control call holds it, the mixer leaves the queue
+	//   for its next block.
 	//
 	// A seek the mixer applies runs inside its block and holds up every voice,
 	// so streamed sources seek in a few milliseconds at most: WavStream MP3
@@ -224,7 +229,9 @@ namespace SoLoud
 	// ticket of the command that set it. A field is still pending while its
 	// ticket is newer than mVoiceCommandAppliedTicket (the seek field: newer
 	// than the slot's PublishedVoiceState::mSeekTicket). Seqlock; written only
-	// by producers, which mVoiceCommandMutex serializes.
+	// by producers, which mVoiceCommandMutex serializes. It is also where a
+	// queued change keeps its value: the queue itself only lists which voice
+	// and field changed.
 	struct PendingVoiceControl
 	{
 		std::atomic<unsigned int> mSeq;
@@ -240,7 +247,8 @@ namespace SoLoud
 		std::atomic<double> mSeek;
 	};
 
-	// One queued voice control call, already expanded to a single voice.
+	// One voice control change, already expanded to a single voice: what the
+	// consumer copies out of the queue to apply it.
 	struct VoiceCommand
 	{
 		enum TYPE
@@ -250,10 +258,12 @@ namespace SoLoud
 			PAUSE,
 			SEEK
 		};
+		double mValue;
 		unsigned long long mTicket;
 		unsigned int mHandle;
-		unsigned int mType;
-		double mValue;
+		unsigned short mType;
+		// The consumer's own bookkeeping while it applies a batch.
+		unsigned short mState;
 	};
 
 	// Result of a lock-free voice state read (see Soloud::readVoiceState_internal).
@@ -637,11 +647,12 @@ namespace SoLoud
 		// setPause, setPan and setVolume are queued and applied by the mixer
 		// at the start of its next block (see VoiceCommand). With the
 		// render-ahead ring they are applied right away, retroactively at the
-		// playhead, when the audio mutex is free and no command is queued, and
-		// queued otherwise (a mix holds the mutex, or a queued seek is waiting
-		// for the mixer); the mixer then applies them at the playhead of its
-		// next block. With the mixer idle and the mutex free, they apply right away
-		// in both modes.
+		// playhead, when the audio mutex is free, together with whatever else
+		// is queued (one re-mix of the ring for all of them), and queued
+		// otherwise (a mix holds the mutex); the mixer then applies them at
+		// the playhead of its next block. With the mixer idle and the mutex
+		// free, they apply right away in both modes. They never wait for the
+		// mutex.
 		// Set the pause state
 		void setPause(handle aVoiceHandle, bool aPause);
 		// Pause all voices
@@ -836,6 +847,16 @@ namespace SoLoud
 		// unpausing always takes the legacy path. Caller must hold the audio
 		// mutex.
 		bool retroactiveParam_internal(unsigned int aSlot, int aParam, float aValue, time aDuration, time aEventTime);
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// The two halves of retroactiveParam_internal(), for applying several
+		// changes with one re-mix (Soloud::applyVoiceCommandBatch_internal):
+		// whether the change could be placed retroactively at all (before
+		// retroactiveBegin_internal), and placing it, between
+		// retroactiveBegin_internal and retroactiveEnd_internal, at aEventTime
+		// (the time the begin was called with). The second returns false when
+		// the voice is no longer the one with aPlayIndex.
+		bool retroactiveParamEligible_internal(unsigned int aSlot, int aParam, float aValue);
+		bool retroactiveParamInWindow_internal(unsigned int aSlot, unsigned int aPlayIndex, int aParam, float aValue, time aDuration, time aEventTime);
 		// Rollback primitive shared by all retroactive events: gate-checks
 		// aEventTime, drops queued ended-events the restore would resurrect,
 		// restores the checkpoint at or before aEventTime and replays the
@@ -908,30 +929,31 @@ namespace SoLoud
 		// Lock audio thread mutex. Applies the queued volume/pan/pause
 		// commands before returning (see VoiceCommand), and the queued seeks:
 		// all of them with aMixBlockStart (only mix_internal() passes it),
-		// otherwise only cheap ones (AudioSourceInstance::hasCheapSeek).
+		// otherwise only cheap ones (AudioSourceInstance::hasCheapSeek). The
+		// mixer (aMixBlockStart) only try-locks the queue's own mutex, and
+		// leaves the queue for its next block when a control call holds it.
 		void lockAudioMutex_internal(bool aMixBlockStart = false);
 		// ###### flutter_soloud local patch (non-blocking voice control) ######
 		// Like lockAudioMutex_internal(), but returns false instead of waiting
-		// when another thread holds the mutex. With aOnlyWithEmptyQueue, also
-		// returns false (mutex released) when volume/pan/pause commands are
-		// queued, so the caller never runs another call's queued work (with
-		// the render-ahead ring, each can re-mix the ring). Applies only
-		// cheap queued seeks (AudioSourceInstance::hasCheapSeek).
-		bool tryLockAudioMutex_internal(bool aOnlyWithEmptyQueue = false);
+		// when another thread holds the mutex. Applies only cheap queued
+		// seeks (AudioSourceInstance::hasCheapSeek).
+		bool tryLockAudioMutex_internal();
 		// Unlock audio thread mutex. Publishes the voice states first (see
 		// PublishedVoiceState).
 		void unlockAudioMutex_internal();
 		// ###### flutter_soloud local patch (non-blocking voice control) ######
 		// Queue a voice control call (VoiceCommand::TYPE), expanding voice
-		// groups. Returns true when the call is fully handled: queued, or
-		// nothing to do because no voice matches. Returns false with the audio
-		// mutex held when the caller must apply it itself: the mixer is idle
-		// and the mutex was free, so nothing would apply a queued command
-		// soon (everything queued, seeks included, is applied first); (not
-		// SEEK) the queue is full; or (render-ahead ring, not SEEK) the mutex
-		// was free and no volume/pan/pause command was queued, so the change
-		// can still be placed retroactively at the playhead right away. A
-		// SEEK finding its queue full waits for the mixer to drain it.
+		// groups; a voice with a change of the same type still queued gets
+		// the new value instead (last value wins), so the queue never fills
+		// up. Never waits for the audio mutex. Volume, pan and pause always
+		// return true: queued, then applied at once (with everything else
+		// queued) when the audio mutex is free and either the mixer is idle
+		// or the render-ahead ring is on. SEEK returns true when queued, or
+		// when no voice matches; it returns false with the audio mutex held
+		// when the mixer is idle and the mutex was free, so nothing would
+		// apply a queued seek soon: everything queued, seeks included, has
+		// been applied, and the caller seeks itself and returns the source's
+		// result.
 		bool queueVoiceCommand_internal(unsigned int aType, handle aVoiceHandle, double aValue);
 		// True when no mix block has started for a while (or ever): the
 		// device is stopped or nobody calls mix(), so a queued voice command
@@ -939,17 +961,25 @@ namespace SoLoud
 		// while" is 4 blocks of the length last mixed, and at least
 		// VOICE_COMMAND_MIXER_IDLE_MS.
 		bool isMixerIdle_internal() const;
-		// Apply one voice control call to one voice. Caller holds the audio
-		// mutex. Returns the source's seek() result for SEEK.
-		result applyVoiceCommand_internal(unsigned int aType, unsigned int aVoice, double aValue);
-		// Apply every queued volume/pan/pause command. Caller holds the audio
-		// mutex.
-		void applyVoiceCommands_internal();
-		// Apply the queued seeks, newest per voice. Caller holds the audio
-		// mutex and is the mixer at the start of a block, or a control call on
-		// the idle-mixer path. With aOnlyCheap (any other lock holder), only
-		// those of voices whose instance hasCheapSeek(); the rest stay queued.
-		void applyQueuedSeeks_internal(bool aOnlyCheap = false);
+		// Apply a seek to one voice. Caller holds the audio mutex. Returns the
+		// source's seek() result.
+		result applySeek_internal(unsigned int aVoice, double aSeconds);
+		// Apply every queued volume/pan/pause change. Caller holds the audio
+		// mutex. With aTryOnly (the mixer), leaves them queued when a control
+		// call holds mVoiceCommandMutex.
+		void applyVoiceCommands_internal(bool aTryOnly = false);
+		// Apply volume/pan/pause changes, at most one per voice and type,
+		// already copied out of the queue. With the render-ahead ring, those
+		// placed retroactively at the playhead share a single re-mix. Caller
+		// holds the audio mutex.
+		void applyVoiceCommandBatch_internal(VoiceCommand *aBatch, unsigned int aCount);
+		// Apply the queued seeks. Caller holds the audio mutex and is the
+		// mixer at the start of a block, or a control call on the idle-mixer
+		// path. With aOnlyCheap (any other lock holder), only those of voices
+		// whose instance hasCheapSeek(); the rest stay queued. With aTryOnly
+		// (the mixer), leaves them queued when a control call holds
+		// mVoiceCommandMutex.
+		void applyQueuedSeeks_internal(bool aOnlyCheap = false, bool aTryOnly = false);
 		// Refresh mPublishedVoice for one slot / for every slot in use. Caller
 		// holds the audio mutex.
 		void publishVoiceState_internal(unsigned int aVoice);
@@ -1123,23 +1153,34 @@ namespace SoLoud
 		// See PublishedVoiceState, PendingVoiceControl and VoiceCommand.
 		PublishedVoiceState mPublishedVoice[VOICE_COUNT];
 		PendingVoiceControl mPendingVoice[VOICE_COUNT];
-		// Single-producer/single-consumer ring: producers are serialized by
-		// mVoiceCommandMutex, the consumer by the audio mutex, so the consumer
-		// role can move between the mixer and locking API calls. The audio
-		// thread never takes mVoiceCommandMutex.
-		VoiceCommand mVoiceCommand[VOICE_COMMAND_QUEUE_SIZE];
-		std::atomic<unsigned int> mVoiceCommandHead; // next to apply
-		std::atomic<unsigned int> mVoiceCommandTail; // next free
-		// Seeks, in a ring of their own with the same producers; the consumer
-		// is only ever the mixer at a block start (or a control call on the
-		// idle-mixer path), under the audio mutex.
-		VoiceCommand mSeekCommand[VOICE_COMMAND_QUEUE_SIZE];
-		std::atomic<unsigned int> mSeekCommandHead; // next to apply
-		std::atomic<unsigned int> mSeekCommandTail; // next free
+		// The queue (see queueVoiceCommand_internal()): which voice slots have
+		// a change of which type queued, oldest first, at most one entry per
+		// slot and type; the values are in mPendingVoice. Producers and
+		// consumers take mVoiceCommandMutex (a Thread mutex: on the web's
+		// AudioWorklet build, one the worklet may try-lock); the mixer only
+		// try-locks it. Bit (1 << VoiceCommand::TYPE) of a slot's byte is set
+		// while it has an entry in the matching list.
+		unsigned char mVoiceCommandQueued[VOICE_COUNT];
+		// Volume/pan/pause entries, slot * 4 + type.
+		unsigned short mVoiceCommandList[VOICE_COUNT * 3];
+		unsigned int mVoiceCommandListCount;
+		// Seek entries, by slot. Drained by the mixer at a block start (or a
+		// control call on the idle-mixer path); other lock holders take only
+		// the cheap ones.
+		unsigned short mSeekCommandList[VOICE_COUNT];
+		unsigned int mSeekCommandListCount;
+		// The two counts, for a check without the mutex: nothing queued, so
+		// nothing to drain.
+		std::atomic<unsigned int> mVoiceCommandPending;
+		std::atomic<unsigned int> mSeekCommandPending;
+		// What a consumer copied out of the queue, applied under the audio
+		// mutex after mVoiceCommandMutex is released.
+		VoiceCommand mVoiceCommandBatch[VOICE_COUNT * 3];
+		VoiceCommand mSeekCommandBatch[VOICE_COUNT];
 		// Per slot, ticket of the newest queued seek applied (under the audio
 		// mutex); published as PublishedVoiceState::mSeekTicket.
 		unsigned long long mVoiceSeekAppliedTicket[VOICE_COUNT];
-		std::mutex mVoiceCommandMutex;
+		void *mVoiceCommandMutex;
 		// Last ticket handed out (under mVoiceCommandMutex).
 		unsigned long long mVoiceCommandTicket;
 		// Last ticket applied (under the audio mutex), and its published copy:

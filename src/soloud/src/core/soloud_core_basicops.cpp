@@ -486,7 +486,7 @@ namespace SoLoud
 			return SO_NO_ERROR;
 		result res = SO_NO_ERROR;
 		FOR_ALL_VOICES_LOCKED_PRE
-			const result singleres = applyVoiceCommand_internal(VoiceCommand::SEEK, ch, aSeconds);
+			const result singleres = applySeek_internal(ch, aSeconds);
 			if (singleres != SO_NO_ERROR)
 				res = singleres;
 		FOR_ALL_VOICES_LOCKED_POST

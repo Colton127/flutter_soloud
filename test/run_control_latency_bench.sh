@@ -13,6 +13,8 @@
 #   ./test/run_control_latency_bench.sh --seconds 10 --render-ahead 4096
 #   ./test/run_control_latency_bench.sh --disk-delay-ms 30 --disk-delay-prob 0.05
 #   ./test/run_control_latency_bench.sh --m4a /path/to/file.m4a   (macOS: NativeStream)
+#   ./test/run_control_latency_bench.sh --burst 10000 [--render-ahead 4096]
+#       (bursts of control calls, then getActiveVoiceCount/stop/play)
 
 set -e
 

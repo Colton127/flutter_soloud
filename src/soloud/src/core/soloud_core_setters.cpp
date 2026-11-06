@@ -69,20 +69,14 @@ namespace SoLoud
 
 	// ###### flutter_soloud local patch (non-blocking voice control) ######
 	// setPause, setPan and setVolume queue the change for the mixer instead
-	// of waiting for the audio mutex (see VoiceCommand in soloud.h). They
-	// apply it here, under the mutex, only when queueVoiceCommand_internal()
-	// hands the mutex back: the mutex was free and either the render-ahead
-	// ring is on or no mixer is running, or the queue is full.
+	// of waiting for the audio mutex (see VoiceCommand in soloud.h);
+	// queueVoiceCommand_internal() also applies it at once when the mutex is
+	// free and either the render-ahead ring is on or no mixer is running.
 	// The per-voice body, retroactive placement included, is
-	// applyVoiceCommand_internal().
+	// applyVoiceCommandBatch_internal().
 	void Soloud::setPause(handle aVoiceHandle, bool aPause)
 	{
-		if (queueVoiceCommand_internal(VoiceCommand::PAUSE, aVoiceHandle, aPause ? 1.0 : 0.0))
-			return;
-		FOR_ALL_VOICES_LOCKED_PRE
-			applyVoiceCommand_internal(VoiceCommand::PAUSE, ch, aPause ? 1.0 : 0.0);
-		FOR_ALL_VOICES_LOCKED_POST
-		unlockAudioMutex_internal();
+		queueVoiceCommand_internal(VoiceCommand::PAUSE, aVoiceHandle, aPause ? 1.0 : 0.0);
 	}
 
 	result Soloud::setMaxActiveVoiceCount(unsigned int aVoiceCount)
@@ -146,12 +140,7 @@ namespace SoLoud
 	void Soloud::setPan(handle aVoiceHandle, float aPan)
 	{
 		// ###### flutter_soloud local patch (non-blocking voice control) ######
-		if (queueVoiceCommand_internal(VoiceCommand::PAN, aVoiceHandle, aPan))
-			return;
-		FOR_ALL_VOICES_LOCKED_PRE
-			applyVoiceCommand_internal(VoiceCommand::PAN, ch, aPan);
-		FOR_ALL_VOICES_LOCKED_POST
-		unlockAudioMutex_internal();
+		queueVoiceCommand_internal(VoiceCommand::PAN, aVoiceHandle, aPan);
 	}
 
 	void Soloud::setChannelVolume(handle aVoiceHandle, unsigned int aChannel, float aVolume)
@@ -268,12 +257,7 @@ namespace SoLoud
 	void Soloud::setVolume(handle aVoiceHandle, float aVolume)
 	{
 		// ###### flutter_soloud local patch (non-blocking voice control) ######
-		if (queueVoiceCommand_internal(VoiceCommand::VOLUME, aVoiceHandle, aVolume))
-			return;
-		FOR_ALL_VOICES_LOCKED_PRE
-			applyVoiceCommand_internal(VoiceCommand::VOLUME, ch, aVolume);
-		FOR_ALL_VOICES_LOCKED_POST
-		unlockAudioMutex_internal();
+		queueVoiceCommand_internal(VoiceCommand::VOLUME, aVoiceHandle, aVolume);
 	}
 
 	void Soloud::setDelaySamples(handle aVoiceHandle, unsigned int aSamples)

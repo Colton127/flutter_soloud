@@ -25,6 +25,13 @@
 // --m4a <file> adds NativeStream voices (LoadMode.disk for M4A/MP4; macOS
 // and Android only), to time NativeStream's seek inside the mix as well.
 //
+// --burst <n> runs a different scenario instead (see runBurst()): bursts of
+// n setVolume/setPan/setPause calls spread over --burst-voices voices, each
+// followed right away by getActiveVoiceCount(), stop() and play(), which
+// take the audio mutex and so apply whatever the burst left queued.
+// --burst-hold-ms <ms> issues each burst while another thread holds the
+// audio mutex (as a long mix block would), so that all of it is queued.
+//
 // "late wake-ups/underruns" counts mixer periods that fell more than a period
 // behind real time (or, with the ring, device reads the ring could not
 // fill): the late blocks a listener would hear.
@@ -80,6 +87,11 @@ struct Options {
     // M4A file to stream with NativeStream (LoadMode.disk for M4A/MP4), off
     // by default so the default runs stay comparable.
     const char *m4a = nullptr;
+    // Burst mode (runBurst()): calls per burst (0 = off), voices, rounds.
+    unsigned int burst = 0;
+    unsigned int burstVoices = 100;
+    unsigned int burstRounds = 3;
+    double burstHoldMs = 0;
 };
 
 Options gOptions;
@@ -375,12 +387,175 @@ bool parseArgs(int argc, char **argv) {
         else if (a == "--poll-ms" && next(v)) gOptions.pollMs = v;
         else if (a == "--assets" && i + 1 < argc) gOptions.assets = argv[++i];
         else if (a == "--m4a" && i + 1 < argc) gOptions.m4a = argv[++i];
+        else if (a == "--burst" && next(v)) gOptions.burst = (unsigned)v;
+        else if (a == "--burst-voices" && next(v)) gOptions.burstVoices = (unsigned)v;
+        else if (a == "--burst-rounds" && next(v)) gOptions.burstRounds = (unsigned)v;
+        else if (a == "--burst-hold-ms" && next(v)) gOptions.burstHoldMs = v;
         else {
             std::fprintf(stderr, "unknown or incomplete option: %s\n", a.c_str());
             return false;
         }
     }
     return true;
+}
+
+// ---- Burst mode -------------------------------------------------------------
+
+// A burst of --burst setVolume/setPan/setPause calls spread round-robin over
+// --burst-voices in-memory voices, issued as fast as the caller can, then,
+// right away, one getActiveVoiceCount(), one stop() and one play(): calls
+// unrelated to the burst that take the audio mutex, and so apply whatever
+// the burst left queued first (with the render-ahead ring, possibly a
+// retroactive re-mix per queued change). Repeated --burst-rounds times while
+// the mixer thread runs at real time (with --render-ahead, the ring top-up
+// plus a device-period read, as in the main bench). Reports, per round: the
+// burst (total and worst single call), each of the three calls, and the
+// longest mix block from the start of the burst to 1 s after its end (wall
+// time of mix(), waiting for the audio mutex included).
+//
+// With --burst-hold-ms, a holder thread takes the audio mutex before the
+// burst and releases it when the burst is done (or after that many ms,
+// whichever is first), as a mix block stalled in a slow source would: the
+// whole burst is then queued, and the three calls right after it -- or the
+// mixer, if it gets the mutex first -- apply all of it.
+int runBurst(SoLoud::Soloud &soloud) {
+    SoLoud::Wav sound;
+    const std::string path = std::string(gOptions.assets) + "/sample-WAV.wav";
+    if (sound.load(path.c_str()) != SoLoud::SO_NO_ERROR) {
+        std::fprintf(stderr, "cannot load %s\n", path.c_str());
+        return 1;
+    }
+    sound.setLooping(true);
+    std::vector<SoLoud::handle> voices;
+    for (unsigned int i = 0; i < gOptions.burstVoices; ++i)
+        voices.push_back(soloud.play(sound, 0.2f));
+    std::printf("control-call burst bench: %u in-memory voices (64 audible), %u calls "
+                "per burst, quantum %u frames @ %u Hz, render-ahead %u (device period %u), "
+                "%u rounds, audio mutex held during the burst: %s\n",
+                gOptions.burstVoices, gOptions.burst, gOptions.buffer, gOptions.sampleRate,
+                gOptions.renderAhead, gOptions.devicePeriod, gOptions.burstRounds,
+                gOptions.burstHoldMs > 0 ? "yes" : "no");
+
+    std::atomic<bool> running{true};
+    std::vector<BlockRecord> blocks;
+    blocks.reserve(1 << 16);
+    std::vector<float> out(std::max(gOptions.buffer, gOptions.devicePeriod) * 2);
+    std::thread mixer([&] {
+        auto mixOne = [&](float *dst) {
+            BlockRecord b{};
+            b.start = nowUs();
+            soloud.mix(dst, gOptions.buffer);
+            b.end = nowUs();
+            if (blocks.size() < blocks.capacity())
+                blocks.push_back(b);
+        };
+        const bool ring = soloud.isRenderAheadEnabled();
+        const unsigned int period = ring ? gOptions.devicePeriod : gOptions.buffer;
+        const auto periodDuration = std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>((double)period / gOptions.sampleRate));
+        auto next = Clock::now();
+        while (running.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_until(next);
+            if (ring) {
+                while (soloud.mRenderRing.availableToRead() < gOptions.renderAhead &&
+                       soloud.mRenderRing.availableToWrite() >= gOptions.buffer) {
+                    mixOne(soloud.mRenderRingStaging.mData);
+                    soloud.mRenderRing.write(soloud.mRenderRingStaging.mData, gOptions.buffer);
+                }
+                soloud.mRenderRing.read(out.data(), period);
+            } else {
+                mixOne(out.data());
+            }
+            next += periodDuration;
+            if (Clock::now() > next + periodDuration)
+                next = Clock::now();
+        }
+    });
+
+    struct Round {
+        double start, end;  // burst
+        double worstCall;
+        double activeCount, stop, play;
+    };
+    std::vector<Round> rounds;
+    for (unsigned int r = 0; r < gOptions.burstRounds; ++r) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        std::atomic<bool> held{false}, burstDone{false};
+        std::thread holder;
+        if (gOptions.burstHoldMs > 0) {
+            holder = std::thread([&] {
+                soloud.lockAudioMutex_internal();
+                held.store(true);
+                const double until = nowUs() + gOptions.burstHoldMs * 1000.0;
+                while (!burstDone.load() && nowUs() < until)
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                soloud.unlockAudioMutex_internal();
+            });
+            while (!held.load())
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        Round round{};
+        round.start = nowUs();
+        const unsigned int voiceCount = (unsigned int)voices.size();
+        for (unsigned int i = 0; i < gOptions.burst; ++i) {
+            const SoLoud::handle h = voices[i % voiceCount];
+            const unsigned int pass = i / voiceCount;
+            const double t0 = nowUs();
+            switch (pass % 3) {
+            case 0: soloud.setVolume(h, 0.1f + 0.05f * (float)((pass / 3) % 5)); break;
+            case 1: soloud.setPan(h, (pass / 3) % 2 ? 0.3f : -0.3f); break;
+            default: soloud.setPause(h, (pass / 3) % 2 == 0); break;
+            }
+            round.worstCall = std::max(round.worstCall, nowUs() - t0);
+        }
+        round.end = nowUs();
+        burstDone.store(true);
+        if (holder.joinable())
+            holder.join();
+        double t0 = nowUs();
+        static volatile unsigned int sink = 0;
+        sink = sink + soloud.getActiveVoiceCount();
+        round.activeCount = nowUs() - t0;
+        t0 = nowUs();
+        soloud.stop(voices[0]);
+        round.stop = nowUs() - t0;
+        t0 = nowUs();
+        voices[0] = soloud.play(sound, 0.2f);
+        round.play = nowUs() - t0;
+        rounds.push_back(round);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        for (SoLoud::handle h : voices)
+            soloud.setPause(h, false);
+    }
+    running.store(false, std::memory_order_release);
+    mixer.join();
+
+    std::printf("\n  round   burst ms  worst call ms  getActiveVoiceCount ms  stop ms  play ms  "
+                "longest block ms\n");
+    Round worst{};
+    double worstBlock = 0;
+    for (size_t r = 0; r < rounds.size(); ++r) {
+        const Round &round = rounds[r];
+        double longest = 0;
+        for (const BlockRecord &b : blocks)
+            if (b.end >= round.start && b.start <= round.end + 1e6)
+                longest = std::max(longest, b.end - b.start);
+        std::printf("  %5zu  %9.1f  %13.3f  %22.3f  %7.3f  %7.3f  %16.3f\n", r + 1,
+                    (round.end - round.start) / 1000.0, round.worstCall / 1000.0,
+                    round.activeCount / 1000.0, round.stop / 1000.0, round.play / 1000.0,
+                    longest / 1000.0);
+        worst.end = std::max(worst.end, round.end - round.start);
+        worst.worstCall = std::max(worst.worstCall, round.worstCall);
+        worst.activeCount = std::max(worst.activeCount, round.activeCount);
+        worst.stop = std::max(worst.stop, round.stop);
+        worst.play = std::max(worst.play, round.play);
+        worstBlock = std::max(worstBlock, longest);
+    }
+    std::printf("  max    %9.1f  %13.3f  %22.3f  %7.3f  %7.3f  %16.3f\n", worst.end / 1000.0,
+                worst.worstCall / 1000.0, worst.activeCount / 1000.0, worst.stop / 1000.0,
+                worst.play / 1000.0, worstBlock / 1000.0);
+    soloud.deinit();
+    return 0;
 }
 
 }  // namespace
@@ -400,6 +575,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     soloud.setMaxActiveVoiceCount(64);
+    if (gOptions.burst > 0)
+        return runBurst(soloud);
 
     // ---- Load sounds -------------------------------------------------------
     struct DiskAsset { Format format; const char *file; };

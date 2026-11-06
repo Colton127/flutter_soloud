@@ -13,17 +13,22 @@
 //   every control call on that voice, on another voice and on a voice group
 //   returns in under 5 ms meanwhile, with get-after-set returning the new
 //   value (plain mix and render-ahead ring);
+// - tens of thousands of calls over 100 voices and a group while the mix is
+//   stalled all return in under 5 ms (the queue coalesces to one change per
+//   voice and type, so it never fills up), and the mixer then applies the
+//   last values set;
 // - changes reach the voice at the next mix block, a seek before the voice's
 //   next getAudio(), in call order, also relative to calls that still lock;
 // - invalid and stale handles, voice groups, faders, scheduled pause/stop,
-//   voice-ended dispatch, a full queue and teardown keep SoLoud's semantics;
+//   voice-ended dispatch, many calls between blocks and teardown keep
+//   SoLoud's semantics;
 // - with no mixer running (device stopped), calls apply at once instead of
 //   waiting in the queue for a block that does not come;
 // - queued seeks run only in the mixer at a block start (or on the idle-mixer
 //   path): play/stop/fadeVolume/getActiveVoiceCount and the other locking
 //   calls right after a slow seek return at once without running it; only the
-//   newest of several seeks of a voice runs; a full seek queue waits for the
-//   mixer instead of seeking on the caller;
+//   newest of several seeks of a voice runs; thousands of seeks while the
+//   mixer runs never wait and never seek on the caller;
 // - disposing a sound (stop/stopAudioSource/stopAll/destructor, then delete)
 //   with its seek queued or running in the mixer never lets the mixer touch
 //   the disposed source afterwards;
@@ -312,6 +317,113 @@ void testCallsDoNotWaitForBlockedMix(bool renderAhead) {
     soloud.deinit();
 }
 
+// Saturation: far more control calls than the voices have fields, over many
+// voices and a voice group, with the mix stalled inside a getAudio(). The
+// queue holds one change per voice and type (newest value wins), so it
+// cannot fill up: every call returns at once, the getters report the newest
+// values meanwhile, and once the mixer runs again every voice holds the
+// last values set, each voice seeked once.
+void testSaturationWhileMixBlocked(bool renderAhead) {
+    std::printf("%s: tens of thousands of control calls while the mix is stalled\n",
+                renderAhead ? "render-ahead" : "direct");
+    SoLoud::Soloud soloud;
+    if (!initEngine(soloud, renderAhead)) return;
+    TestSource slow(0.25f);
+    TestSource level(0.5f);
+    playUnity(soloud, slow);
+    constexpr int kVoices = 100;
+    std::vector<SoLoud::handle> voices;
+    for (int i = 0; i < kVoices; ++i)
+        voices.push_back(playUnity(soloud, level));
+    const SoLoud::handle group = soloud.createVoiceGroup();
+    for (int i = 0; i < kVoices; i += 2)
+        soloud.addVoiceToGroup(group, voices[i]);
+
+    std::atomic<bool> running{true};
+    std::atomic<unsigned int> blocks{0};
+    std::thread mixer([&] {
+        std::vector<float> out(kBuffer * 2);
+        while (running.load()) {
+            if (renderAhead) {
+                soloud.renderRingTopUp_internal();
+                soloud.mRenderRing.read(out.data(), kDevicePeriod);
+            } else {
+                soloud.mix(out.data(), kBuffer);
+            }
+            blocks.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    EXPECT(waitFor([&] { return blocks.load() >= 4; }, 2000), "mixer did not start");
+    const unsigned int seeksBefore = level.seeks.load();
+    slow.armed.store(true);
+    EXPECT(waitFor([&] { return slow.inside.load(); }, 2000), "the mix never reached the slow source");
+
+    auto volumeOf = [](int r, int k) { return float((r * 7 + k) % 100) / 100.0f; };
+    auto panOf = [](int r, int k) { return float((r * 3 + k) % 21) / 10.0f - 1.0f; };
+    auto seekOf = [](int r, int k) { return 0.25 + 0.001 * double(r * kVoices + k); };
+    const int rounds = 60;  // 60 x 100 voices x 4 calls, plus group calls; even: ends paused
+    double worst = 0;
+    unsigned int calls = 0;
+    auto call = [&](const std::function<void()> &f) {
+        const auto t0 = Clock::now();
+        f();
+        worst = std::max(worst, msSince(t0));
+        ++calls;
+    };
+    const auto burstStart = Clock::now();
+    for (int r = 0; r < rounds; ++r) {
+        // Group calls first, overwritten by this round's per-voice calls.
+        call([&] { soloud.setVolume(group, 0.123f); });
+        call([&] { soloud.setPan(group, 0.5f); });
+        call([&] { soloud.seek(group, 9.0); });
+        call([&] { soloud.setPause(group, r % 2 == 0); });
+        for (int k = 0; k < kVoices; ++k) {
+            const SoLoud::handle h = voices[k];
+            call([&] { soloud.setVolume(h, volumeOf(r, k)); });
+            call([&] { soloud.setPan(h, panOf(r, k)); });
+            call([&] { soloud.setPause(h, r % 2 == 1); });
+            call([&] { soloud.seek(h, seekOf(r, k)); });
+        }
+    }
+    const double burstMs = msSince(burstStart);
+    EXPECT(slow.inside.load(), "the calls outlasted the stalled block -- they waited for it");
+    EXPECT(worst < kMaxCallMs, "worst control call %.3f ms while the mix was stalled", worst);
+    std::printf("  %u calls in %.1f ms, worst call %.3f ms\n", calls, burstMs, worst);
+
+    bool newest = true;
+    for (int k = 0; k < kVoices; ++k) {
+        const SoLoud::handle h = voices[k];
+        newest = newest && near(soloud.getVolume(h), volumeOf(rounds - 1, k)) &&
+                 near(soloud.getPan(h), panOf(rounds - 1, k)) && soloud.getPause(h) &&
+                 near(soloud.getStreamPosition(h), seekOf(rounds - 1, k));
+    }
+    EXPECT(newest, "the getters report the newest values while the mix is stalled");
+
+    EXPECT(waitFor([&] { return !slow.inside.load(); }, 2000), "stall never ended");
+    const unsigned int after = blocks.load();
+    EXPECT(waitFor([&] { return blocks.load() >= after + 3; }, 2000), "mixer stopped");
+    running.store(false);
+    mixer.join();
+
+    bool applied = true;
+    for (int k = 0; k < kVoices && applied; ++k) {
+        const SoLoud::handle h = voices[k];
+        SoLoud::AudioSourceInstance *v = voiceOf(soloud, h);
+        applied = v != nullptr && near(v->mSetVolume, volumeOf(rounds - 1, k)) &&
+                  near(v->mPan, panOf(rounds - 1, k)) && (v->mFlags & SoLoud::AudioSourceInstance::PAUSED) &&
+                  near(v->mStreamPosition, seekOf(rounds - 1, k)) &&
+                  soloud.getVolume(h) == v->mSetVolume && soloud.getStreamPosition(h) == v->mStreamPosition;
+        if (!applied && v)
+            std::fprintf(stderr, "  voice %d: volume %f pan %f paused %d position %f\n", k, v->mSetVolume, v->mPan,
+                         int(v->mFlags & SoLoud::AudioSourceInstance::PAUSED), v->mStreamPosition);
+    }
+    EXPECT(applied, "the mixer applied the last values set");
+    EXPECT(level.seeks.load() - seeksBefore == (unsigned int)kVoices, "%u source seeks for %d voices",
+           level.seeks.load() - seeksBefore, kVoices);
+    soloud.deinit();
+}
+
 // Changes reach the voice at the next mix block, not before: the voice
 // instance is untouched until the mixer applies them, the getters report
 // them meanwhile, and a seek lands before the voice's next getAudio().
@@ -571,23 +683,24 @@ void testFadersAndScheduledOps() {
     soloud.deinit();
 }
 
-// A full queue falls back to the locking path without losing or reordering
-// anything, and teardown with commands still queued is safe.
-void testQueueFullAndTeardown() {
-    std::printf("full queue and teardown with queued commands\n");
+// Many more calls than voices between two blocks coalesce (one queued
+// change per voice and type, newest value wins) without losing or
+// reordering anything, and teardown with commands still queued is safe.
+void testManyCommandsAndTeardown() {
+    std::printf("many commands between blocks, and teardown with queued commands\n");
     {
         SoLoud::Soloud soloud;
         if (!initEngine(soloud)) return;
         TestSource level(0.5f);
         const SoLoud::handle h = playUnity(soloud, level);
         mixBlock(soloud);  // the mixer runs: calls queue
-        const int n = 3 * VOICE_COMMAND_QUEUE_SIZE + 17;
+        const int n = 5000;
         for (int i = 1; i <= n; ++i)
-            soloud.setVolume(h, float(i) / n);
-        EXPECT(near(soloud.getVolume(h), 1.0), "newest volume after overflow: %f", soloud.getVolume(h));
+            soloud.setVolume(h, 0.5f * float(i) / n);
+        EXPECT(near(soloud.getVolume(h), 0.5), "newest volume: %f", soloud.getVolume(h));
+        EXPECT(near(voiceOf(soloud, h)->mSetVolume, 1.0), "applied before the next block");
         mixBlock(soloud);
-        EXPECT(near(voiceOf(soloud, h)->mSetVolume, 1.0), "applied after overflow: %f",
-               voiceOf(soloud, h)->mSetVolume);
+        EXPECT(near(voiceOf(soloud, h)->mSetVolume, 0.5), "applied: %f", voiceOf(soloud, h)->mSetVolume);
 
         for (int i = 0; i < 100; ++i) {
             soloud.setVolume(h, 0.5f);
@@ -908,10 +1021,11 @@ void testSupersededSeeksSkipped() {
     soloud.deinit();
 }
 
-// More seeks than the seek queue holds, while a mixer runs: the caller waits
-// for the mixer to drain the queue instead of running seeks itself.
-void testSeekQueueFull() {
-    std::printf("full seek queue waits for the mixer\n");
+// Many seeks while a mixer runs: a voice has at most one seek queued (the
+// newest target), so no seek call ever waits for room in the queue, none
+// runs on the caller, and the last target is where each voice ends up.
+void testManySeeksWhileMixing() {
+    std::printf("many seeks while the mixer runs never wait\n");
     SoLoud::Soloud soloud;
     if (!initEngine(soloud)) return;
     SlowSeekSource slow(0);
@@ -928,9 +1042,14 @@ void testSeekQueueFull() {
     });
     while (soloud.isMixerIdle_internal())
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const int n = 3 * VOICE_COMMAND_QUEUE_SIZE;
-    for (int i = 0; i < n; ++i)
+    const int n = 5000;
+    double worst = 0;
+    for (int i = 0; i < n; ++i) {
+        const auto t0 = Clock::now();
         soloud.seek(handles[i % handles.size()], 0.001 * (i + 1));
+        worst = std::max(worst, msSince(t0));
+    }
+    EXPECT(worst < kMaxCallMs, "worst seek call %.3f ms", worst);
     EXPECT(near(soloud.getStreamPosition(handles[(n - 1) % handles.size()]), 0.001 * n), "newest target");
     EXPECT(waitFor([&] { return soloud.getStreamPosition(handles.back()) > 0.001 * n; }, 2000),
            "last seek never applied");
@@ -938,6 +1057,7 @@ void testSeekQueueFull() {
     mixer.join();
     EXPECT(!slow.seekedOnCaller.load(), "a seek ran on the calling thread");
     EXPECT(slow.seeks.load() <= (unsigned int)n, "%u seeks", slow.seeks.load());
+    std::printf("  %d seeks, worst call %.3f ms, %u source seeks\n", n, worst, slow.seeks.load());
     soloud.deinit();
 }
 
@@ -1115,12 +1235,14 @@ void testConcurrentStress() {
 int main() {
     testCallsDoNotWaitForBlockedMix(false);
     testCallsDoNotWaitForBlockedMix(true);
+    testSaturationWhileMixBlocked(false);
+    testSaturationWhileMixBlocked(true);
     testChangesApplyAtNextBlock();
     testCommandOrder();
     testHandleSemantics();
     testVoiceGroups();
     testFadersAndScheduledOps();
-    testQueueFullAndTeardown();
+    testManyCommandsAndTeardown();
     testRenderAheadAppliesImmediatelyWhenIdle();
     testIdleMixerAppliesAtOnce(false);
     testIdleMixerAppliesAtOnce(true);
@@ -1128,7 +1250,7 @@ int main() {
     testLockingCallsLeaveSeeksToMixer(true);
     testCheapSeeksAppliedByLockingCalls();
     testSupersededSeeksSkipped();
-    testSeekQueueFull();
+    testManySeeksWhileMixing();
     testDisposeMidSeek();
     testConcurrentStress();
 
