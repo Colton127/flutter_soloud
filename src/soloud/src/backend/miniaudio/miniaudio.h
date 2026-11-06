@@ -39514,10 +39514,105 @@ static ma_result ma_open_stream__aaudio(ma_device* pDevice, const ma_device_conf
     return ma_open_stream_and_close_builder__aaudio(pDevice->pContext, pBuilder, ppStream);
 }
 
+/* ###### flutter_soloud local patch (AAudio stop and wait before close) ######
+Stop the stream, wait about one burst, then close it. Ported from Oboe's close workaround, Apache-2.0,
+google/oboe main @ 8c13e5e2552bdf9ccadb4211a48646e32b50eabd:
+  - src/aaudio/AudioStreamAAudio.cpp: AudioStreamAAudio::close() and AudioStreamAAudio::requestStop_l()
+  - src/common/AudioStream.cpp: AudioStream::calculateDefaultDelayBeforeCloseMillis()
+  - include/oboe/AudioStream.h: sleepBeforeClose(), kMinDelayBeforeCloseMillis, kMaxDelayBeforeCloseMillis
+
+Why: a legacy (non-MMAP) AAudio stream registers an AudioTrack device callback when it is opened, started
+or not. On Android 11 that callback holds a raw pointer to the stream and AAudioStream_close() deletes the
+stream at once, so a route change already being delivered on a binder thread can run
+AudioStreamLegacy::onAudioDeviceUpdate() on a freed stream. Oboe stops the stream and sleeps for about
+one burst before closing it, so that callbacks already in flight can finish first.
+
+Gating, as in Oboe: Oboe does this in close() whenever OboeGlobals::areWorkaroundsEnabled(), which
+defaults to true, on every SDK version. It has no Android 11 specific gate. The only SDK check on this
+path is in requestStop_l(): on SDK <= 27 (O_MR1) a stream that is already stopping or stopped is not
+stopped again. This is deliberately not gated on aaudio.enableCompatibilityWorkarounds. That flag is
+per device and off by default (ma_device_config_init() zeroes it), flutter_soloud leaves it off, a
+reroute rebuilds the config without it, and the probe streams have no device config at all.
+
+Device streams get this on every SDK, as in Oboe. The never-started probe streams get it only on
+SDK <= 30; see ma_close_probe_stream__aaudio().
+
+Must never run on an AAudio callback thread: AAudio rejects stop and close from a callback. Every caller
+runs on an application thread or on the context's job thread.
+*/
+#define MA_AAUDIO_MIN_DELAY_BEFORE_CLOSE_MS    10  /* Oboe's kMinDelayBeforeCloseMillis. */
+#define MA_AAUDIO_MAX_DELAY_BEFORE_CLOSE_MS    100 /* Oboe's kMaxDelayBeforeCloseMillis. */
+
+static void ma_stop_and_wait_before_close__aaudio(ma_context* pContext, ma_AAudioStream* pStream)
+{
+    ma_bool32 requestStop = MA_TRUE;
+    ma_int64 framesPerBurst;
+    ma_int64 sampleRate;
+    ma_int64 delayInMilliseconds = MA_AAUDIO_MIN_DELAY_BEFORE_CLOSE_MS;
+
+    /* requestStop_l(): avoid state machine errors on SDK <= 27 (O_MR1). */
+    if (ma_android_sdk_version() <= 27) {
+        ma_aaudio_stream_state_t state = ((MA_PFN_AAudioStream_getState)pContext->aaudio.AAudioStream_getState)(pStream);
+        if (state == MA_AAUDIO_STREAM_STATE_STOPPING || state == MA_AAUDIO_STREAM_STATE_STOPPED) {
+            requestStop = MA_FALSE;
+        }
+    }
+
+    if (requestStop) {
+        ((MA_PFN_AAudioStream_requestStop)pContext->aaudio.AAudioStream_requestStop)(pStream); /* Result ignored, as in Oboe's close(). */
+    }
+
+    /* calculateDefaultDelayBeforeCloseMillis(): one burst plus 1 ms of margin, clamped to [10, 100] ms. */
+    framesPerBurst = ((MA_PFN_AAudioStream_getFramesPerBurst)pContext->aaudio.AAudioStream_getFramesPerBurst)(pStream);
+    sampleRate     = ((MA_PFN_AAudioStream_getSampleRate)pContext->aaudio.AAudioStream_getSampleRate)(pStream);
+    if (framesPerBurst > 0 && sampleRate > 0) {
+        delayInMilliseconds = ma_clamp(1 + (framesPerBurst * 1000) / sampleRate, MA_AAUDIO_MIN_DELAY_BEFORE_CLOSE_MS, MA_AAUDIO_MAX_DELAY_BEFORE_CLOSE_MS);
+    }
+
+    /* sleepBeforeClose() */
+    ma_sleep((ma_uint32)delayInMilliseconds);
+}
+/* ###### end flutter_soloud local patch (AAudio stop and wait before close) ###### */
+
 static ma_result ma_close_stream__aaudio(ma_context* pContext, ma_AAudioStream* pStream)
 {
     if (pStream == NULL) {
         return MA_INVALID_ARGS;
+    }
+
+    /* ###### flutter_soloud local patch (AAudio stop and wait before close) ###### */
+    ma_stop_and_wait_before_close__aaudio(pContext, pStream);
+
+    return ma_result_from_aaudio(((MA_PFN_AAudioStream_close)pContext->aaudio.AAudioStream_close)(pStream));
+}
+
+/* ###### flutter_soloud local patch (AAudio stop and wait before close) ######
+Closes a stream opened only to probe a device: never started, with no data or error callback. It gets
+the stop and wait above only on SDK <= 30. This is a deliberate deviation from Oboe, whose close()
+treats every stream alike, and it applies to probe streams only.
+
+Why SDK <= 30: the use-after-free that the wait guards against exists there and not from Android 12.
+AOSP platform/frameworks/av, media/libaaudio/src:
+  - android11-release (e7e59490c070f00bb2f5e0273e4de482dd05c209): AudioStreamTrack::open() registers a
+    StreamDeviceCallback holding a raw AudioStreamLegacy* for every stream, started or not, and
+    AAudioStream_close() deletes the stream.
+  - android12-release (28c005633b2b3867d403ee0ceb8fded4b319e3ad): AudioStream is itself the RefBase
+    AudioDeviceCallback (addAudioDeviceCallback(this)), and AAudioStream_close() only drops a strong
+    reference, so a callback already in flight keeps the stream alive.
+
+Why not on every SDK: device enumeration runs synchronously on the caller's thread, which for
+flutter_soloud is the UI thread, and it opens two probes (playback and capture). On an API 36
+emulator, where the probes get non-fast legacy tracks with bursts of about 46 ms, waiting on every
+SDK took enumeration from a median of 24.8 ms to 89.6 ms, about +65 ms per enumeration.
+*/
+static ma_result ma_close_probe_stream__aaudio(ma_context* pContext, ma_AAudioStream* pStream)
+{
+    if (pStream == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (ma_android_sdk_version() <= 30) {
+        ma_stop_and_wait_before_close__aaudio(pContext, pStream);
     }
 
     return ma_result_from_aaudio(((MA_PFN_AAudioStream_close)pContext->aaudio.AAudioStream_close)(pStream));
@@ -39532,7 +39627,7 @@ static ma_bool32 ma_has_default_device__aaudio(ma_context* pContext, ma_device_t
         return MA_FALSE;
     }
 
-    ma_close_stream__aaudio(pContext, pStream);
+    ma_close_probe_stream__aaudio(pContext, pStream); /* flutter_soloud local patch: was ma_close_stream__aaudio(). */
     return MA_TRUE;
 }
 
@@ -39640,7 +39735,7 @@ static ma_result ma_context_get_device_info__aaudio(ma_context* pContext, ma_dev
 
     ma_context_add_native_data_format_from_AAudioStream__aaudio(pContext, pStream, 0, pDeviceInfo);
 
-    ma_close_stream__aaudio(pContext, pStream);
+    ma_close_probe_stream__aaudio(pContext, pStream); /* flutter_soloud local patch: was ma_close_stream__aaudio(). */
     pStream = NULL;
 
     return MA_SUCCESS;
