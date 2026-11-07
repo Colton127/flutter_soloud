@@ -43,14 +43,21 @@
 // that pause and unpause voices automatically, nor post device lifecycle
 // requests (which take mInterruptionMutex) while it is held:
 //
-//   * a BufferStream's background decode thread runs checkBuffering() with
-//     check_buffer_mutex held, and a play() of that stream holds sounds_mutex
-//     and goes on to take check_buffer_mutex. The decode thread's automatic
-//     unpause must complete while such a play is parked holding sounds_mutex
-//     (the bufferStreamBackgroundDecoded and playSoundLookedUp barriers), so
-//     it must not take sounds_mutex. This one cannot fail softly: if the
-//     unpause does not complete in a bounded time, releasing the parked play
-//     would deadlock, so the run ends there;
+//   * a BufferStream's background decode thread runs checkBuffering(),
+//     which reads and updates the sound's handle list, so it takes
+//     sounds_mutex first, as a play() of that stream does before it takes
+//     check_buffer_mutex. While a play is parked holding sounds_mutex (the
+//     bufferStreamBackgroundDecoded and playSoundLookedUp barriers) the
+//     thread's buffering check must wait, and once the play is released both
+//     must complete: the waiting thread holds no check_buffer_mutex. This one
+//     cannot fail softly: if they do not complete in a bounded time, they
+//     are deadlocked, so the run ends there;
+//   * a BufferStream is fed, played, stopped and read by several threads at
+//     once while the mixer pauses its voices whenever they run out of data.
+//     Every buffering event names a voice of the stream, and under
+//     ThreadSanitizer nothing races: the mixer finds the voice it pauses in
+//     SoLoud's voice table, not in the sound's handle list, and the stream's
+//     counters are atomic;
 //   * an automatic pause and an automatic unpause made under sounds_mutex (a
 //     play() and an addAudioDataStream() of a buffer stream) post their
 //     lifecycle request only once sounds_mutex is free: the thread is parked
@@ -877,13 +884,13 @@ void mixerCompletingAPullSeekSkipsTheBufferingCheck()
 }
 
 /// A play() of a BufferStream parks holding sounds_mutex while the stream's
-/// background decode thread unpauses a voice automatically.
+/// background decode thread is about to run its buffering check.
 ///
-/// The decode thread runs checkBuffering() with check_buffer_mutex held, and
-/// the play takes check_buffer_mutex in its own checkBuffering() once it goes
-/// on, with sounds_mutex still held. So the decode thread's pause change must
-/// not take sounds_mutex: if it did, it would wait here for the parked play,
-/// and released, the play would wait for it.
+/// The check reads and updates the sound's handle list, which the play
+/// appends to, so the decode thread takes sounds_mutex for it, and must wait
+/// for the parked play. It takes sounds_mutex before check_buffer_mutex, as
+/// the play does, and holds neither while it waits, so once the play is
+/// released both complete.
 ///
 /// Getting a decode thread to make that call takes a few steps. The stream is
 /// AUTO (MP3) and is fed 4 KiB, which it keeps undecoded until more arrives.
@@ -893,7 +900,7 @@ void mixerCompletingAPullSeekSkipsTheBufferingCheck()
 /// (schedulePause() with no delay, which leaves the user-paused flag clear),
 /// so that checkBuffering() unpauses it automatically once the stream has
 /// ended.
-void automaticUnpauseCompletesWhilePlayHoldsTheSounds()
+void decodeThreadsBufferingCheckWaitsForAParkedPlay()
 {
     const char *what = "BufferStream decode thread vs a parked play()";
     std::printf("%s\n", what);
@@ -969,30 +976,160 @@ void automaticUnpauseCompletesWhilePlayHoldsTheSounds()
     if (!waitBarrierReachedFor(DeviceBarrier::playSoundLookedUp, kProgressMs))
         abortWedgedRun("the second play() never reached its sound lookup");
 
-    // The play now holds sounds_mutex. Let the decode thread run its
-    // checkBuffering().
+    // The play now holds sounds_mutex. Let the decode thread go on to its
+    // checkBuffering(): it must wait for the play.
     clearBufferingEvents();
     soloud_test::releaseBarrier(DeviceBarrier::bufferStreamBackgroundDecoded);
+    EXPECT(!waitForBufferingEvent(false, first, kParkMs),
+           "%s: the decode thread ran its buffering check while a play() of "
+           "the stream held sounds_mutex: it read the handle list the play "
+           "appends to",
+           what);
 
+    soloud_test::releaseBarrier(DeviceBarrier::playSoundLookedUp);
     if (!waitForBufferingEvent(false, first, kProgressMs))
     {
         abortWedgedRun(
-            "the decode thread's automatic unpause did not complete while a "
-            "play() of the stream held sounds_mutex. It waits for sounds_mutex "
-            "with check_buffer_mutex held, and the parked play() takes them "
-            "in the other order once released: releasing it would deadlock");
+            "the first voice was not unpaused once the play was released. "
+            "The play's buffering check and the decode thread's would each "
+            "unpause it: the two are deadlocked");
     }
-    EXPECT(getPause(first) == 0,
-           "%s: the decode thread should have unpaused the first voice", what);
-
-    soloud_test::releaseBarrier(DeviceBarrier::playSoundLookedUp);
     playThread.join();
     EXPECT(secondResult == PlayerErrors::noError && second != 0,
            "%s: the parked play should succeed once released (error %d)", what,
            static_cast<int>(secondResult));
+    EXPECT(getPause(first) == 0, "%s: the first voice should be unpaused",
+           what);
 
     // Joins the decode thread, so it has finished before the stream goes.
     resetBufferStream(hash);
+    disposeSound(hash);
+    expectNothingLeft(what);
+}
+
+/// A RELEASED BufferStream of raw PCM is fed, played, stopped and read by
+/// several threads at once for 1.5 s while the mixer plays it.
+///
+/// It is fed in short bursts, so its voices keep running out of data, and the
+/// mixer pauses each one as it does, reporting it in a buffering event; the
+/// next delivery's buffering check unpauses it. Meanwhile another thread plays
+/// and stops more voices of the stream, adding their handles to the sound's
+/// handle list and removing them, and another reads its length and the time
+/// it has consumed. The mixer must name each voice it pauses after the voice
+/// itself, whether or not its handle has reached the list yet, and must not
+/// touch the list. Under ThreadSanitizer nothing may race: the list, and the
+/// counters the feeder, the mixer and the readers all update or read.
+void bufferStreamUnderConcurrentUse()
+{
+    const char *what = "BufferStream under concurrent use";
+    std::printf("%s\n", what);
+
+    unsigned int hash = 0;
+    PlayerErrors err = setBufferStream(
+        &hash, 32 * 1024 * 1024, /*RELEASED*/ 1, /*bufferingTimeNeeds*/ 0.02,
+        44100, 2, /*PCM_F32LE*/ 0, onBuffering, nullptr);
+    EXPECT(err == PlayerErrors::noError && hash != 0,
+           "%s: setBufferStream should succeed (error %d)", what,
+           static_cast<int>(err));
+    if (err != PlayerErrors::noError || hash == 0)
+        return;
+
+    // 30 ms of quiet stereo every 40 ms: the voices keep running out.
+    const std::vector<float> burst(44100 * 2 * 30 / 1000, 0.001f);
+    const auto feed = [&] {
+        return addAudioDataStream(
+            hash, reinterpret_cast<const unsigned char *>(burst.data()),
+            static_cast<unsigned int>(burst.size() * sizeof(float)));
+    };
+    err = feed();
+    EXPECT(err == PlayerErrors::noError, "%s: the first delivery (error %d)",
+           what, static_cast<int>(err));
+
+    std::mutex playedMutex;
+    std::vector<unsigned int> played;
+    unsigned int main = 0;
+    err = play(hash, 0, 0.05f, 0.0f, false, false, 0.0, 0.0, -1, -1, 1.0f,
+               &main);
+    EXPECT(err == PlayerErrors::noError && main != 0,
+           "%s: the stream should play (error %d)", what,
+           static_cast<int>(err));
+    if (main == 0)
+    {
+        disposeSound(hash);
+        return;
+    }
+    played.push_back(main);
+    clearBufferingEvents();
+
+    std::atomic<bool> running{true};
+    std::atomic<int> feedErrors{0};
+    std::thread feeder([&] {
+        while (running.load())
+        {
+            if (feed() != PlayerErrors::noError)
+                ++feedErrors;
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+    });
+    std::thread player([&] {
+        while (running.load())
+        {
+            unsigned int voice = 0;
+            if (play(hash, 0, 0.05f, 0.0f, false, false, 0.0, 0.0, -1, -1,
+                     1.0f, &voice) == PlayerErrors::noError &&
+                voice != 0)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(playedMutex);
+                    played.push_back(voice);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                stop(voice);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+    std::thread reader([&] {
+        while (running.load())
+        {
+            float consumed = 0.0f;
+            (void)getLength(hash);
+            (void)getStreamTimeConsumed(hash, &consumed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    running.store(false);
+    feeder.join();
+    player.join();
+    reader.join();
+
+    EXPECT(feedErrors.load() == 0, "%s: %d deliveries failed", what,
+           feedErrors.load());
+    {
+        std::lock_guard<std::mutex> eventsLock(gBufferingMutex);
+        std::lock_guard<std::mutex> playedLock(playedMutex);
+        int paused = 0;
+        int strangers = 0;
+        for (const BufferingEvent &e : gBuffering)
+        {
+            if (e.isBuffering)
+                ++paused;
+            bool known = false;
+            for (const unsigned int voice : played)
+                known = known || voice == e.handle;
+            if (!known)
+                ++strangers;
+        }
+        EXPECT(paused > 0,
+               "%s: the voices should have been paused for buffering", what);
+        EXPECT(strangers == 0,
+               "%s: %d buffering event(s) named a voice the stream never "
+               "played",
+               what, strangers);
+    }
+
     disposeSound(hash);
     expectNothingLeft(what);
 }
@@ -1152,27 +1289,8 @@ int main()
     mixerCompletingAPullSeekSkipsTheBufferingCheck();
 
     lifecycleRequestsWaitForTheSoundsLock();
-#if defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define PLAY_DISPOSE_RACE_TSAN 1
-#endif
-#endif
-#if defined(__SANITIZE_THREAD__)
-#define PLAY_DISPOSE_RACE_TSAN 1
-#endif
-#if defined(PLAY_DISPOSE_RACE_TSAN)
-    // Skipped under ThreadSanitizer: driving a BufferStream's decode thread
-    // trips data races BufferStream already has, independent of this test's
-    // locking. That thread's checkBuffering() reads the sound's handle list
-    // under check_buffer_mutex only, while a play() appends to it under
-    // sounds_mutex, and the thread updates mUncompressedBytesReceived and
-    // mSampleCount with no lock while getLength() and the mixer's hasEnded()
-    // read them. The plain and AddressSanitizer builds run it.
-    std::printf("BufferStream decode thread vs a parked play(): skipped under "
-                "ThreadSanitizer (pre-existing BufferStream data races)\n");
-#else
-    automaticUnpauseCompletesWhilePlayHoldsTheSounds();
-#endif
+    decodeThreadsBufferingCheckWaitsForAParkedPlay();
+    bufferStreamUnderConcurrentUse();
 
     tearDownEngine();
 

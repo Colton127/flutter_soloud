@@ -16,6 +16,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -641,6 +642,16 @@ public:
   /// @param handle handle of the sound.
   void removeHandle(unsigned int handle);
 
+  /// @brief Run [work] holding sounds_mutex, for a thread that must not wait
+  /// for it unconditionally: a BufferStream's background decode thread, which
+  /// a reset or a disposal stops and joins while holding sounds_mutex. Tries
+  /// the mutex until it gets it or [cancelled] returns true, and checks
+  /// [cancelled] again once it holds it. Lifecycle requests [work] makes are
+  /// posted once the mutex is released, as under a SoundsLock.
+  /// @return whether [work] ran.
+  bool runWithSoundsLockUnlessCancelled(const std::function<bool()> &cancelled,
+                                        const std::function<void()> &work);
+
   /// @brief Stop all handles of the already loaded sound identified by
   /// [soundHash] and clear it.
   ///
@@ -1203,8 +1214,9 @@ private:
   // or unpause a voice (a buffer stream's checkBuffering(), a stop(), a call
   // into SoLoud that can mix ahead) takes it through a SoundsLock, which
   // defers those requests to its release. An automatic (buffering)
-  // setPause() does not take it at all, so a stream's decode thread can pause
-  // a voice while a play() of that stream holds it.
+  // setPause() does not take it itself: the buffering checks that make one
+  // already hold it (a BufferStream's decode thread through
+  // runWithSoundsLockUnlessCancelled()), and the mixer never takes it.
   //
   // SoLoud reports a voice ended on the thread that ended it, the mixer's
   // included, and removeHandle() only tries this mutex: a removal it cannot

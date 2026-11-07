@@ -46,6 +46,11 @@ public:
   virtual SoLoud::SourceStateSnapshot *captureSourceState();
   virtual void restoreSourceState(SoLoud::SourceStateSnapshot *aState);
   bool samplerateAlreadySet;
+
+private:
+  /// This voice's handle, from SoLoud's voice table: 0 if it is not there.
+  /// SoLoud's audio mutex is held (the mixer's, in getAudio()).
+  SoLoud::handle findOwnHandleLocked() const;
 };
 
 class BufferStream : public AudioSource {
@@ -63,14 +68,17 @@ public:
   unsigned int autoTypeChannels;
   float autoTypeSamplerate;
   unsigned int mMaxBufferSize;
-  int64_t mSampleCount;
-  uint64_t mBytesConsumed;
+  // The counters and the end flag are updated by a delivery (under
+  // sounds_mutex), by the background decode thread and, for a RELEASED
+  // stream, by the mixer, and read by all of them: atomic.
+  std::atomic<int64_t> mSampleCount{0};
+  std::atomic<uint64_t> mBytesConsumed{0};
   SoLoud::time mBufferingTimeNeeds;
   PCMformat mPCMformat;
   Buffer mBuffer;
   uint64_t mBytesReceived;
-  uint64_t mUncompressedBytesReceived;
-  bool dataIsEnded;
+  std::atomic<uint64_t> mUncompressedBytesReceived{0};
+  std::atomic<bool> dataIsEnded{false};
   std::atomic<bool> mIsBuffering{true};
   int mIcyMetaInt;
   
@@ -82,6 +90,11 @@ public:
   std::atomic<bool> mStopBackgroundDecode{false};
 #endif
   void stopBackgroundDecode();
+  /// checkBuffering() for the background decode thread, which holds no lock:
+  /// takes sounds_mutex for it, unless the thread is being stopped (a reset
+  /// or a disposal, which holds sounds_mutex while it joins the thread).
+  /// Returns false, having checked nothing, when it is.
+  bool checkBufferingFromDecodeThread(unsigned int afterAddingBytesCount);
 
   std::unique_ptr<StreamDecoder> streamDecoder;
 
@@ -100,6 +113,10 @@ public:
   void setBufferIcyMetaInt(int icyMetaInt);
   PlayerErrors addData(const void *aData, unsigned int numSamples,
                        bool forceAdd = false);
+  /// Pause the voices that ran out of data and unpause the ones that have
+  /// enough again. It reads and updates the sound's handle list, so the
+  /// caller holds Player::sounds_mutex (through a SoundsLock: the pauses and
+  /// unpauses ask for device lifecycle changes).
   void checkBuffering(unsigned int afterAddingBytesCount);
   void callOnMetadataCallback(AudioMetadata &metadata);
   void callOnBufferingCallback(bool isBuffering, unsigned int handle,
