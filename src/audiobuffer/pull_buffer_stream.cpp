@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "../device_lifecycle_test_hooks.h"
 #include "../soloud_common.h"
 #include "metadata_ffi.h"
 
@@ -139,8 +140,8 @@ unsigned int PullBufferStreamInstance::getAudio(float *aBuffer,
       std::min(static_cast<size_t>(requestedSamples), availableSamples);
 
   // No decoded samples available: zero the whole output buffer and ask for
-  // more data. Do not call checkBuffering here: it runs on the audio thread
-  // and would deadlock when calling getPause/getPosition.
+  // more data. Do not call checkBuffering here: it must not run on the audio
+  // thread (see its declaration).
   if (samplesToRead == 0) {
     for (unsigned int ch = 0; ch < mChannels; ++ch) {
       std::memset(aBuffer + ch * aBufferSize, 0, sizeof(float) * aSamplesToRead);
@@ -172,10 +173,8 @@ unsigned int PullBufferStreamInstance::getAudio(float *aBuffer,
                 sizeof(float) * (aSamplesToRead - readFrames));
   }
 
-  // Do not call checkBuffering from the audio thread: getPause/getPosition
-  // acquire the Soloud mixer lock and would deadlock with the thread that
-  // is currently calling getAudio(). Buffering checks are done when the user
-  // adds data or marks the end of the stream (main thread).
+  // Do not call checkBuffering from the audio thread (see its declaration).
+  // Buffering checks are done when data is delivered, or the stream ends.
   mParent->requestMoreDataIfNeeded();
   return readFrames;
 }
@@ -291,7 +290,10 @@ result PullBufferStreamInstance::seek(double aSeconds, float *aScratch,
   mParent->mDataIsEnded.store(false);
   mParent->mWaitingForData.store(false);
   mParent->resetDecoderForSeek(targetSample);
-  mParent->applyPendingSeek();
+  // SoLoud applies seeks with its audio mutex held, usually on the mixer
+  // thread, where checkBuffering() must not run.
+  mParent->applyPendingSeek(/*aOnAudioThread*/ true);
+  SOLOUD_TEST_BARRIER(pullSeekPending);
   return SO_NO_ERROR;
 }
 
@@ -648,6 +650,7 @@ PlayerErrors PullBufferStream::addAudioData(const void *aData,
   if (mDurationProbeState == DurationProbeState::BuildingSeekTable) {
     ++mSeekTableBuildChunks;
   }
+  SOLOUD_TEST_BARRIER(pullDataQueued);
 
   // If the sequential feed has reached the declared end of the file, mark
   // the stream as ended so the decoder can flush its final frames and the
@@ -801,7 +804,7 @@ void PullBufferStream::finishDurationProbe(double duration) {
   callOnAudioDurationCallback(duration);
 }
 
-void PullBufferStream::decodePendingDataLocked() {
+void PullBufferStream::decodePendingDataLocked(bool aOnAudioThread) {
   // First, move any previously decoded samples that did not fit into the
   // circular buffer. If the circular buffer is still full, we cannot accept
   // any newly decoded samples either, so stop here.
@@ -882,7 +885,7 @@ void PullBufferStream::decodePendingDataLocked() {
       }
       // Once decoded, the encoded data is consumed from the pending buffer.
       mEncodedBuffer.clear();
-      applyPendingSeek();
+      applyPendingSeek(aOnAudioThread);
 
       // For formats whose duration becomes known only after decoding (e.g.
       // small Ogg files once the EOS page is seen), report it now.
@@ -947,7 +950,7 @@ void PullBufferStream::decodePendingDataLocked() {
     SOLOUD_DEBUG_LOG(
         "[PullBuffer] decodePendingData PCM frames=%zu written=%zu backlog=%zu\n",
         framesToProcess, written, mDecodedBacklog.size());
-    applyPendingSeek();
+    applyPendingSeek(aOnAudioThread);
   }
 }
 
@@ -957,12 +960,13 @@ void PullBufferStream::decodePendingData() {
 }
 
 void PullBufferStream::tryDecodePendingData() {
+  // Only the mixer calls this, from getAudio().
   std::unique_lock<std::mutex> lock(mDecodeMutex, std::try_to_lock);
   if (!lock.owns_lock()) return;
-  decodePendingDataLocked();
+  decodePendingDataLocked(/*aOnAudioThread*/ true);
 }
 
-void PullBufferStream::applyPendingSeek() {
+void PullBufferStream::applyPendingSeek(bool aOnAudioThread) {
   if (!mPendingSeek.load()) return;
 
   // If we haven't resolved the encoded byte offset yet, try again now that
@@ -996,9 +1000,17 @@ void PullBufferStream::applyPendingSeek() {
   }
 
   mPendingSeek.store(false);
+  SOLOUD_TEST_BARRIER(pullSeekCompleted);
   // The play head was already moved by seek() or by the offset-resolution block
   // above; now that data is here we can resume normal playback.
-  checkBuffering();
+  //
+  // Not on the audio thread (see checkBuffering()). The mixer completes a seek
+  // while it is mixing the voice, so the check could only pause it for a low
+  // buffer, and the next delivery, which the mixer keeps requesting, runs it.
+  // PullBufferStreamInstance::seek() has just discarded the buffer when it
+  // calls this, so it returns above.
+  if (!aOnAudioThread)
+    checkBuffering();
 }
 
 void PullBufferStream::drainBacklog() {
@@ -1114,6 +1126,7 @@ void PullBufferStream::requestMoreDataIfNeeded() {
 }
 
 void PullBufferStream::checkBuffering() {
+  SOLOUD_TEST_BARRIER(pullBufferingCheckEntered);
   if (mParent == nullptr || mParent->handle.empty()) return;
   if (mBaseSamplerate == 0.0f || mPCMformat.channels == 0) return;
 
@@ -1147,6 +1160,11 @@ void PullBufferStream::checkBuffering() {
       // be backlogged for a short time. Do not pause while we still have a
       // backlog that is being drained, otherwise playback never starts.
       backlogSamples == 0) {
+    // An automatic pause: clear the user-paused flag here, as BufferStream
+    // does, so the resume below can unpause the voice. Player::setPause()
+    // leaves the flag to automatic callers. Under sounds_mutex, like the
+    // handle[0] reads above and below (see the declaration).
+    mParent->handle[0].isUserPaused = false;
     mThePlayer->setPause(handle, true, false);
     mIsBuffering.store(true);
     callOnBufferingCallback(true, handle, availableTime);

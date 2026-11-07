@@ -104,6 +104,12 @@ namespace SoLoud
 		}
 
 		mActiveVoiceDirty = true;
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// Publish the new voice now rather than at unlock: the handle play()
+		// returns must be valid for the lock-free isValidVoiceHandle() and the
+		// queued control calls even if this slot is past mHighestVoice by the
+		// time the mutex is released.
+		publishVoiceState_internal(ch);
 		return ch;
 	}
 
@@ -468,18 +474,23 @@ namespace SoLoud
 
 	result Soloud::seek(handle aVoiceHandle, time aSeconds)
 	{
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// Queued: the mixer seeks the source at the start of its next block,
+		// before the voice's next getAudio() (see applyQueuedSeeks_internal).
+		// The source's own seek work -- decoding, for an MP3 stream -- used to
+		// run here, on the caller, with the audio mutex held (stalling the
+		// mixer as well). It applies here only when no mixer is running
+		// (isMixerIdle_internal) and the mutex is free, after the seeks queued
+		// before it; then it returns the source's result as before.
+		if (queueVoiceCommand_internal(VoiceCommand::SEEK, aVoiceHandle, aSeconds))
+			return SO_NO_ERROR;
 		result res = SO_NO_ERROR;
-		result singleres = SO_NO_ERROR;
-		FOR_ALL_VOICES_PRE
-			singleres = mVoice[ch]->seek(aSeconds, mScratch.mData, mScratchSize);
-		if (singleres == SO_NO_ERROR)
-		{
-			mVoice[ch]->mSourceSamplePosition = (uint64_t)floor(
-				aSeconds * mVoice[ch]->mBaseSamplerate);
-		}
-		if (singleres != SO_NO_ERROR)
-			res = singleres;
-		FOR_ALL_VOICES_POST
+		FOR_ALL_VOICES_LOCKED_PRE
+			const result singleres = applySeek_internal(ch, aSeconds);
+			if (singleres != SO_NO_ERROR)
+				res = singleres;
+		FOR_ALL_VOICES_LOCKED_POST
+		unlockAudioMutex_internal();
 		return res;
 	}
 

@@ -13,6 +13,7 @@ import 'dart:ui' as ui;
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter_soloud/src/audio_visualization_data.dart';
+import 'package:flutter_soloud/src/bindings/android_engine_lifecycle.dart';
 import 'package:flutter_soloud/src/bindings/bindings_player.dart';
 import 'package:flutter_soloud/src/bindings/darwin_engine_lifecycle.dart';
 import 'package:flutter_soloud/src/bindings/flutter_soloud_ffigen.dart'
@@ -686,6 +687,17 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   static const DarwinEngineLifecycle _iosEngineLifecycle =
       DarwinEngineLifecycle();
+
+  @override
+  bool get needsNativeLibraryInUseSignal => AndroidEngineLifecycle.isPending;
+
+  @override
+  Future<void> markNativeLibraryInUse() async {
+    await _androidEngineLifecycle.markNativeLibraryInUse();
+  }
+
+  static const AndroidEngineLifecycle _androidEngineLifecycle =
+      AndroidEngineLifecycle();
 
   @override
   void requestEngineShutdown() => native.requestEngineShutdown();

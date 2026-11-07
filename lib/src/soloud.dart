@@ -681,6 +681,19 @@ interface class SoLoud {
       }
     }
 
+    // Android only: tell the plugin this isolate uses the native library, so
+    // its engine-teardown hooks never skip the claim and the callbacks about
+    // to be created. Sent here: isInited() above has loaded the library, so
+    // the plugin's later load is a refcount bump, and nothing that a teardown
+    // must undo exists yet. Once acknowledged on this isolate it is not sent
+    // again, and off Android it never is, so neither suspends here.
+    if (_controller.soLoudFFI.needsNativeLibraryInUseSignal) {
+      await _controller.soLoudFFI.markNativeLibraryInUse();
+      if (initializationGeneration != _lifecycleGeneration) {
+        await _waitForInitializationTeardownAndThrow();
+      }
+    }
+
     // Claims the native engine for this FlutterEngine before the device open is
     // dispatched. Only iOS has to go through the platform to do it, and only
     // there does this become a suspension point -- everywhere else the claim is
@@ -1230,7 +1243,9 @@ interface class SoLoud {
     // miniaudio.h, where only `started` and `stopped` are reliable.
     // `audioDeviceStartFailed` is different: the plugin's own lifecycle
     // scheduler emits it, so it is reliable everywhere and is republished on
-    // the public [audioDeviceStartFailures] stream.
+    // the public [audioDeviceStartFailures] stream. So is
+    // `audioDeviceStalled`, emitted by the plugin's device-callback watchdog
+    // and republished on [audioDeviceStalls].
     if (!_controller.soLoudFFI.stateChangedController.hasListener) {
       _controller.soLoudFFI.stateChangedEvents.listen((newState) {
         _log.fine(() => 'Audio engine state changed: $newState');
@@ -1245,6 +1260,17 @@ interface class SoLoud {
               AudioDeviceStartFailure.deviceUnavailable,
             );
           }
+        } else if (newState == PlayerStateNotification.audioDeviceStalled) {
+          _log.severe(
+            'The audio output device reports started, but it has stopped '
+            'requesting audio. No audio is being produced until the device is '
+            'rebuilt, for example with changeDevice().',
+          );
+          if (!_audioDeviceStallsController.isClosed) {
+            _audioDeviceStallsController.add(
+              AudioDeviceStall.dataCallbackStopped,
+            );
+          }
         }
       });
     }
@@ -1252,6 +1278,9 @@ interface class SoLoud {
 
   final StreamController<AudioDeviceStartFailure>
   _audioDeviceStartFailuresController = StreamController.broadcast();
+
+  final StreamController<AudioDeviceStall> _audioDeviceStallsController =
+      StreamController.broadcast();
 
   /// Reports failures of *automatic* output-device startup.
   ///
@@ -1285,6 +1314,49 @@ interface class SoLoud {
   /// not emit here.
   Stream<AudioDeviceStartFailure> get audioDeviceStartFailures =>
       _audioDeviceStartFailuresController.stream;
+
+  /// Reports an output device that stopped producing audio while still
+  /// reporting itself started.
+  ///
+  /// Some platforms, mostly while the app is in the background, stop calling
+  /// the output device back for audio while the device keeps reporting
+  /// [AudioDeviceState.started]. Nothing is mixed and nothing is heard. Voices
+  /// stay valid and unpaused, but their positions do not advance, and nothing
+  /// else changes: no exception, no state change, no [audioDeviceStartFailures]
+  /// event. The plugin watches the device for exactly this and emits
+  /// [AudioDeviceStall.dataCallbackStopped] here once the device has gone
+  /// without a callback for a couple of seconds (at least 2 s, more for very
+  /// large buffer sizes).
+  ///
+  /// It is reported once per stall. It is reported again only after the device
+  /// has produced audio again, or has been stopped, restarted or rebuilt and
+  /// then stalled anew. It is never reported while the device is stopped
+  /// (including the idle stop of [setAudioDeviceIdleTimeout]), during an OS
+  /// audio interruption, or while the engine is not initialized. Time the app
+  /// spends suspended by the OS does not count towards a stall. Never emitted
+  /// on the web.
+  ///
+  /// Nothing is recovered automatically. Rebuild the device with
+  /// [changeDevice]: it closes the stalled device and opens a new one,
+  /// keeping loaded sounds, playing voices and their positions, and starts
+  /// it, since the stalled device was running. With no argument the new
+  /// device is the current default output; pass the device you selected
+  /// earlier to stay on it. [stopAudioDevice] followed by [startAudioDevice]
+  /// is not enough: it restarts the same underlying stream and only rebuilds
+  /// it if that start fails. A full [deinit] and [init] also recovers but
+  /// discards every loaded sound.
+  ///
+  /// ```dart
+  /// SoLoud.instance.audioDeviceStalls.listen((_) async {
+  ///   try {
+  ///     await SoLoud.instance.changeDevice();
+  ///   } on SoLoudAudioDeviceFailedToStartCppException {
+  ///     // No usable output right now: tell the user, or retry later.
+  ///   }
+  /// });
+  /// ```
+  Stream<AudioDeviceStall> get audioDeviceStalls =>
+      _audioDeviceStallsController.stream;
 
   /// Registers a freshly loaded sound, or throws if [error] says it did not
   /// load.

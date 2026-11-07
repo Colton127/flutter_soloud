@@ -303,6 +303,25 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   Future<void> prepareEngineInitAsync();
 
+  /// Whether [markNativeLibraryInUse] has to run before this isolate takes
+  /// the engine claim and registers its callbacks.
+  ///
+  /// True only on Android, and only until the plugin has acknowledged it once
+  /// on this isolate. Everywhere else, and from then on, initialization does
+  /// not suspend for it.
+  @mustBeOverridden
+  bool get needsNativeLibraryInUseSignal;
+
+  /// Tell the Android plugin that this isolate uses the native library, so
+  /// that its engine-teardown hooks never skip their native calls.
+  ///
+  /// Call it after the first native call has loaded the library and before
+  /// any call that creates state a teardown has to undo. Never throws: when
+  /// the platform cannot be told, the library's own load marker is the
+  /// fallback.
+  @mustBeOverridden
+  Future<void> markNativeLibraryInUse();
+
   /// Publish a native shutdown request before dispatching asynchronous dispose.
   @mustBeOverridden
   void requestEngineShutdown();

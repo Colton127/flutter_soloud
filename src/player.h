@@ -395,7 +395,8 @@ public:
 
   /// Apply the currently published policy to this Player and post whatever
   /// lifecycle request it implies. The caller must keep this Player alive for
-  /// the duration (in practice: hold init_deinit_mutex).
+  /// the duration (in practice: hold init_deinit_mutex, or a PlayerPin -- see
+  /// bindings.cpp).
   void applyPublishedAudioDeviceIdleTimeout();
 
   /// The idle-timeout policy this Player is currently running with, in
@@ -624,10 +625,17 @@ public:
 
   /// @brief Stop all handles of the already loaded sound identified by
   /// [soundHash] and clear it.
+  ///
+  /// Never operates the device and never takes mDeviceLifecycleOperationMutex
+  /// or the backend's device lock, so it does not wait for a device operation
+  /// in flight; the idle policy stops the device later, on the scheduler.
   /// @param soundHash hash of the sound.
   void disposeSound(unsigned int soundHash);
 
   /// @brief Dispose all sounds already loaded.
+  ///
+  /// Like disposeSound(), it never operates the device or waits for a device
+  /// operation: Dart calls both synchronously on the UI thread.
   void disposeAllSound();
 
   /// @brief Clear every native->Dart callback pointer held by the player.
@@ -1100,7 +1108,26 @@ public:
 
 private:
   std::mutex remove_handle_mutex;
-  mutable std::recursive_mutex sounds_mutex; // Protects the sounds vector (recursive to avoid deadlock in destructors)
+  // Protects the sounds vector (recursive to avoid deadlock in destructors).
+  //
+  // findByHash()/findByHandle() return a raw ActiveSound* and take this only
+  // for the lookup. disposeSound()/disposeAllSound() stop a sound's voices
+  // and take it out of `sounds` under this mutex and destroy it right after,
+  // so a caller that goes on to use the result must hold this mutex from
+  // before the lookup to its last use (see SoundsLock in player.cpp).
+  //
+  // Lock order: sounds_mutex -> SoLoud's audio mutex. It must never be taken
+  // with the audio mutex held, held across a backend device call, or held
+  // while taking mDeviceLifecycleOperationMutex (teardown takes that one
+  // first). No lifecycle request (resumeEngine(), pauseEngine(),
+  // evaluateAudioDeviceIdle()) is posted while it is held, since those take
+  // mInterruptionMutex: a path that holds it across something that can pause
+  // or unpause a voice (a buffer stream's checkBuffering(), a stop(), a call
+  // into SoLoud that can mix ahead) takes it through a SoundsLock, which
+  // defers those requests to its release. An automatic (buffering)
+  // setPause() does not take it at all, so a stream's decode thread can pause
+  // a voice while a play() of that stream holds it.
+  mutable std::recursive_mutex sounds_mutex;
   unsigned int mBufferSize;
 
   std::map<unsigned int, BusData> busMap;
@@ -1115,7 +1142,10 @@ private:
   std::thread mPauseThread;
   std::mutex mPauseMutex;
   // Serializes the actual blocking device operations performed by both the
-  // scheduler and the explicit lifecycle APIs.
+  // scheduler and the explicit lifecycle APIs, and teardown's own. It is held
+  // across backend device calls, so the sound operations (disposeSound(),
+  // disposeAllSound()) must never take it. Lock order: see the changeDevice()
+  // export in bindings.cpp.
   std::mutex mDeviceLifecycleOperationMutex;
   std::condition_variable mPauseCv;
   enum class DeviceLifecycleRequest : uint8_t {
@@ -1166,6 +1196,50 @@ private:
   /// milliseconds. Read by the scheduler thread, written from the FFI thread.
   std::atomic<int64_t> mIdleTimeoutMs;
 
+  // Output-device callback stall watchdog.
+  //
+  // Some devices keep reporting `ma_device_state_started` while the OS has
+  // stopped calling their data callback -- mostly with the app in the
+  // background. Nothing is mixed, voices stay valid and unpaused but never
+  // advance, and nothing else tells the app. This thread watches the device
+  // callback's heartbeat (see miniaudio_sampleDataCallbackLiveness()) and
+  // reports a stall once, as `event_audio_device_stalled`. Report only: it
+  // never operates the device.
+  //
+  // It runs from init() to dispose(), but only polls while the device is not
+  // stopped. While the device is stopped or uninitialized it is parked on
+  // mStallWatchdogCv with no timeout, and only a device start
+  // (performAudioDeviceStart()) wakes it, through kickStallWatchdog(). No
+  // thread exists before init() or after dispose().
+  //
+  // Lock ordering: mStallWatchdogMutex is a leaf. It guards only the stop flag
+  // and the wake epoch, nothing blocking runs under it, and the watchdog
+  // releases it before sampling the backend or dispatching the event. Kicks
+  // may arrive with mDeviceLifecycleOperationMutex held. The watchdog takes no
+  // other Player mutex and never init_deinit_mutex; its backend sample only
+  // try-locks gDeviceOperationMutex, so it can never wait behind a device
+  // operation either.
+  std::thread mStallWatchdogThread;
+  std::mutex mStallWatchdogMutex;
+  std::condition_variable mStallWatchdogCv;
+  // Protected by mStallWatchdogMutex.
+  bool mStallWatchdogStop = false;
+  // Protected by mStallWatchdogMutex. Advanced by every kick; a parked
+  // watchdog waits for it to move.
+  uint64_t mStallWatchdogWakeEpoch = 0;
+  // How long a started device may go without a data callback before it is
+  // reported. Written by init() before the watchdog thread is created, and
+  // read only by that thread, so the thread creation orders it.
+  int64_t mStallThresholdMs = 0;
+
+  void startStallWatchdog();
+  void stopStallWatchdog();
+  /// Wake a parked watchdog so it samples the device again. Cheap and
+  /// non-blocking; called after anything that may have started the device.
+  void kickStallWatchdog();
+  void stallWatchdogLoop();
+  void reportDeviceCallbackStall();
+
   void pauseEngineScheduler();
   /// Apply a pause/unpause to [handle] and post the matching device
   /// lifecycle request. [isUserAction] is false for automatic buffering
@@ -1182,6 +1256,9 @@ private:
   /// out. Explicit starts return the error to their caller instead and do not
   /// go through here.
   void reportAutomaticDeviceStartFailure();
+
+  /// The stall watchdog's threshold for the device init() has just opened.
+  int64_t computeDeviceStallThresholdMs() const;
 
   /// The generation a later cancellation can be compared against.
   ///
@@ -1212,7 +1289,12 @@ private:
   bool requestDeviceLifecycle(DeviceLifecycleRequest request);
   void startPauseEngineScheduler();
   void stopPauseEngineScheduler();
+  /// Teardown only: stops every voice, pauses the device, destroys the sounds.
   void stopDeviceAndDestroyAllSounds();
+  /// Stop every voice, take every loaded sound out and clear the global
+  /// filters, all in one sounds_mutex critical section, then destroy the
+  /// sounds after releasing it. The device is not touched.
+  void destroyAllSounds();
   void handleAudioInterruption(bool began);
   static void audioInterruptionCallback(void *context, bool began);
 };

@@ -107,6 +107,15 @@ namespace SoLoud
 	// 3 = starting, 4 = stopping). Returns 0 (uninitialized) if the device has
 	// not been initialized.
 	unsigned int miniaudio_getAudioDeviceState();
+	// One sample for the embedder's device-callback stall watchdog: the device
+	// state (as miniaudio_getAudioDeviceState()), how many device data callbacks
+	// have run, and how many started/stopped/rerouted transitions the device has
+	// made. The counters only mean something compared with an earlier sample.
+	// Never blocks: returns false, writing nothing, while a device operation
+	// holds the backend, because a device that is being opened, started,
+	// stopped or replaced is not a stalled one.
+	bool miniaudio_sampleDataCallbackLiveness(unsigned int *aState,
+		unsigned int *aCallbackCount, unsigned int *aRunGeneration);
 
 	// nosound back-end initialization call
 	result nosound_init(SoLoud::Soloud* aSoloud, unsigned int aFlags = Soloud::CLIP_ROUNDOFF, unsigned int aSamplerate = 44100, unsigned int aBuffer = 2048, unsigned int aChannels = 2);
@@ -138,6 +147,25 @@ namespace SoLoud
 			h_++; \
 		} \
 		unlockAudioMutex_internal();
+
+// ###### flutter_soloud local patch (non-blocking voice control) ######
+// FOR_ALL_VOICES_PRE/POST for a caller that already holds the audio mutex
+// (see Soloud::queueVoiceCommand_internal); POST does not unlock it.
+#define FOR_ALL_VOICES_LOCKED_PRE \
+		handle *h_ = NULL; \
+		handle th_[2] = { aVoiceHandle, 0 }; \
+		h_ = voiceGroupHandleToArray_internal(aVoiceHandle); \
+		if (h_ == NULL) h_ = th_; \
+		while (*h_) \
+		{ \
+			int ch = getVoiceFromHandle_internal(*h_); \
+			if (ch != -1)  \
+			{
+
+#define FOR_ALL_VOICES_LOCKED_POST \
+			} \
+			h_++; \
+		}
 
 #define FOR_ALL_VOICES_PRE_3D \
 		handle *h_ = NULL; \

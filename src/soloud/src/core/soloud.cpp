@@ -27,6 +27,7 @@ freely, subject to the following restrictions:
 #include <math.h> // sin
 #include <float.h> // _controlfp
 #include <algorithm> // stable_sort
+#include <chrono> // steady_clock (mixer idle detection)
 #ifdef __EMSCRIPTEN__
 #include <emscripten/threading.h>
 #endif
@@ -182,6 +183,42 @@ namespace SoLoud
 		mResampleDataOwner = NULL;
 		for (i = 0; i < 3 * MAX_CHANNELS; i++)
 			m3dSpeakerPosition[i] = 0;
+
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		for (i = 0; i < VOICE_COUNT; i++)
+		{
+			PublishedVoiceState &p = mPublishedVoice[i];
+			p.mSeq.store(0, std::memory_order_relaxed);
+			p.mHandle.store(0, std::memory_order_relaxed);
+			p.mVolume.store(0, std::memory_order_relaxed);
+			p.mPan.store(0, std::memory_order_relaxed);
+			p.mPaused.store(0, std::memory_order_relaxed);
+			p.mPosition.store(0, std::memory_order_relaxed);
+			p.mSeekTicket.store(0, std::memory_order_relaxed);
+			mVoiceSeekAppliedTicket[i] = 0;
+			PendingVoiceControl &q = mPendingVoice[i];
+			q.mSeq.store(0, std::memory_order_relaxed);
+			q.mHandle.store(0, std::memory_order_relaxed);
+			q.mVolumeTicket.store(0, std::memory_order_relaxed);
+			q.mPanTicket.store(0, std::memory_order_relaxed);
+			q.mPauseTicket.store(0, std::memory_order_relaxed);
+			q.mSeekTicket.store(0, std::memory_order_relaxed);
+			q.mVolume.store(0, std::memory_order_relaxed);
+			q.mPan.store(0, std::memory_order_relaxed);
+			q.mPause.store(0, std::memory_order_relaxed);
+			q.mSeek.store(0, std::memory_order_relaxed);
+			mVoiceCommandQueued[i] = 0;
+		}
+		mVoiceCommandListCount = 0;
+		mSeekCommandListCount = 0;
+		mVoiceCommandPending.store(0, std::memory_order_relaxed);
+		mSeekCommandPending.store(0, std::memory_order_relaxed);
+		mVoiceCommandMutex = Thread::createMutex();
+		mVoiceCommandTicket = 0;
+		mVoiceCommandDrainedTicket = 0;
+		mVoiceCommandAppliedTicket.store(0, std::memory_order_relaxed);
+		mMixBlockStartNs.store(0, std::memory_order_relaxed);
+		mMixBlockLengthNs.store(0, std::memory_order_relaxed);
 	}
 
 	Soloud::~Soloud()
@@ -199,6 +236,9 @@ namespace SoLoud
 		delete[] mVoiceGroup;
 		delete[] mResampleData;
 		delete[] mResampleDataOwner;
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		Thread::destroyMutex(mVoiceCommandMutex);
+		mVoiceCommandMutex = NULL;
 	}
 
 	void Soloud::deinit()
@@ -2458,12 +2498,24 @@ namespace SoLoud
 		float buffertime = aSamples / (float)mSamplerate;
 		float globalVolume[2];
 
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// Mark the mixer as running, for isMixerIdle_internal().
+		mMixBlockLengthNs.store((long long)(1e9 * aSamples / mSamplerate), std::memory_order_relaxed);
+		mMixBlockStartNs.store(
+			(long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count(),
+			std::memory_order_relaxed);
+
 		// Advance the mix clock under the same lock as the mix itself.
 		// playScheduled() computes a voice's delay from mStreamTime under this
 		// lock; if the clock advanced before the lock was taken, a voice
 		// scheduled in between got its delay from the next buffer while this
 		// buffer still counted it down, and started one buffer early.
-		lockAudioMutex_internal();
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// The block start: the only place, besides a control call on the
+		// idle-mixer path, where queued seeks are applied (see
+		// applyQueuedSeeks_internal).
+		lockAudioMutex_internal(true);
 		mStreamTime += buffertime;
 
 		globalVolume[0] = mGlobalVolume;
@@ -2620,19 +2672,60 @@ namespace SoLoud
 		}
 	}
 
-	void Soloud::lockAudioMutex_internal()
+	void Soloud::lockAudioMutex_internal(bool aMixBlockStart)
 	{
 		if (mAudioThreadMutex)
 		{
 			Thread::lockMutex(mAudioThreadMutex);
 		}
 		SOLOUD_ASSERT(!mInsideAudioThreadMutex);
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// Apply the queued volume/pan/pause commands first, so whatever runs
+		// under the mutex -- the next mix block, or a locking API call -- sees
+		// every command issued before it (see VoiceCommand). Queued seeks all
+		// at a mix block start; anywhere else only those of sources whose seek
+		// is cheap (hasCheapSeek), as the others would run a source's seek
+		// work on an unrelated caller (see applyQueuedSeeks_internal). The
+		// mixer never waits for the queue's own mutex: when a control call
+		// holds it, the queue waits for the next block. The flag is already
+		// set only on a same-thread re-entry of the web's recursive mutex
+		// (from inside a mix or another hold); the outer hold applies them.
+		const bool reentered = mInsideAudioThreadMutex;
 		mInsideAudioThreadMutex = true;
+		if (!reentered)
+		{
+			applyVoiceCommands_internal(aMixBlockStart);
+			applyQueuedSeeks_internal(!aMixBlockStart, aMixBlockStart);
+		}
+	}
+
+	// ###### flutter_soloud local patch (non-blocking voice control) ######
+	bool Soloud::tryLockAudioMutex_internal()
+	{
+		if (mAudioThreadMutex && Thread::tryLockMutex(mAudioThreadMutex) != 0)
+			return false;
+		const bool reentered = mInsideAudioThreadMutex;
+		mInsideAudioThreadMutex = true;
+		if (!reentered)
+		{
+			applyVoiceCommands_internal();
+			applyQueuedSeeks_internal(true);
+		}
+		return true;
 	}
 
 	void Soloud::unlockAudioMutex_internal()
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// Publish what this hold changed (positions advanced by a mix, voices
+		// started or stopped, commands applied) for the lock-free getters,
+		// then the last applied command ticket, in that order: a getter that
+		// sees the ticket also sees the state it produced.
+		publishVoiceStates_internal();
+		mVoiceCommandAppliedTicket.store(mVoiceCommandDrainedTicket,
+			std::memory_order_release);
 
 		if (mEndedVoiceCount != 0 && !mDispatchingEndedVoices)
 		{

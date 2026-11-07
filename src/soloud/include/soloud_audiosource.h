@@ -247,6 +247,13 @@ namespace SoLoud
 		virtual bool hasEnded() = 0;
 		// Seek to certain place in the stream. Base implementation is generic "tape" seek (and slow).
 		virtual result seek(time aSeconds, float *mScratch, unsigned int mScratchSize);
+		// ###### flutter_soloud local patch (non-blocking voice control) ######
+		// True when seek() is cheap (microseconds: no decoding, no file I/O)
+		// and safe to run on any thread that holds the audio mutex. A queued
+		// seek of such a voice is then also applied by whichever API call
+		// takes the mutex next, not only by the mixer at its next block (see
+		// Soloud::applyQueuedSeeks_internal). Default: not cheap.
+		virtual bool hasCheapSeek() const { return false; }
 		// Rewind stream. Base implementation returns NOT_IMPLEMENTED, meaning it can't rewind.
 		virtual result rewind();
 		// Get information. Returns 0 by default.

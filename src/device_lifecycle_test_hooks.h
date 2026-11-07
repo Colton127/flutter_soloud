@@ -23,8 +23,9 @@ namespace soloud_test
   enum class DeviceBarrier
   {
     /// Inside the native changeDevice() export, after the global `player` has
-    /// been read but before Player::changeDevice() runs. Parks a change worker
-    /// against a concurrent teardown.
+    /// been pinned but before Player::changeDevice() runs. Parks a change
+    /// worker against a concurrent teardown, or against the calls that must
+    /// not wait for it.
     changeDeviceEntered = 0,
     /// In Player::changeDevice(), after `shouldStartReplacement` has been
     /// decided from the active-voice count and device state.
@@ -60,8 +61,62 @@ namespace soloud_test
     /// released the gate, before it stops the mixer capture and the
     /// visualizations. A newer registration can be claimed in this window.
     retiredCaptureStopEntered,
+    /// Inside the native startAudioDevice() export, after the global `player`
+    /// has been pinned but before Player::startAudioDevice() runs.
+    startAudioDeviceEntered,
+    /// Inside the native stopAudioDevice() export, after the global `player`
+    /// has been pinned but before Player::stopAudioDevice() runs.
+    stopAudioDeviceEntered,
+    /// In the device-callback stall watchdog, each time it wakes, before it
+    /// reads the clock and samples the device. Parking it here is a watchdog
+    /// frozen by a process suspension: when released, its wake-up is far
+    /// later than scheduled.
+    stallWatchdogWoke,
+    /// In every Player::play* variant, right after the sound has been looked
+    /// up by hash and before it is used. A disposeSound()/disposeAllSound()
+    /// started while a play is parked here must neither free the sound under
+    /// it nor leave the voice it goes on to create alive.
+    playSoundLookedUp,
+    /// In a BufferStream's background decode thread (started by
+    /// setDataIsEnded() while the decoder still holds data), after a chunk has
+    /// been decoded into the buffer and before checkBuffering() runs for it.
+    /// That checkBuffering() can pause or unpause voices automatically, from
+    /// a thread holding check_buffer_mutex.
+    bufferStreamBackgroundDecoded,
+    /// At the top of Player::resumeEngine() and
+    /// Player::evaluateAudioDeviceIdle() when they actually post (a request
+    /// deferred to a SoundsLock release does not get here), before
+    /// mInterruptionMutex is taken. Only threads that set
+    /// tObserveLifecyclePosts reach it, so a test can tell its own thread's
+    /// posts from the mixer's and the scheduler's.
+    lifecyclePostEntered,
+    /// In Player::addPullBufferDataStream(), right after the stream has been
+    /// looked up by hash and before data is added to it. A disposal started
+    /// while a feeder is parked here must not destroy the stream under it.
+    pullDataSoundLookedUp,
+    /// At the end of a PullBufferStream seek out of the buffered range, in
+    /// PullBufferStreamInstance::seek(): the buffer has been discarded and the
+    /// seek stays pending until data at its target has been decoded. SoLoud
+    /// applies seeks with its audio mutex held, usually on the mixer thread.
+    pullSeekPending,
+    /// In PullBufferStream::addAudioData(), after the delivered bytes have
+    /// been queued for decoding and before the delivering thread decodes
+    /// them. While a feeder is parked here the mixer can decode them itself
+    /// (PullBufferStream::tryDecodePendingData()).
+    pullDataQueued,
+    /// In PullBufferStream::applyPendingSeek(), right after data decoded at
+    /// the target has completed a pending seek, before the buffering check a
+    /// delivering thread runs next.
+    pullSeekCompleted,
+    /// At the top of PullBufferStream::checkBuffering(), which runs only on a
+    /// thread delivering data, holding sounds_mutex, and never on the mixer.
+    pullBufferingCheckEntered,
     barrierCount
   };
+
+  /// Set on a thread a test drives, so that thread's lifecycle posts hit the
+  /// lifecyclePostEntered barrier (see SOLOUD_TEST_LIFECYCLE_POST()).
+  inline thread_local bool tObserveLifecyclePosts = false;
 
   /// Arm [barrier]. The *next* thread reaching it parks until released; any
   /// thread arriving after that passes straight through, so a barrier cannot
@@ -98,13 +153,38 @@ namespace soloud_test
   /// can drive rebuild/retry deterministically rather than by unplugging
   /// hardware. Returns true when this start must be failed.
   bool consumeForcedDeviceStartFailure();
+
+  /// Make the device data callback return silence without reaching the
+  /// engine, while the device itself keeps running and reporting started:
+  /// nothing is mixed, voices do not advance, and the callback heartbeat the
+  /// stall watchdog reads stops moving. That is the field failure the
+  /// watchdog exists to report, without needing an OS that misbehaves.
+  void setDeviceCallbackStalled(bool stalled);
+
+  /// Called on the audio callback path, so lock-free: a relaxed atomic load.
+  bool deviceCallbackStalled();
+
+  /// Override the stall watchdog threshold picked up by the next
+  /// Player::init(), so a test runs in seconds. 0 restores the computed
+  /// production threshold.
+  void setDeviceStallThresholdMs(long long thresholdMs);
+  long long deviceStallThresholdOverrideMs();
 } // namespace soloud_test
 
 #define SOLOUD_TEST_BARRIER(name)                                              \
   ::soloud_test::hitBarrier(::soloud_test::DeviceBarrier::name)
 
+/// A lifecycle request is about to be posted on this thread.
+#define SOLOUD_TEST_LIFECYCLE_POST()                                           \
+  do                                                                           \
+  {                                                                            \
+    if (::soloud_test::tObserveLifecyclePosts)                                 \
+      SOLOUD_TEST_BARRIER(lifecyclePostEntered);                               \
+  } while (0)
+
 #else
 
 #define SOLOUD_TEST_BARRIER(name) ((void)0)
+#define SOLOUD_TEST_LIFECYCLE_POST() ((void)0)
 
 #endif // SOLOUD_LIFECYCLE_TEST_HOOKS
