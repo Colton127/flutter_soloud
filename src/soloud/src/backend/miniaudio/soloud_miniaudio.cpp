@@ -531,17 +531,88 @@ namespace SoLoud
         return result;
     }
 
+    // Oboe's bounds on the wait before a close (kMinDelayBeforeCloseMillis,
+    // kMaxDelayBeforeCloseMillis).
+    constexpr ma_int64 kMinDelayBeforeCloseMs = 10;
+    constexpr ma_int64 kMaxDelayBeforeCloseMs = 100;
+
+    /// Stop [pStream] and wait about one burst, before it is closed. Ported
+    /// from Oboe's close workaround (google/oboe 8c13e5e2:
+    /// AudioStreamAAudio::close() and requestStop_l(), and
+    /// AudioStream::calculateDefaultDelayBeforeCloseMillis()).
+    ///
+    /// On Android 11 and earlier a legacy (non-MMAP) stream is an AudioTrack
+    /// whose callbacks hold a raw pointer to the stream: its audio data, and
+    /// the route changes it registers for when it is opened, started or not.
+    /// AAudioStream_close() deletes the stream at once, so a callback already
+    /// being delivered then runs on a freed stream and crashes the process,
+    /// in AudioStreamLegacy_callback() or AudioStreamLegacy::
+    /// onAudioDeviceUpdate(). From Android 12 the stream is reference counted
+    /// and closing it only drops a reference. Stopping it and waiting lets the
+    /// callbacks in flight finish first.
+    ///
+    /// miniaudio closes AAudio streams directly on every path: a device's
+    /// uninit, the reroute job after a disconnect, and the streams it opens to
+    /// probe a device. Each goes through `context`'s AAudioStream_close, so
+    /// the wait is added there, in closeAAudioStream(), and miniaudio is
+    /// unchanged.
+    ///
+    /// As in Oboe, a device stream gets it on every SDK, and on SDK <= 27 (O_MR1)
+    /// one that is already stopping or stopped is not stopped again. A probe,
+    /// which is never started, gets it only on SDK <= 30, where the
+    /// raw-pointer callback exists: enumeration runs on the caller's thread,
+    /// for flutter_soloud the UI thread, and on an API 36 emulator the wait
+    /// added about 65 ms to each.
+    ///
+    /// Never called on an AAudio callback thread, where AAudio refuses stop
+    /// and close: miniaudio closes streams only on application threads and on
+    /// its job thread.
+    static void stopAndWaitBeforeClose(ma_AAudioStream *pStream)
+    {
+        bool requestStop = true;
+        if (ma_android_sdk_version() <= 27)
+        {
+            const ma_aaudio_stream_state_t state =
+                ((MA_PFN_AAudioStream_getState)
+                     context.aaudio.AAudioStream_getState)(pStream);
+            requestStop = state != MA_AAUDIO_STREAM_STATE_STOPPING &&
+                          state != MA_AAUDIO_STREAM_STATE_STOPPED;
+        }
+        // The result is ignored, as in Oboe's close().
+        if (requestStop)
+            ((MA_PFN_AAudioStream_requestStop)
+                 context.aaudio.AAudioStream_requestStop)(pStream);
+
+        const ma_int64 framesPerBurst =
+            ((MA_PFN_AAudioStream_getFramesPerBurst)
+                 context.aaudio.AAudioStream_getFramesPerBurst)(pStream);
+        const ma_int64 sampleRate =
+            ((MA_PFN_AAudioStream_getSampleRate)
+                 context.aaudio.AAudioStream_getSampleRate)(pStream);
+        ma_int64 delayMs = kMinDelayBeforeCloseMs;
+        if (framesPerBurst > 0 && sampleRate > 0)
+            delayMs = std::clamp<ma_int64>(1 + framesPerBurst * 1000 / sampleRate,
+                                           kMinDelayBeforeCloseMs,
+                                           kMaxDelayBeforeCloseMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+
     static ma_aaudio_result_t closeAAudioStream(ma_AAudioStream *pStream)
     {
+        bool deviceStream;
         {
             std::lock_guard<std::mutex> lock(gAAudioStreamGate);
-            gOpenDeviceStreams.erase(std::remove(gOpenDeviceStreams.begin(),
-                                                 gOpenDeviceStreams.end(),
-                                                 pStream),
-                                     gOpenDeviceStreams.end());
+            const auto closed = std::remove(gOpenDeviceStreams.begin(),
+                                            gOpenDeviceStreams.end(), pStream);
+            deviceStream = closed != gOpenDeviceStreams.end();
+            gOpenDeviceStreams.erase(closed, gOpenDeviceStreams.end());
         }
         // Not under the lock: closing joins the stream's callback thread,
-        // which may be waiting for it in gateAAudioStreamError().
+        // which may be waiting for it in gateAAudioStreamError(). Already out
+        // of gOpenDeviceStreams, so an error the stream reports while it is
+        // stopped and waited out queues no reroute.
+        if (deviceStream || ma_android_sdk_version() <= 30)
+            stopAndWaitBeforeClose(pStream);
         return gCloseAAudioStream(pStream);
     }
 
@@ -647,6 +718,7 @@ namespace SoLoud
         {
             soloud_platform_log("miniaudio: closing an AAudio stream a failed "
                                 "device initialization left open\n");
+            stopAndWaitBeforeClose(pStream);
             gCloseAAudioStream(pStream);
         }
 #endif
