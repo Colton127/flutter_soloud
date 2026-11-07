@@ -1633,8 +1633,9 @@ void Player::applyPauseState(unsigned int handle, bool pause, bool isUserAction)
     // flag is already clear, so writing it here would change nothing for
     // them. They must not take sounds_mutex: they run with
     // check_buffer_mutex held on a BufferStream's background decode thread,
-    // which a play() of that stream takes in the opposite order, and on the
-    // mixer thread with the audio mutex held.
+    // which a play() of that stream takes in the opposite order. (A
+    // PullBufferStream's run only under sounds_mutex, while data is delivered;
+    // never on the audio thread.)
     if (isUserAction)
     {
         std::lock_guard<std::recursive_mutex> lock(sounds_mutex);

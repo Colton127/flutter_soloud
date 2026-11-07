@@ -55,7 +55,15 @@
 //     play() and an addAudioDataStream() of a buffer stream) post their
 //     lifecycle request only once sounds_mutex is free: the thread is parked
 //     where the request is posted (lifecyclePostEntered), before
-//     mInterruptionMutex is taken, and sounds_mutex is shown to be free then.
+//     mInterruptionMutex is taken, and sounds_mutex is shown to be free then;
+//   * a PullBufferStream's buffering check, which pauses and unpauses its
+//     voice automatically, runs only on a thread delivering data, holding
+//     sounds_mutex, never on the mixer: a mixer that completes a pending seek
+//     by decoding delivered data itself leaves the check to the delivery (the
+//     pullSeekCompleted and pullBufferingCheckEntered barriers). The check
+//     reads the voice's entry in the sound's handle list and writes its
+//     user-paused flag, which sounds_mutex protects, and its getPause() can
+//     wait for a control thread, which the audio thread must never do.
 //
 // Build and run from the flutter_soloud repository root with:
 //
@@ -736,6 +744,138 @@ void pullDataDeliveryAgainstDisposal(Disposal disposal)
     watchSound(0);
 }
 
+/// The mixer completes a PullBufferStream's pending seek with data a feeder
+/// delivered, and must not run the stream's buffering check on the way.
+///
+/// PullBufferStream::checkBuffering() reads the voice's entry in the sound's
+/// handle list and writes its user-paused flag, which sounds_mutex protects,
+/// and calls Player::getPause(), whose lock-free read can wait for a control
+/// thread in the middle of publishing a queued command. A seek out of the
+/// buffered range stays pending until data at its target has been decoded,
+/// and the mixer decodes delivered data itself when the feeder has not yet
+/// (getAudio() -> tryDecodePendingData()), completing the seek. That used to
+/// run checkBuffering() there: on the audio thread, without sounds_mutex.
+///
+/// The stream seeks out of its buffer, a feeder delivers data at the target
+/// and parks before decoding it (pullDataQueued), and the mixer decodes it and
+/// completes the seek (pullSeekCompleted). The mixer must not go on to the
+/// check (pullBufferingCheckEntered); the feeder, released, must, holding
+/// sounds_mutex.
+void mixerCompletingAPullSeekSkipsTheBufferingCheck()
+{
+    const char *what = "pull stream seek completed by the mixer";
+    std::printf("%s, with the feeder parked before decoding\n", what);
+
+    // As in pullDataDeliveryAgainstDisposal(): raw PCM, no decoder.
+    constexpr unsigned int kSampleRate = 44100;
+    constexpr unsigned int kChannels = 2;
+    unsigned int hash = 0;
+    PlayerErrors err = setPullBufferStream(
+        &hash, /*bufferSizeBytes*/ 1u << 20, 0.5, kSampleRate, kChannels,
+        static_cast<int>(PCM_F32LE), /*audioSizeBytes*/ 64u << 20, nullptr,
+        nullptr, nullptr, nullptr);
+    EXPECT(err == PlayerErrors::noError && hash != 0,
+           "%s: the pull stream should be created (error %d)", what,
+           static_cast<int>(err));
+    if (err != PlayerErrors::noError || hash == 0)
+        return;
+
+    unsigned int voice = 0;
+    err = playVariant(PlayVariant::play, hash, &voice);
+    EXPECT(err == PlayerErrors::noError && voice != 0,
+           "%s: the pull stream should play (error %d)", what,
+           static_cast<int>(err));
+    if (err != PlayerErrors::noError || voice == 0)
+    {
+        disposeSound(hash);
+        expectNothingLeft(what);
+        return;
+    }
+
+    // A quarter of a second of silence. The first delivery, from the start,
+    // is decoded by the feeder, and the voice plays it.
+    const std::vector<float> pcm(kSampleRate / 4 * kChannels, 0.0f);
+    const auto *bytes = reinterpret_cast<const unsigned char *>(pcm.data());
+    const auto length = static_cast<unsigned int>(pcm.size() * sizeof(float));
+    err = addPullBufferDataStream(hash, bytes, length, 0);
+    EXPECT(err == PlayerErrors::noError,
+           "%s: the first delivery should be added (error %d)", what,
+           static_cast<int>(err));
+
+    // Seek well past it. The mixer applies the seek at its next block (or the
+    // seeking thread does, if no mixer is running, hence its own thread): the
+    // buffer is discarded and the seek stays pending until data at 10 s has
+    // been decoded.
+    soloud_test::armBarrier(DeviceBarrier::pullSeekPending);
+    PlayerErrors seekResult = PlayerErrors::noError;
+    std::thread seeker([&] { seekResult = seek(voice, 10.0f); });
+    if (!waitBarrierReachedFor(DeviceBarrier::pullSeekPending, kProgressMs))
+        abortWedgedRun("the pull stream's seek was never applied");
+    soloud_test::releaseBarrier(DeviceBarrier::pullSeekPending);
+    seeker.join();
+    EXPECT(seekResult == PlayerErrors::noError,
+           "%s: the seek should be accepted (error %d)", what,
+           static_cast<int>(seekResult));
+
+    // Deliver data at the target. The feeder parks once its bytes are queued,
+    // before decoding them, holding sounds_mutex; the mixer decodes them and
+    // completes the seek meanwhile.
+    soloud_test::armBarrier(DeviceBarrier::pullDataQueued);
+    soloud_test::armBarrier(DeviceBarrier::pullSeekCompleted);
+    soloud_test::armBarrier(DeviceBarrier::pullBufferingCheckEntered);
+    PlayerErrors feedResult = PlayerErrors::noError;
+    std::thread feeder(
+        [&] { feedResult = addPullBufferDataStream(hash, bytes, length, 0); });
+    if (!waitBarrierReachedFor(DeviceBarrier::pullDataQueued, kProgressMs))
+        abortWedgedRun("the delivery at the seek target never queued its data");
+    if (!waitBarrierReachedFor(DeviceBarrier::pullSeekCompleted, kProgressMs))
+        abortWedgedRun("the mixer never completed the seek with the queued data");
+    soloud_test::releaseBarrier(DeviceBarrier::pullSeekCompleted);
+
+    // The mixer must not go on to the buffering check. Without the fix it gets
+    // there at once and parks; bounded, since with the fix nothing does until
+    // the feeder is released.
+    const bool mixerChecked =
+        waitBarrierReachedFor(DeviceBarrier::pullBufferingCheckEntered, kParkMs);
+    EXPECT(!mixerChecked,
+           "%s: the mixer ran the stream's buffering check after completing "
+           "the seek, on the audio thread and without sounds_mutex",
+           what);
+    if (mixerChecked)
+    {
+        soloud_test::releaseBarrier(DeviceBarrier::pullBufferingCheckEntered);
+        soloud_test::releaseBarrier(DeviceBarrier::pullDataQueued);
+    }
+    else
+    {
+        // The delivery runs the check itself once released, holding
+        // sounds_mutex. Reaching the barrier also ends the wait above.
+        soloud_test::releaseBarrier(DeviceBarrier::pullDataQueued);
+        if (!waitBarrierReachedFor(DeviceBarrier::pullBufferingCheckEntered,
+                                   kProgressMs))
+            abortWedgedRun("the delivery never ran the stream's buffering check");
+        SoundsMutexProbe probe(hash);
+        EXPECT(!probe.acquiredWithin(kParkMs),
+               "%s: the delivery should run the buffering check holding "
+               "sounds_mutex",
+               what);
+        soloud_test::releaseBarrier(DeviceBarrier::pullBufferingCheckEntered);
+    }
+    feeder.join();
+    EXPECT(feedResult == PlayerErrors::noError,
+           "%s: the delivery at the seek target should be added (error %d)",
+           what, static_cast<int>(feedResult));
+
+    // The seek took effect: the voice plays on from its target.
+    const double position = getPosition(voice);
+    EXPECT(position >= 10.0 - 1e-3,
+           "%s: the voice should play from the seek target (position %.3f s)",
+           what, position);
+
+    disposeSound(hash);
+    expectNothingLeft(what);
+}
+
 /// A play() of a BufferStream parks holding sounds_mutex while the stream's
 /// background decode thread unpauses a voice automatically.
 ///
@@ -1009,6 +1149,7 @@ int main()
 
     pullDataDeliveryAgainstDisposal(Disposal::oneSound);
     pullDataDeliveryAgainstDisposal(Disposal::allSounds);
+    mixerCompletingAPullSeekSkipsTheBufferingCheck();
 
     lifecycleRequestsWaitForTheSoundsLock();
 #if defined(__has_feature)
