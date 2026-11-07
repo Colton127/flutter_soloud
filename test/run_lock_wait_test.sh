@@ -16,7 +16,8 @@
 # skip.
 #
 # Pass --asan to build under AddressSanitizer, or --tsan to build under
-# ThreadSanitizer. A scenario name after it (idle) runs only that scenario.
+# ThreadSanitizer. A scenario name after it (idle or ended) runs only that
+# scenario.
 
 set -e
 

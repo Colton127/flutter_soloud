@@ -13,6 +13,11 @@
 //     tries it: while an interruption's handler is parked holding it
 //     (audioInterruptionLocked), the mixer's clock keeps advancing, and once
 //     it is released the evaluation the mixer could not make still happens.
+//   * a voice the mixer ends is reported on the mixer's thread, and the
+//     report takes the voice's handle out of its sound's handle list, which
+//     Player::sounds_mutex guards. While a play is parked holding that
+//     (playSoundLookedUp), the mixer's clock keeps advancing and the end is
+//     reported; the handle is gone from the list once the play is released.
 //
 // Build and run from the flutter_soloud repository root with:
 //
@@ -20,7 +25,7 @@
 //   ./test/run_lock_wait_test.sh --asan     (AddressSanitizer)
 //   ./test/run_lock_wait_test.sh --tsan     (ThreadSanitizer)
 //
-// A scenario name after the flag (idle) runs only that scenario.
+// A scenario name after the flag (idle or ended) runs only that scenario.
 
 #include "bindings.h"
 #include "device_lifecycle_test_hooks.h"
@@ -41,8 +46,9 @@
 
 extern "C"
 {
-    // Test-only export, compiled in with SOLOUD_LIFECYCLE_TEST_HOOKS.
+    // Test-only exports, compiled in with SOLOUD_LIFECYCLE_TEST_HOOKS.
     int soloudTestSoundCount();
+    int soloudTestSoundHandleCount(unsigned int hash);
 }
 
 namespace
@@ -218,7 +224,34 @@ double engineTimeAdvanceOver(long long ms)
 // Engine
 // ---------------------------------------------------------------------------
 
-void onVoiceEnded(unsigned int *handle) { std::free(handle); }
+std::mutex gEndedMutex;
+std::condition_variable gEndedCv;
+std::vector<unsigned int> gEndedVoices;
+
+void onVoiceEnded(unsigned int *handle)
+{
+    {
+        std::lock_guard<std::mutex> lock(gEndedMutex);
+        gEndedVoices.push_back(*handle);
+    }
+    gEndedCv.notify_all();
+    std::free(handle);
+}
+
+/// Wait, at most [ms], for the end of [voice] to be reported to Dart.
+bool waitForVoiceEnded(unsigned int voice, long long ms)
+{
+    std::unique_lock<std::mutex> lock(gEndedMutex);
+    return gEndedCv.wait_for(
+        lock, std::chrono::milliseconds(ms),
+        [&]
+        {
+            for (const unsigned int ended : gEndedVoices)
+                if (ended == voice)
+                    return true;
+            return false;
+        });
+}
 
 void onFileLoaded(enum PlayerErrors *e, char *name, unsigned int *hash,
                   uint64_t *counter)
@@ -347,6 +380,70 @@ void mixerDoesNotWaitForTheLifecycleLock()
            "%s: the device should start again", what);
 }
 
+/// SoLoud reports a voice ended on the thread that ended it, after it has
+/// released its audio mutex: for a voice the mixer ends, on the mixer's
+/// thread. The report takes the voice's handle out of its sound's handle
+/// list, which sounds_mutex guards, and a play, a disposal or a stream's
+/// delivery holds that for as long as it takes. The mixer must not wait for
+/// it: the removal is left to the next thread that takes the mutex, which
+/// applies it before anything else.
+///
+/// A play parks holding sounds_mutex (playSoundLookedUp), and the mixer ends
+/// another voice of the same sound (scheduleStop()). The mixer's clock must
+/// keep advancing while the play is parked, and the end must be reported.
+/// Once the play is released, the sound must have the new voice's handle and
+/// not the ended one's.
+void mixerDoesNotWaitForTheSoundsLock()
+{
+    const char *what = "the mixer's voice-ended report vs a held sounds lock";
+    std::printf("%s\n", what);
+
+    const unsigned int hash = loadTestWaveform();
+    const unsigned int ending = hash != 0 ? playQuietly(hash) : 0;
+    EXPECT(hash != 0 && ending != 0, "%s: a waveform should load and play",
+           what);
+    if (ending == 0)
+    {
+        if (hash != 0)
+            disposeSound(hash);
+        return;
+    }
+
+    soloud_test::armBarrier(DeviceBarrier::playSoundLookedUp);
+    unsigned int played = 0;
+    BackgroundCall play([&] { played = playQuietly(hash); });
+    if (!waitBarrierReachedFor(DeviceBarrier::playSoundLookedUp, kProgressMs))
+        endRun("the play never reached its lookup");
+
+    // Ended by the mixer once 50 ms of it have played, and reported there.
+    scheduleStop(ending, 0.05f);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const double advanced = engineTimeAdvanceOver(kParkMs);
+    EXPECT(advanced >= kParkMs / 3000.0,
+           "%s: the mixer stopped mixing while a play held the sounds lock "
+           "(its clock moved %.3f s in %.3f s)",
+           what, advanced, kParkMs / 1000.0);
+    EXPECT(waitForVoiceEnded(ending, kParkMs),
+           "%s: the voice's end should be reported while the play holds the "
+           "sounds lock",
+           what);
+
+    soloud_test::releaseBarrier(DeviceBarrier::playSoundLookedUp);
+    play.join();
+
+    EXPECT(played != 0, "%s: the parked play should succeed", what);
+    EXPECT(waitForVoiceEnded(ending, kProgressMs),
+           "%s: the voice's end should be reported", what);
+    const int handles = soloudTestSoundHandleCount(hash);
+    EXPECT(handles == 1,
+           "%s: the sound should have only the new voice's handle, not the "
+           "ended one's (it has %d)",
+           what, handles);
+
+    disposeSound(hash);
+    expectNothingLeft(what);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -354,7 +451,7 @@ int main(int argc, char **argv)
     startHangGuard(120);
 
     const char *only = argc > 1 ? argv[1] : nullptr;
-    const char *const kScenarios[] = {"idle"};
+    const char *const kScenarios[] = {"idle", "ended"};
     if (only != nullptr)
     {
         bool known = false;
@@ -362,7 +459,8 @@ int main(int argc, char **argv)
             known = known || std::strcmp(only, name) == 0;
         if (!known)
         {
-            std::fprintf(stderr, "Unknown scenario '%s': use idle.\n", only);
+            std::fprintf(stderr, "Unknown scenario '%s': use idle or ended.\n",
+                         only);
             return 2;
         }
     }
@@ -385,6 +483,8 @@ int main(int argc, char **argv)
 
     if (wanted("idle"))
         mixerDoesNotWaitForTheLifecycleLock();
+    if (wanted("ended"))
+        mixerDoesNotWaitForTheSoundsLock();
 
     tearDownEngine();
 

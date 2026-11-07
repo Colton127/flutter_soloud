@@ -99,6 +99,11 @@ public:
   /// @brief Return the active sounds.
   int getSoundsCount();
 
+  /// @brief How many voice handles the sound [soundHash] has registered: the
+  /// voices it plays that have not been reported ended. 0 for an unknown
+  /// sound.
+  int getSoundHandleCount(unsigned int soundHash);
+
   /// @brief Returns human readable string of an error.
   /// @param errorCode the error code.
   /// @return a string represented by the PlayerErrors code.
@@ -629,6 +634,10 @@ public:
   void stopAudioSource(unsigned int soundHash);
 
   /// @brief Remove the unique [handle] form the list of internal sounds.
+  /// SoLoud reports a voice ended on the thread that ended it, the mixer's
+  /// included, so this never waits for sounds_mutex: when another thread
+  /// holds it, the removal is left for the next thread to take it (see
+  /// SoundsMutex).
   /// @param handle handle of the sound.
   void removeHandle(unsigned int handle);
 
@@ -1095,6 +1104,45 @@ public:
   BusData *findBusData(unsigned int busId);
 
 public:
+  /// The type of sounds_mutex: a recursive mutex that, whenever a thread
+  /// takes it at the outermost level, first applies the handle removals
+  /// removeHandle() left for later because another thread held it. No holder
+  /// sees a handle whose voice was reported ended before it took the mutex.
+  class SoundsMutex
+  {
+  public:
+    explicit SoundsMutex(Player &player) : mPlayer(player) {}
+    SoundsMutex(const SoundsMutex &) = delete;
+    SoundsMutex &operator=(const SoundsMutex &) = delete;
+
+    void lock()
+    {
+      mMutex.lock();
+      if (mDepth++ == 0)
+        mPlayer.applyDeferredHandleRemovals();
+    }
+    bool try_lock()
+    {
+      if (!mMutex.try_lock())
+        return false;
+      if (mDepth++ == 0)
+        mPlayer.applyDeferredHandleRemovals();
+      return true;
+    }
+    void unlock()
+    {
+      --mDepth;
+      mMutex.unlock();
+    }
+
+  private:
+    std::recursive_mutex mMutex;
+    Player &mPlayer;
+    // How many times the holding thread holds mMutex. Only the holder
+    // touches it.
+    int mDepth = 0;
+  };
+
   /// all the sounds loaded
   std::vector<std::unique_ptr<ActiveSound>> sounds;
 
@@ -1116,7 +1164,28 @@ public:
   unsigned int mChannels;
 
 private:
+  /// Remove [handle] from its sound's handle list. sounds_mutex is held.
+  void removeHandleLocked(unsigned int handle);
+  /// Apply the removals removeHandle() deferred (mDeferredHandleRemovals).
+  /// Called by SoundsMutex when a thread takes sounds_mutex.
+  void applyDeferredHandleRemovals();
+
+  /// Room for handle removals deferred while one thread holds sounds_mutex.
+  /// Reserved up front, so deferring one never allocates on the mixer's
+  /// thread. Past it removeHandle() waits for sounds_mutex, as it used to.
+  static constexpr size_t kMaxDeferredHandleRemovals = 4096;
+  /// Guards mDeferredHandleRemovals. A leaf: held only to add a handle or
+  /// to copy them all out, never while waiting for another lock.
   std::mutex remove_handle_mutex;
+  /// Handles of voices reported ended while another thread held
+  /// sounds_mutex, still in their sounds' handle lists.
+  std::vector<unsigned int> mDeferredHandleRemovals;
+  /// Whether mDeferredHandleRemovals may be non-empty, so taking
+  /// sounds_mutex skips remove_handle_mutex when it is not.
+  std::atomic<bool> mHasDeferredHandleRemovals{false};
+  /// The removals being applied, copied out of mDeferredHandleRemovals.
+  /// Used under sounds_mutex only; reserved like it.
+  std::vector<unsigned int> mHandleRemovalsToApply;
   // Protects the sounds vector (recursive to avoid deadlock in destructors).
   //
   // findByHash()/findByHandle() return a raw ActiveSound* and take this only
@@ -1136,7 +1205,11 @@ private:
   // defers those requests to its release. An automatic (buffering)
   // setPause() does not take it at all, so a stream's decode thread can pause
   // a voice while a play() of that stream holds it.
-  mutable std::recursive_mutex sounds_mutex;
+  //
+  // SoLoud reports a voice ended on the thread that ended it, the mixer's
+  // included, and removeHandle() only tries this mutex: a removal it cannot
+  // make is applied by the next thread to take it (see SoundsMutex).
+  mutable SoundsMutex sounds_mutex{*this};
   unsigned int mBufferSize;
 
   std::map<unsigned int, BusData> busMap;
