@@ -122,6 +122,10 @@ namespace soloud_test
     /// buffer and dropped from the queue. The decoding thread holds the decode
     /// mutex here: a delivery, or the mixer (tryDecodePendingData()).
     pullDecoding,
+    /// In Player::handleAudioInterruption(), right after mInterruptionMutex
+    /// has been taken. An OS interruption's notification, or
+    /// debugTriggerAudioInterruption(), parked here holds that lock.
+    audioInterruptionLocked,
     barrierCount
   };
 

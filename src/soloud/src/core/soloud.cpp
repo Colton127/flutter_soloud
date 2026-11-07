@@ -2489,10 +2489,17 @@ namespace SoLoud
 		mVoiceInactiveCallbackPending = false;
 		unlockAudioMutex_internal();
 
+		// ###### flutter_soloud local patch (non-blocking idle request) ######
+		// A notification the callback could not act on after an earlier block
+		// is made again now (see _voiceInactiveCallback).
+		const bool retryVoiceInactive =
+			mVoiceInactiveCallbackRetry.load(std::memory_order_relaxed) &&
+			mVoiceInactiveCallbackRetry.exchange(false, std::memory_order_acq_rel);
 		auto voiceInactiveCallback =
 			_voiceInactiveCallback.load(std::memory_order_acquire);
-		if (notifyVoiceInactive && voiceInactiveCallback != nullptr)
-			voiceInactiveCallback();
+		if ((notifyVoiceInactive || retryVoiceInactive) &&
+			voiceInactiveCallback != nullptr && !voiceInactiveCallback())
+			mVoiceInactiveCallbackRetry.store(true, std::memory_order_release);
 		
 		// Note: clipping channels*aStride, not channels*aSamples, so we're possibly clipping some unused data.
 		// The buffers should be large enough for it, we just may do a few bytes of unneccessary work.

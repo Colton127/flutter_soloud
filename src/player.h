@@ -80,8 +80,10 @@ public:
   void setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int *));
 
   /// @brief Set a function callback triggered after a voice stops or becomes
-  /// paused and the SoLoud audio mutex has been released.
-  void setVoiceInactiveCallback(void (*voiceInactiveCallback)());
+  /// paused and the SoLoud audio mutex has been released. It runs on the
+  /// mixer's thread and returns false when it could not act without waiting;
+  /// the mixer then calls it again after its next block.
+  void setVoiceInactiveCallback(bool (*voiceInactiveCallback)());
 
   /// @brief Set a function callback triggered when the state of the player
   /// changes.
@@ -355,6 +357,13 @@ public:
   /// inactive. The lifecycle scheduler performs the authoritative active voice
   /// count check before stopping the device.
   void evaluateAudioDeviceIdle();
+
+  /// @brief evaluateAudioDeviceIdle() for the mixer, after a block in which
+  /// a voice stopped or paused, without waiting for mInterruptionMutex.
+  /// Returns false, having done nothing, when another thread holds it: an OS
+  /// interruption's handler, or another lifecycle request. The mixer then
+  /// asks again after its next block.
+  bool requestAudioDeviceIdleFromMixer();
 
   /// @brief Ensure the audio device is started, off the UI thread. Posts an
   /// immediate resume request to the background scheduler so the blocking
@@ -1295,6 +1304,9 @@ private:
   /// filters, all in one sounds_mutex critical section, then destroy the
   /// sounds after releasing it. The device is not touched.
   void destroyAllSounds();
+  /// The body of evaluateAudioDeviceIdle(), for a caller that holds
+  /// mInterruptionMutex.
+  void evaluateAudioDeviceIdleLocked();
   void handleAudioInterruption(bool began);
   static void audioInterruptionCallback(void *context, bool began);
 };
