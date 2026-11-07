@@ -90,6 +90,10 @@ namespace soloud_test
     /// tObserveLifecyclePosts reach it, so a test can tell its own thread's
     /// posts from the mixer's and the scheduler's.
     lifecyclePostEntered,
+    /// In Player::addPullBufferDataStream(), right after the stream has been
+    /// looked up by hash and before data is added to it. A disposal started
+    /// while a feeder is parked here must not destroy the stream under it.
+    pullDataSoundLookedUp,
     barrierCount
   };
 

@@ -25,7 +25,14 @@
 //   * afterwards no voice is alive, no handle is registered and no sound is
 //     loaded;
 //   * disposeSound() stops every voice of the sound before destroying it, not
-//     only some of them, however many there are.
+//     only some of them, however many there are;
+//   * a feeder thread parked inside addPullBufferDataStream() after looking
+//     its playing PullBufferStream up (the pullDataSoundLookedUp barrier)
+//     keeps either disposal from finishing in the same way, its data is added
+//     before the stream is destroyed, and a delivery after the disposal finds
+//     no stream. Without the mutex held across the delivery this is a
+//     heap-use-after-free in PullBufferStream::addAudioData() under
+//     AddressSanitizer.
 //
 // Under AddressSanitizer the first scenario reports a heap-use-after-free in
 // Player::play() when the play does not hold sounds_mutex across its use of
@@ -614,6 +621,121 @@ void disposalStopsEveryVoiceFirst(Disposal disposal)
     watchSound(0);
 }
 
+/// A feeder thread parks inside addPullBufferDataStream() right after it has
+/// looked the stream up, and [disposal] runs meanwhile. The stream is playing,
+/// so the delivery also runs the stream's checkBuffering() against its voice.
+///
+/// Without the fix the disposal destroys the PullBufferStream at once and the
+/// feeder, released, decodes into it: a heap-use-after-free under
+/// AddressSanitizer. With the fix the feeder holds sounds_mutex while parked,
+/// so the disposal cannot finish until the data has been added.
+void pullDataDeliveryAgainstDisposal(Disposal disposal)
+{
+    char what[96];
+    std::snprintf(what, sizeof(what), "addPullBufferDataStream() vs %s",
+                  disposalName(disposal));
+    std::printf("%s, with the feeder parked after its lookup\n", what);
+
+    // 32-bit float stereo PCM at 44.1 kHz: no decoder involved, so the
+    // delivery is a copy into the stream's buffer plus its buffering check.
+    constexpr unsigned int kSampleRate = 44100;
+    constexpr unsigned int kChannels = 2;
+    constexpr unsigned int kBufferBytes = 1u << 20;
+    unsigned int hash = 0;
+    PlayerErrors err = setPullBufferStream(
+        &hash, kBufferBytes, 0.5, kSampleRate, kChannels,
+        static_cast<int>(PCM_F32LE), /*audioSizeBytes*/ 64u << 20, nullptr,
+        nullptr, nullptr, nullptr);
+    EXPECT(err == PlayerErrors::noError && hash != 0,
+           "%s: the pull stream should be created (error %d)", what,
+           static_cast<int>(err));
+    if (err != PlayerErrors::noError || hash == 0)
+        return;
+
+    unsigned int voice = 0;
+    err = playVariant(PlayVariant::play, hash, &voice);
+    EXPECT(err == PlayerErrors::noError && voice != 0,
+           "%s: the pull stream should play (error %d)", what,
+           static_cast<int>(err));
+    watchSound(hash);
+
+    // A quarter of a second of silence.
+    const std::vector<float> pcm(kSampleRate / 4 * kChannels, 0.0f);
+
+    soloud_test::armBarrier(DeviceBarrier::pullDataSoundLookedUp);
+
+    PlayerErrors feedResult = PlayerErrors::noError;
+    std::thread feeder(
+        [&]
+        {
+            feedResult = addPullBufferDataStream(
+                hash, reinterpret_cast<const unsigned char *>(pcm.data()),
+                static_cast<unsigned int>(pcm.size() * sizeof(float)), 0);
+        });
+
+    soloud_test::waitBarrierReached(DeviceBarrier::pullDataSoundLookedUp);
+
+    std::mutex doneMutex;
+    std::condition_variable doneCv;
+    bool disposalDone = false;
+    std::thread disposeThread(
+        [&]
+        {
+            runDisposal(disposal, hash);
+            {
+                std::lock_guard<std::mutex> lock(doneMutex);
+                disposalDone = true;
+            }
+            doneCv.notify_all();
+        });
+
+    // Bounded on purpose: with the fix the disposal waits for the parked
+    // feeder, so waiting for it without a bound would never return.
+    bool finishedWhileParked;
+    {
+        std::unique_lock<std::mutex> lock(doneMutex);
+        finishedWhileParked =
+            doneCv.wait_for(lock, std::chrono::milliseconds(kParkMs),
+                            [&] { return disposalDone; });
+    }
+
+    soloud_test::releaseBarrier(DeviceBarrier::pullDataSoundLookedUp);
+    feeder.join();
+    disposeThread.join();
+
+    EXPECT(!finishedWhileParked,
+           "%s: the disposal finished while the feeder was parked between "
+           "its lookup and its use of the stream",
+           what);
+    EXPECT(feedResult == PlayerErrors::noError,
+           "%s: the parked delivery should complete before the disposal, got "
+           "error %d",
+           what, static_cast<int>(feedResult));
+    if (voice != 0)
+    {
+        EXPECT(soloudTestVoiceIsValid(voice) == 0,
+               "%s: the stream's voice should have been stopped", what);
+        const int loaded = loadedWhenEnded(voice);
+        EXPECT(loaded == 1,
+               "%s: the disposal should stop the stream's voice before the "
+               "stream is destroyed (sound loaded when it ended: %d, -1 = "
+               "never ended)",
+               what, loaded);
+    }
+
+    // A delivery after the disposal finds no stream.
+    err = addPullBufferDataStream(
+        hash, reinterpret_cast<const unsigned char *>(pcm.data()),
+        static_cast<unsigned int>(pcm.size() * sizeof(float)), 0);
+    EXPECT(err == PlayerErrors::soundHashNotFound,
+           "%s: a delivery after the disposal should find no stream, got "
+           "error %d",
+           what, static_cast<int>(err));
+
+    expectNothingLeft(what);
+    watchSound(0);
+}
+
 /// A play() of a BufferStream parks holding sounds_mutex while the stream's
 /// background decode thread unpauses a voice automatically.
 ///
@@ -884,6 +1006,9 @@ int main()
 
     disposalStopsEveryVoiceFirst(Disposal::oneSound);
     disposalStopsEveryVoiceFirst(Disposal::allSounds);
+
+    pullDataDeliveryAgainstDisposal(Disposal::oneSound);
+    pullDataDeliveryAgainstDisposal(Disposal::allSounds);
 
     lifecycleRequestsWaitForTheSoundsLock();
 #if defined(__has_feature)
