@@ -3710,10 +3710,14 @@ extern "C"
     {
       if (soundHash != 0)
       {
-        auto const s = player.get()->findByHash(soundHash);
-        if (s == nullptr)
-          return soundHashNotFound;
-        *index = s->filters->isFilterActive(filterType);
+        // The sound is used under sounds_mutex: a disposal on another thread
+        // must not destroy it in between.
+        return player.get()->useSoundByHash(
+            soundHash, [&](ActiveSound &s)
+            {
+              *index = s.filters->isFilterActive(filterType);
+              return noError;
+            });
       }
       else
       {
@@ -3770,10 +3774,9 @@ extern "C"
 
     if (soundHash != 0)
     {
-      auto const s = player.get()->findByHash(soundHash);
-      if (s == nullptr)
-        return soundHashNotFound;
-      return s->filters->addFilter(filterType);
+      return player.get()->useSoundByHash(
+          soundHash,
+          [&](ActiveSound &s) { return s.filters->addFilter(filterType); });
     }
     else
     {
@@ -3808,11 +3811,12 @@ extern "C"
     {
       if (soundHash != 0)
       {
-        auto const s = player.get()->findByHash(soundHash);
-        if (s == nullptr)
-          return soundHashNotFound;
-        if (!s->filters->removeFilter(filterType))
-          return filterNotFound;
+        return player.get()->useSoundByHash(
+            soundHash, [&](ActiveSound &s)
+            {
+              return s.filters->removeFilter(filterType) ? noError
+                                                         : filterNotFound;
+            });
       }
       else
       {
@@ -3868,15 +3872,13 @@ extern "C"
       }
       else if (handle > 0)
       {
-        auto const &s = player.get()->findByHandle(handle);
-        if (s == nullptr)
-        {
-          return soundHandleNotFound;
-        }
-        else
-        {
-          s->filters.get()->setFilterParams(handle, filterType, attributeId, value);
-        }
+        return player.get()->useSoundByHandle(
+            handle, [&](ActiveSound &s)
+            {
+              s.filters->setFilterParams(handle, filterType, attributeId,
+                                         value);
+              return noError;
+            });
       }
     }
     return PlayerErrors::noError;
@@ -3929,19 +3931,17 @@ extern "C"
       }
       else
       {
-        auto const &s = player.get()->findByHandle(handle);
-        if (s == nullptr)
-          return soundHandleNotFound;
-        else
-        {
-          *filterValue =
-              s->filters.get()->getFilterParams(handle, filterType, attributeId);
-          if (!(isnormal(*filterValue) || isnan(*filterValue)))
-            return filterParameterGetError;
-          if (*filterValue == 9999.0f)
-            return filterNotFound;
-          return noError;
-        }
+        return player.get()->useSoundByHandle(
+            handle, [&](ActiveSound &s)
+            {
+              *filterValue =
+                  s.filters->getFilterParams(handle, filterType, attributeId);
+              if (!(isnormal(*filterValue) || isnan(*filterValue)))
+                return filterParameterGetError;
+              if (*filterValue == 9999.0f)
+                return filterNotFound;
+              return noError;
+            });
       }
     }
     return PlayerErrors::noError;
@@ -3987,16 +3987,13 @@ extern "C"
       }
       else
       {
-        auto const &s = player.get()->findByHandle(handle);
-        if (s == nullptr)
-        {
-          return soundHandleNotFound;
-        }
-        else
-        {
-          s->filters.get()->fadeFilterParameter(handle, filterType, attributeId, to,
-                                                time);
-        }
+        return player.get()->useSoundByHandle(
+            handle, [&](ActiveSound &s)
+            {
+              s.filters->fadeFilterParameter(handle, filterType, attributeId,
+                                             to, time);
+              return noError;
+            });
       }
     }
     return noError;
@@ -4043,16 +4040,13 @@ extern "C"
       }
       else
       {
-        auto const &s = player.get()->findByHandle(handle);
-        if (s == nullptr)
-        {
-          return soundHandleNotFound;
-        }
-        else
-        {
-          s->filters.get()->oscillateFilterParameter(handle, filterType,
-                                                     attributeId, from, to, time);
-        }
+        return player.get()->useSoundByHandle(
+            handle, [&](ActiveSound &s)
+            {
+              s.filters->oscillateFilterParameter(handle, filterType,
+                                                  attributeId, from, to, time);
+              return noError;
+            });
       }
     }
     return noError;

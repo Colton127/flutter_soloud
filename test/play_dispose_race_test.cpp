@@ -26,6 +26,12 @@
 //     loaded;
 //   * disposeSound() stops every voice of the sound before destroying it, not
 //     only some of them, however many there are;
+//   * the same for each of the seven filter calls that reach a sound's
+//     filters by its hash or by the handle of a voice it plays
+//     (isFilterActive(), addFilter(), removeFilter(), setFilterParams(),
+//     getFilterParams(), fadeFilterParameter() and
+//     oscillateFilterParameter()), parked after their lookup
+//     (soundUseLookedUp): the disposal waits for them, and they succeed;
 //   * a feeder thread parked inside addPullBufferDataStream() after looking
 //     its playing PullBufferStream up (the pullDataSoundLookedUp barrier)
 //     keeps either disposal from finishing in the same way, its data is added
@@ -1134,6 +1140,158 @@ void bufferStreamUnderConcurrentUse()
     expectNothingLeft(what);
 }
 
+/// The filter calls that reach a sound's filters through the sound: by its
+/// hash, or by the handle of a voice it plays.
+enum class FilterCall
+{
+    isActive,
+    add,
+    remove,
+    setParams,
+    getParams,
+    fade,
+    oscillate,
+};
+
+constexpr FilterCall kFilterCalls[] = {
+    FilterCall::isActive,  FilterCall::add,       FilterCall::remove,
+    FilterCall::setParams, FilterCall::getParams, FilterCall::fade,
+    FilterCall::oscillate,
+};
+
+const char *filterCallName(FilterCall call)
+{
+    switch (call)
+    {
+    case FilterCall::isActive:
+        return "isFilterActive()";
+    case FilterCall::add:
+        return "addFilter()";
+    case FilterCall::remove:
+        return "removeFilter()";
+    case FilterCall::setParams:
+        return "setFilterParams()";
+    case FilterCall::getParams:
+        return "getFilterParams()";
+    case FilterCall::fade:
+        return "fadeFilterParameter()";
+    case FilterCall::oscillate:
+        return "oscillateFilterParameter()";
+    }
+    return "?";
+}
+
+/// [call] on the echo filter of the sound [hash], which plays [voice]. Its
+/// parameter 0 is the wet level, 1 by default.
+PlayerErrors callFilter(FilterCall call, unsigned int hash, unsigned int voice)
+{
+    switch (call)
+    {
+    case FilterCall::isActive:
+    {
+        int index = -1;
+        return isFilterActive(hash, 0, EchoFilter, &index);
+    }
+    case FilterCall::add:
+        return addFilter(hash, 0, EchoFilter);
+    case FilterCall::remove:
+        return removeFilter(hash, 0, EchoFilter);
+    case FilterCall::setParams:
+        return setFilterParams(voice, 0, EchoFilter, 0, 0.5f);
+    case FilterCall::getParams:
+    {
+        float value = 0.0f;
+        return getFilterParams(voice, 0, EchoFilter, 0, &value);
+    }
+    case FilterCall::fade:
+        return fadeFilterParameter(voice, 0, EchoFilter, 0, 0.5f, 1.0f);
+    case FilterCall::oscillate:
+        return oscillateFilterParameter(voice, 0, EchoFilter, 0, 0.2f, 0.8f,
+                                        1.0f);
+    }
+    return PlayerErrors::unknownError;
+}
+
+/// A filter call parks right after it has looked up the sound whose filters
+/// it uses (soundUseLookedUp), and [disposal] then starts on another thread.
+///
+/// The call reaches the sound's filters through the sound, so it must hold
+/// sounds_mutex from its lookup to its last use of the sound, as a play
+/// does: the disposal must not finish while the call is parked, and the call
+/// then succeeds on the sound before the disposal destroys it. Without the
+/// mutex held, the disposal destroys the sound under the parked call: a
+/// heap-use-after-free under AddressSanitizer once it is released.
+void raceDisposalAgainstParkedFilterCall(FilterCall call, Disposal disposal)
+{
+    char what[96];
+    std::snprintf(what, sizeof(what), "%s vs %s", filterCallName(call),
+                  disposalName(disposal));
+    std::printf("%s, with the call parked after its lookup\n", what);
+
+    const unsigned int hash = loadTestWaveform();
+    EXPECT(hash != 0, "%s: the test waveform should load", what);
+    if (hash == 0)
+        return;
+    if (call != FilterCall::add)
+    {
+        const PlayerErrors added = addFilter(hash, 0, EchoFilter);
+        EXPECT(added == PlayerErrors::noError,
+               "%s: the echo filter should be added (error %d)", what,
+               static_cast<int>(added));
+    }
+    unsigned int voice = 0;
+    const PlayerErrors played = play(hash, 0, 0.05f, 0.0f, false, false, 0.0,
+                                     0.0, -1, -1, 1.0f, &voice);
+    EXPECT(played == PlayerErrors::noError && voice != 0,
+           "%s: the sound should play (error %d)", what,
+           static_cast<int>(played));
+
+    soloud_test::armBarrier(DeviceBarrier::soundUseLookedUp);
+    PlayerErrors result = PlayerErrors::unknownError;
+    std::thread caller([&] { result = callFilter(call, hash, voice); });
+    if (!waitBarrierReachedFor(DeviceBarrier::soundUseLookedUp, kProgressMs))
+        abortWedgedRun("the filter call never looked its sound up");
+
+    std::mutex doneMutex;
+    std::condition_variable doneCv;
+    bool disposalDone = false;
+    std::thread disposer(
+        [&]
+        {
+            runDisposal(disposal, hash);
+            {
+                std::lock_guard<std::mutex> lock(doneMutex);
+                disposalDone = true;
+            }
+            doneCv.notify_all();
+        });
+
+    // Bounded on purpose: with the fix the disposal waits for the parked
+    // call, so waiting for it without a bound would never return.
+    bool finishedWhileParked;
+    {
+        std::unique_lock<std::mutex> lock(doneMutex);
+        finishedWhileParked =
+            doneCv.wait_for(lock, std::chrono::milliseconds(kParkMs),
+                            [&] { return disposalDone; });
+    }
+
+    soloud_test::releaseBarrier(DeviceBarrier::soundUseLookedUp);
+    caller.join();
+    disposer.join();
+
+    EXPECT(!finishedWhileParked,
+           "%s: the disposal finished while the call was parked between its "
+           "lookup and its use of the sound",
+           what);
+    EXPECT(result == PlayerErrors::noError,
+           "%s: the call, which looked the sound up before the disposal, "
+           "should succeed (error %d)",
+           what, static_cast<int>(result));
+
+    expectNothingLeft(what);
+}
+
 /// One step of lifecycleRequestsWaitForTheSoundsLock(): run [call] on a thread
 /// that observes its own lifecycle posts, park it at its first one, and check
 /// that sounds_mutex is free at that point.
@@ -1283,6 +1441,12 @@ int main()
 
     disposalStopsEveryVoiceFirst(Disposal::oneSound);
     disposalStopsEveryVoiceFirst(Disposal::allSounds);
+
+    for (Disposal disposal : {Disposal::allSounds, Disposal::oneSound})
+    {
+        for (FilterCall call : kFilterCalls)
+            raceDisposalAgainstParkedFilterCall(call, disposal);
+    }
 
     pullDataDeliveryAgainstDisposal(Disposal::oneSound);
     pullDataDeliveryAgainstDisposal(Disposal::allSounds);

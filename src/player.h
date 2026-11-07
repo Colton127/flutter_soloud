@@ -848,6 +848,24 @@ public:
   /// @return If not found, return nullptr.
   ActiveSound *findByHash(unsigned int hash);
 
+  /// @brief Run [use] on the sound [soundHash], holding sounds_mutex from the
+  /// lookup to the end of [use], so a disposal on another thread cannot
+  /// destroy the sound in between (findByHash() alone takes the mutex only
+  /// for the lookup). Lifecycle requests [use] makes are posted once the
+  /// mutex is released, as under a SoundsLock.
+  /// @return [soundHashNotFound] if there is no such sound, else what [use]
+  /// returns.
+  PlayerErrors useSoundByHash(
+      unsigned int soundHash,
+      const std::function<PlayerErrors(ActiveSound &)> &use);
+
+  /// @brief useSoundByHash() for the sound that plays [handle].
+  /// @return [soundHandleNotFound] if no sound plays it, else what [use]
+  /// returns.
+  PlayerErrors useSoundByHandle(
+      SoLoud::handle handle,
+      const std::function<PlayerErrors(ActiveSound &)> &use);
+
   /////////////////////////////////////////
   /// voice groups
   /////////////////////////////////////////

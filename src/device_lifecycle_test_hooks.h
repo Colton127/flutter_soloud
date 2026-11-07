@@ -133,6 +133,11 @@ namespace soloud_test
     /// Right after that count found active voices, before the handler takes
     /// mInterruptionMutex again to ask for the device to start.
     audioInterruptionCounted,
+    /// In Player::useSoundByHash() and useSoundByHandle(), right after the
+    /// sound has been looked up and before it is used (by the filter calls,
+    /// for one). A disposal started while a caller is parked here must not
+    /// destroy the sound under it.
+    soundUseLookedUp,
     barrierCount
   };
 
