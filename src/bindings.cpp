@@ -2149,6 +2149,17 @@ extern "C"
       return -1;
     return (pin.get()->isInited() && pin.get()->isValidHandle(handle)) ? 1 : 0;
   }
+
+  /// How many voice handles the sound [hash] has registered in the current
+  /// Player, reached like soloudTestSoundIsLoaded(). -1 when teardown refused
+  /// the pin.
+  FFI_PLUGIN_EXPORT int soloudTestSoundHandleCount(unsigned int hash)
+  {
+    const PlayerPin pin(PlayerPinKind::sound);
+    if (pin.get() == nullptr)
+      return -1;
+    return pin.get()->getSoundHandleCount(hash);
+  }
 #endif
 
 #if defined(__ANDROID__)
