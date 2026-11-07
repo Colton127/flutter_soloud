@@ -3821,6 +3821,30 @@ ActiveSound *Player::findByHash(unsigned int soundHash)
     return s->get();
 }
 
+PlayerErrors Player::useSoundByHash(
+    unsigned int soundHash,
+    const std::function<PlayerErrors(ActiveSound &)> &use)
+{
+    SoundsLock lock(sounds_mutex, *this);
+    ActiveSound *const s = findByHash(soundHash);
+    if (s == nullptr)
+        return PlayerErrors::soundHashNotFound;
+    SOLOUD_TEST_BARRIER(soundUseLookedUp);
+    return use(*s);
+}
+
+PlayerErrors Player::useSoundByHandle(
+    SoLoud::handle handle,
+    const std::function<PlayerErrors(ActiveSound &)> &use)
+{
+    SoundsLock lock(sounds_mutex, *this);
+    ActiveSound *const s = findByHandle(handle);
+    if (s == nullptr)
+        return PlayerErrors::soundHandleNotFound;
+    SOLOUD_TEST_BARRIER(soundUseLookedUp);
+    return use(*s);
+}
+
 /////////////////////////////////////////
 /// voice groups
 /////////////////////////////////////////
