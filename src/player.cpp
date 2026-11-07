@@ -1245,18 +1245,25 @@ namespace
     /// SoLoud nor can pause, unpause or stop a voice.
     ///
     /// An automatic (buffering) pause or unpause does not take sounds_mutex
-    /// at all (see applyPauseState()), so a stream's decode thread can change
-    /// a voice's pause state while another thread holds it.
+    /// itself (see applyPauseState()): the buffering checks that make one
+    /// already hold it.
     class SoundsLock
     {
     public:
         SoundsLock(Player::SoundsMutex &mutex, Player &player)
             : mLock(mutex), mPlayer(player)
         {
-            DeferredLifecycleRequests &d = tDeferredLifecycle;
-            if (d.depth++ == 0)
-                d.player = &player;
+            enter();
         }
+        /// Only tries the mutex: see ownsLock().
+        SoundsLock(Player::SoundsMutex &mutex, Player &player,
+                   std::try_to_lock_t)
+            : mLock(mutex, std::try_to_lock), mPlayer(player)
+        {
+            if (mLock.owns_lock())
+                enter();
+        }
+        bool ownsLock() const { return mLock.owns_lock(); }
         ~SoundsLock() { release(); }
         SoundsLock(const SoundsLock &) = delete;
         SoundsLock &operator=(const SoundsLock &) = delete;
@@ -1282,10 +1289,40 @@ namespace
         }
 
     private:
+        void enter()
+        {
+            DeferredLifecycleRequests &d = tDeferredLifecycle;
+            if (d.depth++ == 0)
+                d.player = &mPlayer;
+        }
+
         std::unique_lock<Player::SoundsMutex> mLock;
         Player &mPlayer;
     };
 } // namespace
+
+bool Player::runWithSoundsLockUnlessCancelled(
+    const std::function<bool()> &cancelled, const std::function<void()> &work)
+{
+    for (;;)
+    {
+        {
+            SoundsLock lock(sounds_mutex, *this, std::try_to_lock);
+            if (lock.ownsLock())
+            {
+                if (cancelled())
+                    return false;
+                work();
+                return true;
+            }
+        }
+        if (cancelled())
+            return false;
+        // Held for as long as a play, a delivery or a disposal takes: rarely
+        // long, and this thread has nothing else to do meanwhile.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 
 PlayerErrors Player::setBufferStream(
     unsigned int &hash,
@@ -1643,11 +1680,10 @@ void Player::applyPauseState(unsigned int handle, bool pause, bool isUserAction)
     // themselves: BufferStream and PullBufferStream checkBuffering() clear it
     // before an automatic pause and only unpause automatically a voice whose
     // flag is already clear, so writing it here would change nothing for
-    // them. They must not take sounds_mutex: they run with
-    // check_buffer_mutex held on a BufferStream's background decode thread,
-    // which a play() of that stream takes in the opposite order. (A
-    // PullBufferStream's run only under sounds_mutex, while data is delivered;
-    // never on the audio thread.)
+    // them. They already hold sounds_mutex, taken before check_buffer_mutex
+    // as a play() of the stream takes them, and run on a thread adding data
+    // or on a BufferStream's background decode thread, never on the audio
+    // thread.
     if (isUserAction)
     {
         std::lock_guard<SoundsMutex> lock(sounds_mutex);
