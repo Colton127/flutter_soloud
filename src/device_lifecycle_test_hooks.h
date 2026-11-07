@@ -126,6 +126,13 @@ namespace soloud_test
     /// has been taken. An OS interruption's notification, or
     /// debugTriggerAudioInterruption(), parked here holds that lock.
     audioInterruptionLocked,
+    /// In Player::handleAudioInterruption(), for an interruption that ended
+    /// with a finite idle timeout, right before it counts the active voices,
+    /// which waits for SoLoud's audio mutex.
+    audioInterruptionCounting,
+    /// Right after that count found active voices, before the handler takes
+    /// mInterruptionMutex again to ask for the device to start.
+    audioInterruptionCounted,
     barrierCount
   };
 

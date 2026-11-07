@@ -18,6 +18,15 @@
 //     Player::sounds_mutex guards. While a play is parked holding that
 //     (playSoundLookedUp), the mixer's clock keeps advancing and the end is
 //     reported; the handle is gone from the list once the play is released.
+//   * an interruption's end is handled by counting the active voices, which
+//     waits for SoLoud's audio mutex. The handler must not hold
+//     Player::mInterruptionMutex meanwhile, since every lifecycle request
+//     takes it: while the mixer is parked holding the audio mutex inside a
+//     stream's seek (pullSeekDiscarding) and the handler waits to count, an
+//     unpause, which asks for the device to start, still returns. And since
+//     the count is made without the lock, a voice that stops after it and
+//     asks for an idle stop before the handler's start (which supersedes
+//     it) must not leave the device running with nothing to play.
 //
 // Build and run from the flutter_soloud repository root with:
 //
@@ -25,7 +34,8 @@
 //   ./test/run_lock_wait_test.sh --asan     (AddressSanitizer)
 //   ./test/run_lock_wait_test.sh --tsan     (ThreadSanitizer)
 //
-// A scenario name after the flag (idle or ended) runs only that scenario.
+// A scenario name after the flag (idle, ended, interruption or recount) runs
+// only that scenario.
 
 #include "bindings.h"
 #include "device_lifecycle_test_hooks.h"
@@ -444,6 +454,152 @@ void mixerDoesNotWaitForTheSoundsLock()
     expectNothingLeft(what);
 }
 
+/// When an OS interruption ends and the idle timeout is finite, the handler
+/// restarts the device only if voices are active. Counting them waits for
+/// SoLoud's audio mutex: for the mixer's block, for a stream's seek inside
+/// it, or with render-ahead for a re-mix. The handler must not hold
+/// mInterruptionMutex while it waits, since every lifecycle request takes it:
+/// an unpause or a play on the UI thread asks for the device to start.
+///
+/// The mixer parks holding the audio mutex, inside a pull stream's seek out
+/// of its buffer (pullSeekDiscarding). The interruption's end is then
+/// handled up to its count (audioInterruptionCounting), and released into
+/// it: it now waits for the parked mixer. An unpause of another voice must
+/// still return.
+void unpauseDoesNotWaitForAnInterruptionsCount()
+{
+    const char *what = "an unpause vs an interruption's voice count";
+    std::printf("%s\n", what);
+
+    unsigned int stream = 0;
+    const PlayerErrors created =
+        setPullBufferStream(&stream, /*maxBufferSize*/ 1u << 20,
+                            /*bufferTriggerPosition*/ 0.5, 44100, 2,
+                            static_cast<int>(PCM_F32LE),
+                            /*audioSizeBytes*/ 64u << 20, nullptr, nullptr,
+                            nullptr, nullptr);
+    const unsigned int hash = loadTestWaveform();
+    const unsigned int streamVoice =
+        created == PlayerErrors::noError && stream != 0 ? playQuietly(stream)
+                                                        : 0;
+    unsigned int paused = 0;
+    const PlayerErrors playedPaused =
+        hash != 0 ? play(hash, 0, 0.05f, 0.0f, /*paused*/ true,
+                         /*looping*/ false, 0.0, 0.0, -1, -1, 1.0f, &paused)
+                  : PlayerErrors::unknownError;
+    EXPECT(streamVoice != 0 && playedPaused == PlayerErrors::noError &&
+               paused != 0,
+           "%s: a pull stream and a paused waveform should play", what);
+    if (streamVoice == 0 || paused == 0)
+    {
+        if (stream != 0)
+            disposeSound(stream);
+        if (hash != 0)
+            disposeSound(hash);
+        return;
+    }
+
+    // The mixer parks inside the stream's seek, holding the audio mutex. The
+    // seek call gets its own thread: with no mixer running it would apply
+    // the seek itself, and park.
+    soloud_test::armBarrier(DeviceBarrier::pullSeekDiscarding);
+    BackgroundCall seeker([&] { seek(streamVoice, 10.0f); });
+    if (!waitBarrierReachedFor(DeviceBarrier::pullSeekDiscarding, kProgressMs))
+        endRun("the stream's seek never got to discarding its buffer");
+
+    soloud_test::armBarrier(DeviceBarrier::audioInterruptionCounting);
+    BackgroundCall interruption([] { debugTriggerAudioInterruption(0); });
+    if (!waitBarrierReachedFor(DeviceBarrier::audioInterruptionCounting,
+                               kProgressMs))
+        endRun("the interruption's end never got to counting the voices");
+    soloud_test::releaseBarrier(DeviceBarrier::audioInterruptionCounting);
+    EXPECT(!interruption.finishedWithin(kParkMs / 3),
+           "%s: the count should wait for the parked mixer", what);
+
+    BackgroundCall unpause([&] { setPause(paused, false); });
+    EXPECT(unpause.finishedWithin(kParkMs),
+           "%s: the unpause waited for the interruption's handler, which "
+           "held the lifecycle lock while it waited for the mixer",
+           what);
+
+    soloud_test::releaseBarrier(DeviceBarrier::pullSeekDiscarding);
+    EXPECT(interruption.finishedWithin(kProgressMs) &&
+               unpause.finishedWithin(kProgressMs) &&
+               seeker.finishedWithin(kProgressMs),
+           "%s: everything should finish once the mixer is released", what);
+    interruption.join();
+    unpause.join();
+    seeker.join();
+
+    EXPECT(waitForDeviceState(audioDeviceStarted, kProgressMs),
+           "%s: the device should be running (state %d)", what,
+           static_cast<int>(getAudioDeviceState()));
+
+    disposeSound(stream);
+    disposeSound(hash);
+    expectNothingLeft(what);
+}
+
+/// The handler counts the active voices without mInterruptionMutex, then
+/// takes it again to ask for the device to start. A voice may stop in
+/// between and ask for an idle stop, which that start then supersedes (a
+/// start supersedes all idle work). The handler must ask for an idle
+/// evaluation again after its start, or the device keeps running with
+/// nothing to play.
+///
+/// With a short idle timeout, the handler parks after counting the only
+/// voice (audioInterruptionCounted), and the mixer ends that voice and asks
+/// for an idle evaluation. Once the handler is released, the device must go
+/// idle.
+void deviceGoesIdleWhenAVoiceStopsAfterTheCount()
+{
+    const char *what = "a voice stopping after an interruption's count";
+    std::printf("%s\n", what);
+
+    setAudioDeviceIdleTimeout(kShortIdleTimeoutMs);
+    const unsigned int hash = loadTestWaveform();
+    const unsigned int voice = hash != 0 ? playQuietly(hash) : 0;
+    EXPECT(hash != 0 && voice != 0, "%s: a waveform should load and play",
+           what);
+    if (voice == 0)
+    {
+        setAudioDeviceIdleTimeout(kQuietIdleTimeoutMs);
+        if (hash != 0)
+            disposeSound(hash);
+        return;
+    }
+    if (!waitForDeviceState(audioDeviceStarted, kProgressMs))
+        endRun("the device never started for the voice");
+
+    soloud_test::armBarrier(DeviceBarrier::audioInterruptionCounted);
+    BackgroundCall interruption([] { debugTriggerAudioInterruption(0); });
+    if (!waitBarrierReachedFor(DeviceBarrier::audioInterruptionCounted,
+                               kProgressMs))
+        endRun("the interruption's end never counted the voice");
+
+    // Ended by the mixer, which then asks for an idle evaluation, right after
+    // it reports the end on the same thread.
+    scheduleStop(voice, 0.02f);
+    EXPECT(waitForVoiceEnded(voice, kProgressMs),
+           "%s: the voice's end should be reported", what);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    soloud_test::releaseBarrier(DeviceBarrier::audioInterruptionCounted);
+    interruption.join();
+
+    EXPECT(waitForDeviceState(audioDeviceStopped, kProgressMs),
+           "%s: the device should go idle (state %d): the handler's start "
+           "superseded the idle stop the ended voice asked for",
+           what, static_cast<int>(getAudioDeviceState()));
+
+    setAudioDeviceIdleTimeout(kQuietIdleTimeoutMs);
+    disposeSound(hash);
+    expectNothingLeft(what);
+    EXPECT(startAudioDevice() == PlayerErrors::noError &&
+               waitForDeviceState(audioDeviceStarted, kProgressMs),
+           "%s: the device should start again", what);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -451,7 +607,8 @@ int main(int argc, char **argv)
     startHangGuard(120);
 
     const char *only = argc > 1 ? argv[1] : nullptr;
-    const char *const kScenarios[] = {"idle", "ended"};
+    const char *const kScenarios[] = {"idle", "ended", "interruption",
+                                      "recount"};
     if (only != nullptr)
     {
         bool known = false;
@@ -459,7 +616,9 @@ int main(int argc, char **argv)
             known = known || std::strcmp(only, name) == 0;
         if (!known)
         {
-            std::fprintf(stderr, "Unknown scenario '%s': use idle or ended.\n",
+            std::fprintf(stderr,
+                         "Unknown scenario '%s': use idle, ended, "
+                         "interruption or recount.\n",
                          only);
             return 2;
         }
@@ -485,6 +644,10 @@ int main(int argc, char **argv)
         mixerDoesNotWaitForTheLifecycleLock();
     if (wanted("ended"))
         mixerDoesNotWaitForTheSoundsLock();
+    if (wanted("interruption"))
+        unpauseDoesNotWaitForAnInterruptionsCount();
+    if (wanted("recount"))
+        deviceGoesIdleWhenAVoiceStopsAfterTheCount();
 
     tearDownEngine();
 

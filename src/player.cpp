@@ -1233,10 +1233,11 @@ namespace
     /// scheduler's active-voice check is the authoritative one, and an idle
     /// request never displaces a pending start (see requestDeviceLifecycle()),
     /// so posting both is right when one voice paused and another unpaused.
-    /// Those posts take mInterruptionMutex, which an OS interruption holds
-    /// while it asks SoLoud for the active voice count; that call can end
-    /// voices and report them ended on its thread, which takes sounds_mutex.
-    /// Posting under sounds_mutex would close that cycle.
+    /// Those posts take mInterruptionMutex. Nothing that holds it waits for
+    /// sounds_mutex -- an OS interruption's handler counts the active voices
+    /// without it, and a voice's end never waits for sounds_mutex (see
+    /// removeHandle()) -- and posting only once sounds_mutex is released keeps
+    /// it so: neither lock is ever taken while the other is held.
     ///
     /// Nesting is allowed (the mutex is recursive): an inner SoundsLock only
     /// unlocks, and the outermost one posts. A plain lock_guard on
@@ -1774,41 +1775,71 @@ void Player::audioInterruptionCallback(void *context, bool began)
 
 void Player::handleAudioInterruption(bool began)
 {
-    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
-    SOLOUD_TEST_BARRIER(audioInterruptionLocked);
-    if (!mInited.load(std::memory_order_acquire) ||
-        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
-        return;
+    {
+        std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+        SOLOUD_TEST_BARRIER(audioInterruptionLocked);
+        if (!mInited.load(std::memory_order_acquire) ||
+            !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+            return;
 
-    mInterruptionActive.store(began, std::memory_order_release);
+        mInterruptionActive.store(began, std::memory_order_release);
+        if (began)
+        {
 #ifdef __EMSCRIPTEN__
-    if (began)
-    {
-        soloud.pause();
-    }
-    else if (soloud.getActiveVoiceCount() != 0 ||
-             mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
-    {
-        // Web has no lifecycle scheduler thread. Its AudioContext operations
-        // are nonblocking, so recover inline when policy requires it.
-        soloud.resume();
-    }
+            soloud.pause();
 #else
-    if (began)
-    {
-        // This immediate stop supersedes pending starts/idle deadlines. The
-        // callback only posts work; the backend call runs on the scheduler.
-        requestDeviceLifecycle(DeviceLifecycleRequest::interruptionStop);
-    }
-    else if (soloud.getActiveVoiceCount() != 0 ||
-             mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
-    {
-        // Resume only for active playback or indefinite keep-alive. A finite
-        // timeout with an idle engine leaves the interruption-stopped device
-        // stopped; later play/unpause starts it normally.
-        requestDeviceLifecycle(DeviceLifecycleRequest::start);
-    }
+            // This immediate stop supersedes pending starts/idle deadlines.
+            // The callback only posts work; the backend call runs on the
+            // scheduler.
+            requestDeviceLifecycle(DeviceLifecycleRequest::interruptionStop);
 #endif
+            return;
+        }
+
+        if (mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
+        {
+            // Indefinite keep-alive: recover whether or not anything plays.
+#ifdef __EMSCRIPTEN__
+            // Web has no lifecycle scheduler thread. Its AudioContext
+            // operations are nonblocking, so recover inline.
+            soloud.resume();
+#else
+            requestDeviceLifecycle(DeviceLifecycleRequest::start);
+#endif
+            return;
+        }
+    }
+
+    // Recover only for active playback. A finite timeout with an idle engine
+    // leaves the interruption-stopped device stopped; a later play or unpause
+    // starts it normally.
+    //
+    // Counting the active voices waits for SoLoud's audio mutex: for the
+    // mixer's block, a stream's seek inside it, or with render-ahead a
+    // re-mix of the ring. That wait is made without mInterruptionMutex,
+    // which every lifecycle request takes: a play's start request on the UI
+    // thread would otherwise wait for the mix along with this handler.
+    SOLOUD_TEST_BARRIER(audioInterruptionCounting);
+    if (soloud.getActiveVoiceCount() == 0)
+        return;
+    SOLOUD_TEST_BARRIER(audioInterruptionCounted);
+
+    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    // A teardown or a new interruption may have begun meanwhile.
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
+        mInterruptionActive.load(std::memory_order_acquire))
+        return;
+#ifdef __EMSCRIPTEN__
+    soloud.resume();
+#else
+    requestDeviceLifecycle(DeviceLifecycleRequest::start);
+#endif
+    // The voices counted may have stopped since, and asked for an idle stop
+    // that this start has just superseded. Evaluate again, after the start:
+    // the device stops once idle, as the timeout says, only if no voice is
+    // active by then.
+    evaluateAudioDeviceIdleLocked();
 }
 
 // On some platforms (notably iOS) the OS can take a short time to fully
