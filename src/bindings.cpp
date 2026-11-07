@@ -250,75 +250,95 @@ extern "C"
 #endif
   std::unique_ptr<Player> player = std::make_unique<Player>();
 
-  /// Pins the global `player` for exports that must not be serialized behind
-  /// init_deinit_mutex: the explicit device operations, whose backend call can
-  /// block for tens of seconds (a device rebuild has been seen to take 46 s),
-  /// and disposeSound()/disposeAllSound(), which Dart calls synchronously on
-  /// the UI thread -- on Android a wait there is an ANR.
+  /// Pins the global `player` for the length of an export that uses it, so a
+  /// teardown on another thread cannot dispose, destroy or replace that Player
+  /// while the export is still using it.
+  ///
+  /// Every export that reaches the Player holds either init_deinit_mutex,
+  /// which teardown holds throughout, or a pin. Only initialization, teardown,
+  /// loads and a few other lifecycle calls take the mutex; the rest must not
+  /// be serialized behind it. A device operation used to hold it for its whole
+  /// backend call, which can block for tens of seconds (a device rebuild has
+  /// been seen to take 46 s), and Dart makes the control calls (setVolume(),
+  /// getPosition(), seek(), disposeSound(), ...) synchronously on the UI
+  /// thread -- on Android a wait there is an ANR.
   ///
   /// A pin keeps the Player it captured alive and installed: disposeLocked()
   /// waits for every pin to be released before it disposes, destroys or
   /// replaces that Player (see PlayerPinExclusion). It excludes nothing else,
-  /// so a pinned device operation no longer makes a sound operation -- or any
-  /// other caller of init_deinit_mutex -- wait for the device.
+  /// so a pinned device operation does not make an ordinary operation -- or
+  /// any other caller of init_deinit_mutex -- wait for the device.
   ///
   /// There are two kinds because teardown drains them in two steps:
-  ///   * device pins last as long as a backend call. Teardown refuses new ones
-  ///     and waits for the ones in flight first. It is not touching the Player
-  ///     yet, so sound operations keep running normally meanwhile.
-  ///   * sound pins never wait on device work (see disposeSound()), so they
-  ///     are short. Teardown refuses new ones only once the device pins have
-  ///     drained and it is about to dispose the Player, then waits out the
-  ///     ones in flight.
+  ///   * device pins (startAudioDevice(), stopAudioDevice(), changeDevice())
+  ///     last as long as a backend call. Teardown refuses new ones and waits
+  ///     for the ones in flight first. It is not touching the Player yet, so
+  ///     other operations keep running normally meanwhile.
+  ///   * operation pins, taken by every other export that uses the Player,
+  ///     last as long as the export's own work. Teardown refuses new ones only
+  ///     once the device pins have drained and it is about to dispose the
+  ///     Player, then waits out the ones in flight.
   /// A refused pin means teardown already owns the Player: the caller returns
-  /// without touching it, which is the state it would find after the teardown.
+  /// without touching it, with the result it would get once the engine is
+  /// torn down (backendNotInited, or the export's not-initialized value).
   ///
   /// initEngine() needs no exclusion: it never destroys or replaces a Player
   /// (it installs one only where `player` is null, which no pin can hold), and
   /// every pinned operation re-checks Player::isInited() itself.
   ///
+  /// Code that already runs inside a pinned export (a callback SoLoud makes
+  /// while stopping a voice, for one) may read `player` directly. So may the
+  /// threads the Player owns, the audio thread among them: Player::dispose()
+  /// stops them all before `player` is reset.
+  ///
   /// Lock ordering: player_pin_mutex is a leaf, held only to read `player` and
   /// update the counters below. A pin holder must never take
   /// init_deinit_mutex or loadMutex -- teardown waits for pins while holding
-  /// both -- nor wait for a teardown to finish.
+  /// both -- nor wait for a teardown to finish. Taking a pin never waits, so a
+  /// pin may be taken with any other lock held.
   enum class PlayerPinKind
   {
     device,
-    sound,
+    operation,
   };
 
   static std::mutex player_pin_mutex;
   static std::condition_variable player_pin_released;
   // Guarded by player_pin_mutex.
   static int player_device_pins = 0;
-  static int player_sound_pins = 0;
+  static int player_operation_pins = 0;
   static bool player_device_pins_refused = false;
-  static bool player_sound_pins_refused = false;
+  static bool player_operation_pins_refused = false;
 
   class PlayerPin
   {
   public:
     explicit PlayerPin(PlayerPinKind kind) : mKind(kind)
     {
-      std::lock_guard<std::mutex> guard(player_pin_mutex);
-      const bool refused = kind == PlayerPinKind::device
-                               ? player_device_pins_refused
-                               : player_sound_pins_refused;
-      if (refused || player.get() == nullptr)
-        return;
-      mPlayer = player.get();
-      ++count(kind);
+      {
+        std::lock_guard<std::mutex> guard(player_pin_mutex);
+        if (refused(kind) || player.get() == nullptr)
+          return;
+        mPlayer = player.get();
+        ++count(kind);
+      }
+      if (kind == PlayerPinKind::operation)
+        SOLOUD_TEST_BARRIER(playerOperationPinned);
     }
 
     ~PlayerPin()
     {
       if (mPlayer == nullptr)
         return;
+      bool teardownWaiting;
       {
         std::lock_guard<std::mutex> guard(player_pin_mutex);
-        --count(mKind);
+        // Only a teardown waits for pins, and only for the kind it is
+        // refusing, so there is no one to wake on most releases.
+        teardownWaiting = --count(mKind) == 0 && refused(mKind);
       }
-      player_pin_released.notify_all();
+      if (teardownWaiting)
+        player_pin_released.notify_all();
     }
 
     PlayerPin(const PlayerPin &) = delete;
@@ -332,7 +352,13 @@ extern "C"
     static int &count(PlayerPinKind kind)
     {
       return kind == PlayerPinKind::device ? player_device_pins
-                                           : player_sound_pins;
+                                           : player_operation_pins;
+    }
+
+    static bool refused(PlayerPinKind kind)
+    {
+      return kind == PlayerPinKind::device ? player_device_pins_refused
+                                           : player_operation_pins_refused;
     }
 
     const PlayerPinKind mKind;
@@ -341,8 +367,8 @@ extern "C"
 
   /// Held by disposeLocked() for as long as it may dispose, destroy or replace
   /// the Player. Constructing it refuses new device pins and waits out the
-  /// in-flight ones, then does the same for sound pins; destroying it accepts
-  /// pins again, against whichever Player is installed by then.
+  /// in-flight ones, then does the same for operation pins; destroying it
+  /// accepts pins again, against whichever Player is installed by then.
   ///
   /// Only ever constructed with init_deinit_mutex held, so there is never more
   /// than one.
@@ -355,16 +381,16 @@ extern "C"
       player_device_pins_refused = true;
       player_pin_released.wait(lock, []
                                { return player_device_pins == 0; });
-      player_sound_pins_refused = true;
+      player_operation_pins_refused = true;
       player_pin_released.wait(lock, []
-                               { return player_sound_pins == 0; });
+                               { return player_operation_pins == 0; });
     }
 
     ~PlayerPinExclusion()
     {
       std::lock_guard<std::mutex> guard(player_pin_mutex);
       player_device_pins_refused = false;
-      player_sound_pins_refused = false;
+      player_operation_pins_refused = false;
     }
 
     PlayerPinExclusion(const PlayerPinExclusion &) = delete;
@@ -630,8 +656,9 @@ extern "C"
   /// SoLoud invokes this only after releasing its audio mutex.
   FFI_PLUGIN_EXPORT void voiceInactiveCallback()
   {
-    if (player != nullptr)
-      player->evaluateAudioDeviceIdle();
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() != nullptr)
+      pin.get()->evaluateAudioDeviceIdle();
   }
 
 #if defined(__EMSCRIPTEN__) && defined(MA_ENABLE_AUDIO_WORKLETS)
@@ -963,11 +990,16 @@ extern "C"
     // thread may block on the mutex (ALLOW_BLOCKING_ON_MAIN_THREAD); the
     // worklet side never blocks — it try-locks and emits silence on
     // contention (see soloud_miniaudio_audiomixer).
-    if (player.get() != nullptr && player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    // Refused: a teardown owns the Player and stops the capture itself, under
+    // the mutex held here, after the pins have drained.
+    if (pin.get() == nullptr)
+      return;
+    if (pin.get()->isInited())
     {
-      player.get()->soloud.lockAudioMutex_internal();
+      pin.get()->soloud.lockAudioMutex_internal();
       MixerOutput::instance().stop();
-      player.get()->soloud.unlockAudioMutex_internal();
+      pin.get()->soloud.unlockAudioMutex_internal();
       return;
     }
 #endif
@@ -1974,10 +2006,11 @@ extern "C"
   /// already in flight.
   FFI_PLUGIN_EXPORT void soloudTestSetEngineStateCallback(unsigned int enable)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return;
-    player.get()->setStateChangedCallback(enable != 0 ? stateChangedCallback
-                                                      : nullptr);
+    pin.get()->setStateChangedCallback(enable != 0 ? stateChangedCallback
+                                                   : nullptr);
   }
 
   /// How many FlutterEngine-owned teardown workers have run to completion.
@@ -2120,21 +2153,21 @@ extern "C"
   }
 
   /// Which pins teardown is refusing right now (see PlayerPin): bit 0 device
-  /// pins, bit 1 sound pins. Lets a test tell that a teardown has reached its
+  /// pins, bit 1 operation pins. Lets a test tell that a teardown has reached its
   /// drain without sleeping and hoping.
   FFI_PLUGIN_EXPORT int soloudTestRefusedPlayerPins()
   {
     std::lock_guard<std::mutex> guard(player_pin_mutex);
     return (player_device_pins_refused ? 1 : 0) |
-           (player_sound_pins_refused ? 2 : 0);
+           (player_operation_pins_refused ? 2 : 0);
   }
 
-  /// Whether [hash] is loaded in the current Player. Reached through a sound
-  /// pin, as disposeSound() reaches it, so it never waits for
+  /// Whether [hash] is loaded in the current Player. Reached through an
+  /// operation pin, as disposeSound() reaches it, so it never waits for
   /// init_deinit_mutex. -1 when teardown refused the pin.
   FFI_PLUGIN_EXPORT int soloudTestSoundIsLoaded(unsigned int hash)
   {
-    const PlayerPin pin(PlayerPinKind::sound);
+    const PlayerPin pin(PlayerPinKind::operation);
     if (pin.get() == nullptr)
       return -1;
     return pin.get()->findByHash(hash) != nullptr ? 1 : 0;
@@ -2144,7 +2177,7 @@ extern "C"
   /// soloudTestSoundIsLoaded(). -1 when teardown refused the pin.
   FFI_PLUGIN_EXPORT int soloudTestVoiceIsValid(unsigned int handle)
   {
-    const PlayerPin pin(PlayerPinKind::sound);
+    const PlayerPin pin(PlayerPinKind::operation);
     if (pin.get() == nullptr)
       return -1;
     return (pin.get()->isInited() && pin.get()->isValidHandle(handle)) ? 1 : 0;
@@ -2155,7 +2188,7 @@ extern "C"
   /// the pin.
   FFI_PLUGIN_EXPORT int soloudTestSoundHandleCount(unsigned int hash)
   {
-    const PlayerPin pin(PlayerPinKind::sound);
+    const PlayerPin pin(PlayerPinKind::operation);
     if (pin.get() == nullptr)
       return -1;
     return pin.get()->getSoundHandleCount(hash);
@@ -2490,9 +2523,10 @@ extern "C"
   // [hash] the hash of the stream sound.
   FFI_PLUGIN_EXPORT enum PlayerErrors resetBufferStream(unsigned int hash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->resetBufferStream(hash);
+    return pin.get()->resetBufferStream(hash);
   }
 
   /// Get the time consumed by the stream of a type `BufferingType.RELEASED`with
@@ -2500,10 +2534,11 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors getStreamTimeConsumed(unsigned int hash,
                                                             float *timeConsumed)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
 
-    return player.get()->getStreamTimeConsumed(hash, timeConsumed);
+    return pin.get()->getStreamTimeConsumed(hash, timeConsumed);
   }
 
   /// Set the icy metadata integer value. Must be set once before calling
@@ -2545,11 +2580,12 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors setBufferIcyMetaInt(unsigned int hash,
                                                           int icyMetaInt)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     if (icyMetaInt < 0)
       icyMetaInt = 0;
-    return player.get()->setBufferIcyMetaInt(hash, icyMetaInt);
+    return pin.get()->setBufferIcyMetaInt(hash, icyMetaInt);
   }
 
   /// [audioSizeBytes] the total size in **bytes** of the original encoded or
@@ -2590,44 +2626,49 @@ extern "C"
 
   FFI_PLUGIN_EXPORT enum PlayerErrors resetPullBufferStream(unsigned int hash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->resetPullBufferStream(hash);
+    return pin.get()->resetPullBufferStream(hash);
   }
 
   FFI_PLUGIN_EXPORT enum PlayerErrors
   addPullBufferDataStream(unsigned int hash, const unsigned char *data,
                           unsigned int aDataLen, uint64_t offset)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->addPullBufferDataStream(hash, data, aDataLen, offset);
+    return pin.get()->addPullBufferDataStream(hash, data, aDataLen, offset);
   }
 
   FFI_PLUGIN_EXPORT enum PlayerErrors
   getPullBufferTimeRange(unsigned int hash, double *startTime, double *endTime)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->getPullBufferTimeRange(hash, startTime, endTime);
+    return pin.get()->getPullBufferTimeRange(hash, startTime, endTime);
   }
 
   FFI_PLUGIN_EXPORT enum PlayerErrors
   addAudioDataStream(unsigned int hash, const unsigned char *data,
                      unsigned int aDataLen)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->addAudioDataStream(hash, data, aDataLen);
+    return pin.get()->addAudioDataStream(hash, data, aDataLen);
   }
 
   // Set the end of the data stream.
   // [hash] the hash of the stream sound.
   FFI_PLUGIN_EXPORT enum PlayerErrors setDataIsEnded(unsigned int hash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->setDataIsEnded(hash);
+    return pin.get()->setDataIsEnded(hash);
   }
 
   // Get the current buffer size in bytes of this sound with hash [hash].
@@ -2635,9 +2676,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors getBufferSize(unsigned int hash,
                                                     unsigned int *sizeInBytes)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->getBufferSize(hash, sizeInBytes);
+    return pin.get()->getBufferSize(hash, sizeInBytes);
   }
 
   /// Load a new waveform to be played once or multiple times later
@@ -2660,10 +2702,11 @@ extern "C"
                                                    float scale, float detune,
                                                    unsigned int *hash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return (PlayerErrors)player.get()->loadWaveform(waveform, superWave, scale,
-                                                    detune, *hash);
+    return (PlayerErrors)pin.get()->loadWaveform(waveform, superWave, scale,
+                                                 detune, *hash);
   }
 
   /// Set the scale of an already loaded waveform identified by [hash]
@@ -2672,10 +2715,11 @@ extern "C"
   /// [newScale]
   FFI_PLUGIN_EXPORT void setWaveformScale(unsigned int hash, float newScale)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
 
-    player.get()->setWaveformScale(hash, newScale);
+    pin.get()->setWaveformScale(hash, newScale);
   }
 
   /// Set the detune of an already loaded waveform identified by [hash]
@@ -2684,10 +2728,11 @@ extern "C"
   /// [newDetune]
   FFI_PLUGIN_EXPORT void setWaveformDetune(unsigned int hash, float newDetune)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
 
-    player.get()->setWaveformDetune(hash, newDetune);
+    pin.get()->setWaveformDetune(hash, newDetune);
   }
 
   /// Set a new frequency of an already loaded waveform identified by [hash]
@@ -2699,10 +2744,11 @@ extern "C"
   std::thread waveformFreqThread;
   FFI_PLUGIN_EXPORT void setWaveformFreq(unsigned int hash, float newFreq)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
 
-    player.get()->setWaveformFreq(hash, newFreq);
+    pin.get()->setWaveformFreq(hash, newFreq);
   }
 
   /// Set a new frequence of an already loaded waveform identified by [hash]
@@ -2711,10 +2757,11 @@ extern "C"
   /// [superwave]
   FFI_PLUGIN_EXPORT void setSuperWave(unsigned int hash, bool superwave)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
 
-    player.get()->setWaveformSuperwave(hash, superwave);
+    pin.get()->setWaveformSuperwave(hash, superwave);
   }
 
   /// Set a new wave form of an already loaded waveform identified by [hash]
@@ -2731,10 +2778,11 @@ extern "C"
   ///                 WAVE_FSAW
   FFI_PLUGIN_EXPORT void setWaveform(unsigned int hash, int newWaveform)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
 
-    player.get()->setWaveform(hash, newWaveform);
+    pin.get()->setWaveform(hash, newWaveform);
   }
 
   /// Speech the text given
@@ -2745,9 +2793,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors speechText(char *textToSpeech,
                                                  unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return (PlayerErrors)player.get()->textToSpeech(textToSpeech, *handle);
+    return (PlayerErrors)pin.get()->textToSpeech(textToSpeech, *handle);
   }
 
   /// Switch pause state for an already loaded sound identified by [handle]
@@ -2759,9 +2808,10 @@ extern "C"
   /// this never reports [PlayerErrors.audioDeviceFailedToStart].
   FFI_PLUGIN_EXPORT enum PlayerErrors pauseSwitch(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->pauseSwitch(handle);
+    return pin.get()->pauseSwitch(handle);
   }
 
   /// Pause or unpause already loaded sound identified by [handle]
@@ -2774,9 +2824,10 @@ extern "C"
   /// this never reports [PlayerErrors.audioDeviceFailedToStart].
   FFI_PLUGIN_EXPORT enum PlayerErrors setPause(unsigned int handle, bool pause)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return player.get()->setPause(handle, pause);
+    return pin.get()->setPause(handle, pause);
   }
 
   /// Gets the pause state
@@ -2785,10 +2836,11 @@ extern "C"
   /// Return true if paused
   FFI_PLUGIN_EXPORT int getPause(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return false;
-    return player.get()->getPause(handle) ? 1 : 0;
+    return pin.get()->getPause(handle) ? 1 : 0;
   }
 
   /// Set a sound's relative play speed.
@@ -2805,10 +2857,11 @@ extern "C"
   /// [speed] the new speed
   FFI_PLUGIN_EXPORT void setRelativePlaySpeed(unsigned int handle, float speed)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return;
-    player.get()->setRelativePlaySpeed(handle, speed);
+    pin.get()->setRelativePlaySpeed(handle, speed);
   }
 
   /// Get a sound's relative play speed.
@@ -2818,10 +2871,11 @@ extern "C"
   /// Return the current play speed.
   FFI_PLUGIN_EXPORT float getRelativePlaySpeed(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return 1;
-    return player.get()->getRelativePlaySpeed(handle);
+    return pin.get()->getRelativePlaySpeed(handle);
   }
 
   /// Gets the approximate volume for output per output channel (i.e, per speaker).
@@ -2830,9 +2884,10 @@ extern "C"
   /// Return zero for invalid parameters.
   FFI_PLUGIN_EXPORT float getApproximateVolume(unsigned int channel)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0;
-    return player.get()->getApproximateVolume(channel);
+    return pin.get()->getApproximateVolume(channel);
   }
 
   /// Play already loaded sound identified by [hash]
@@ -2858,9 +2913,10 @@ extern "C"
       int loopingStartOffsetAt, int loopingEndOffsetAt,
       float scale, unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    PlayerErrors result = player.get()->play(
+    PlayerErrors result = pin.get()->play(
         soundHash, *handle, busId, volume, pan,
         paused, looping, loopingStartAt, loopingEndAt,
         loopingStartOffsetAt, loopingEndOffsetAt, scale);
@@ -2897,9 +2953,10 @@ extern "C"
       int loopingStartOffsetAt, int loopingEndOffsetAt,
       unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    PlayerErrors result = player.get()->playClocked(
+    PlayerErrors result = pin.get()->playClocked(
         soundHash, *handle, soundTime, busId, volume, pan, scale,
         looping, loopingStartAt, loopingEndAt,
         loopingStartOffsetAt, loopingEndOffsetAt);
@@ -2918,9 +2975,10 @@ extern "C"
   FFI_PLUGIN_EXPORT void setDelaySamples(unsigned int handle,
                                          unsigned int samples)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->setDelaySamples(handle, samples);
+    pin.get()->setDelaySamples(handle, samples);
   }
 
   /// Get the current stream time of a voice, in seconds.
@@ -2929,9 +2987,10 @@ extern "C"
   /// Return the stream time in seconds. 0 if [handle] is invalid.
   FFI_PLUGIN_EXPORT double getStreamTime(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0;
-    return player.get()->getStreamTime(handle);
+    return pin.get()->getStreamTime(handle);
   }
 
   /// Reset the clock used by [playClocked] and [play3dClocked] to the state
@@ -2941,9 +3000,10 @@ extern "C"
   /// audio clock again (leading by two output buffers).
   FFI_PLUGIN_EXPORT void resetStreamTime()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->resetStreamTime();
+    pin.get()->resetStreamTime();
   }
 
   /// Get the engine's global stream time, in seconds.
@@ -2955,9 +3015,10 @@ extern "C"
   /// Return the engine time in seconds.
   FFI_PLUGIN_EXPORT double getEngineTime()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0;
-    return player.get()->getEngineTime();
+    return pin.get()->getEngineTime();
   }
 
   /// Engine time of the sample currently reaching the output device: the mix
@@ -2965,27 +3026,30 @@ extern "C"
   /// [getEngineTime] when the render-ahead ring is disabled (the default).
   FFI_PLUGIN_EXPORT double getPlayheadTime()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0;
-    return player.get()->getPlayheadTime();
+    return pin.get()->getPlayheadTime();
   }
 
   /// Estimated output latency in seconds (render-ahead ring depth plus one
   /// device period). 0 when the render-ahead ring is disabled.
   FFI_PLUGIN_EXPORT double getOutputLatency()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0;
-    return player.get()->getOutputLatency();
+    return pin.get()->getOutputLatency();
   }
 
   /// Whether the render-ahead ring (the retroactive re-mix prerequisite) is
   /// active. Enabled at init time via `initEngine`'s `renderAheadFrames`.
   FFI_PLUGIN_EXPORT unsigned int isRenderAheadEnabled()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0;
-    return player.get()->isRenderAheadEnabled() ? 1 : 0;
+    return pin.get()->isRenderAheadEnabled() ? 1 : 0;
   }
 
   /// Start playing a sound at an absolute engine time (see [getEngineTime]),
@@ -3017,9 +3081,10 @@ extern "C"
       int loopingStartOffsetAt, int loopingEndOffsetAt,
       unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    PlayerErrors result = player.get()->playScheduled(
+    PlayerErrors result = pin.get()->playScheduled(
         soundHash, *handle, atTime, duration, busId, volume, pan, scale,
         looping, loopingStartAt, loopingEndAt,
         loopingStartOffsetAt, loopingEndOffsetAt);
@@ -3035,9 +3100,10 @@ extern "C"
   /// should stop
   FFI_PLUGIN_EXPORT void stopScheduled(unsigned int handle, double atTime)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->stopScheduled(handle, atTime);
+    pin.get()->stopScheduled(handle, atTime);
   }
 
   /// Fade the volume of a sound starting at an absolute engine time
@@ -3057,9 +3123,10 @@ extern "C"
                                        float to, double fadeTime,
                                        bool thenStop)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->fadeScheduled(handle, atTime, to, fadeTime, thenStop);
+    pin.get()->fadeScheduled(handle, atTime, to, fadeTime, thenStop);
   }
 
   /// Stop already loaded sound identified by [handle] and clear it
@@ -3070,9 +3137,10 @@ extern "C"
   /// [handle] is not valid (for example the voice has already ended).
   FFI_PLUGIN_EXPORT enum PlayerErrors stop(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    const enum PlayerErrors error = player.get()->stop(handle);
+    const enum PlayerErrors error = pin.get()->stop(handle);
     if (error != noError)
       return error;
     return noError;
@@ -3084,9 +3152,10 @@ extern "C"
   /// SoLoud itself), so Dart is notified for every handle like with [stop].
   FFI_PLUGIN_EXPORT void stopAll()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->stopAll();
+    pin.get()->stopAll();
   }
 
   /// Stop all voices playing the already loaded sound identified by
@@ -3096,9 +3165,10 @@ extern "C"
   /// SoLoud itself), so Dart is notified for every handle like with [stop].
   FFI_PLUGIN_EXPORT void stopAudioSource(unsigned int soundHash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->stopAudioSource(soundHash);
+    pin.get()->stopAudioSource(soundHash);
   }
 
   /// Stop all handles of the already loaded sound identified by [hash] and
@@ -3109,7 +3179,7 @@ extern "C"
   /// Dart calls this synchronously on the UI thread, so it must never wait for
   /// a device operation. It therefore takes neither init_deinit_mutex nor
   /// loadMutex -- initEngine() and teardown hold both across device work --
-  /// and pins the Player with a sound PlayerPin instead. Below the pin it takes
+  /// and pins the Player with an operation PlayerPin instead. Below the pin it takes
   /// only Player::sounds_mutex, SoLoud's audio mutex and the lifecycle
   /// scheduler's request locks, none of which is held across a backend device
   /// call (see changeDevice() for the lock order).
@@ -3123,7 +3193,7 @@ extern "C"
   /// hash.
   FFI_PLUGIN_EXPORT void disposeSound(unsigned int soundHash)
   {
-    const PlayerPin pin(PlayerPinKind::sound);
+    const PlayerPin pin(PlayerPinKind::operation);
     Player *const p = pin.get();
     if (p == nullptr || !p->isInited())
       return;
@@ -3147,7 +3217,7 @@ extern "C"
   /// guarantee on return and the same single exception.
   FFI_PLUGIN_EXPORT void disposeAllSound()
   {
-    const PlayerPin pin(PlayerPinKind::sound);
+    const PlayerPin pin(PlayerPinKind::operation);
     Player *const p = pin.get();
     if (p == nullptr || !p->isInited())
       return;
@@ -3160,10 +3230,11 @@ extern "C"
   /// Returns true if flagged for looping.
   FFI_PLUGIN_EXPORT int getLooping(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return 0;
-    return player.get()->getLooping(handle) == 1;
+    return pin.get()->getLooping(handle) == 1;
   }
 
   /// This function can be used to set a sample to play on repeat,
@@ -3173,10 +3244,11 @@ extern "C"
   /// [enable]
   FFI_PLUGIN_EXPORT void setLooping(unsigned int handle, bool enable)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return;
-    player.get()->setLooping(handle, enable);
+    pin.get()->setLooping(handle, enable);
   }
 
   /// Get sound loop point value.
@@ -3185,10 +3257,11 @@ extern "C"
   /// Returns the time in seconds.
   FFI_PLUGIN_EXPORT double getLoopPoint(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return 0;
-    return player.get()->getLoopPoint(handle);
+    return pin.get()->getLoopPoint(handle);
   }
 
   /// Set sound loop point value.
@@ -3197,10 +3270,11 @@ extern "C"
   /// [time] in seconds.
   FFI_PLUGIN_EXPORT void setLoopPoint(unsigned int handle, double time)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return;
-    player.get()->setLoopPoint(handle, time);
+    pin.get()->setLoopPoint(handle, time);
   }
 
   /// Get the sound loop end point value.
@@ -3209,10 +3283,11 @@ extern "C"
   /// Returns the time in seconds, or zero for the natural stream end.
   FFI_PLUGIN_EXPORT double getLoopEndPoint(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return 0;
-    return player.get()->getLoopEndPoint(handle);
+    return pin.get()->getLoopEndPoint(handle);
   }
 
   /// Set the sound loop end point value.
@@ -3221,10 +3296,11 @@ extern "C"
   /// [time] in seconds, or zero to use the natural stream end.
   FFI_PLUGIN_EXPORT void setLoopEndPoint(unsigned int handle, double time)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return;
-    player.get()->setLoopEndPoint(handle, time);
+    pin.get()->setLoopEndPoint(handle, time);
   }
 
   /// Enable or disable the visualization of the engine output
@@ -3240,10 +3316,11 @@ extern "C"
       int kind,
       int channel)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     Analyzer::setDataCallback(dispatchVisualizationToDart);
-    const int engineChannels = player.get()->soloud.getBackendChannels();
+    const int engineChannels = pin.get()->soloud.getBackendChannels();
     return Analyzer::instance().setVisualizationEnabled(
         enabled,
         windowSize,
@@ -3285,9 +3362,10 @@ extern "C"
   /// Returns sound length in seconds
   FFI_PLUGIN_EXPORT double getLength(unsigned int soundHash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0;
-    auto f = player.get()->getLength(soundHash);
+    auto f = pin.get()->getLength(soundHash);
     return f;
   }
 
@@ -3309,9 +3387,10 @@ extern "C"
   ///
   FFI_PLUGIN_EXPORT enum PlayerErrors seek(unsigned int handle, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    return (PlayerErrors)player.get()->seek(handle, time);
+    return (PlayerErrors)pin.get()->seek(handle, time);
   }
 
   /// Get current sound position  in seconds
@@ -3320,10 +3399,11 @@ extern "C"
   /// Returns time in seconds
   FFI_PLUGIN_EXPORT double getPosition(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return 0.0;
-    return player.get()->getPosition(handle);
+    return pin.get()->getPosition(handle);
   }
 
   /// Get current Global volume
@@ -3331,9 +3411,10 @@ extern "C"
   /// Returns the volume
   FFI_PLUGIN_EXPORT double getGlobalVolume()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0;
-    return player.get()->getGlobalVolume();
+    return pin.get()->getGlobalVolume();
   }
 
   /// Set current Global volume
@@ -3341,9 +3422,10 @@ extern "C"
   /// Returns the volume
   FFI_PLUGIN_EXPORT enum PlayerErrors setGlobalVolume(float volume)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->setGlobalVolume(volume);
+    pin.get()->setGlobalVolume(volume);
     return noError;
   }
 
@@ -3352,10 +3434,11 @@ extern "C"
   /// Returns the volume
   FFI_PLUGIN_EXPORT double getVolume(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return 0.0;
-    return player.get()->getVolume(handle);
+    return pin.get()->getVolume(handle);
   }
 
   /// Set current [handle] volume
@@ -3363,11 +3446,12 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors setVolume(unsigned int handle,
                                                 float volume)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    if (!player.get()->isValidHandle(handle))
+    if (!pin.get()->isValidHandle(handle))
       return soundHandleNotFound;
-    player.get()->setVolume(handle, volume);
+    pin.get()->setVolume(handle, volume);
     return noError;
   }
 
@@ -3378,10 +3462,11 @@ extern "C"
   /// middle and and 1 is right.
   FFI_PLUGIN_EXPORT double getPan(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0.0f;
 
-    return player.get()->getPan(handle);
+    return pin.get()->getPan(handle);
   }
 
   /// Set a sound's current pan setting.
@@ -3391,10 +3476,11 @@ extern "C"
   /// and and 1 is right.
   FFI_PLUGIN_EXPORT void setPan(unsigned int handle, double pan)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
     // Rounding to 6 decimal to work around the float to double precision.
-    player.get()->setPan(handle, pan);
+    pin.get()->setPan(handle, pan);
   }
 
   /// Set the left/right volumes directly.
@@ -3406,9 +3492,10 @@ extern "C"
   FFI_PLUGIN_EXPORT void setPanAbsolute(unsigned int handle, double panLeft,
                                         double panRight)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->setPanAbsolute(handle, panLeft, panRight);
+    pin.get()->setPanAbsolute(handle, panLeft, panRight);
   }
 
   /// Check if a handle is still valid.
@@ -3417,44 +3504,49 @@ extern "C"
   /// Return true if it still exists
   FFI_PLUGIN_EXPORT int getIsValidVoiceHandle(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return false;
-    return player.get()->isValidHandle(handle) ? 1 : 0;
+    return pin.get()->isValidHandle(handle) ? 1 : 0;
   }
 
   /// Returns the number of concurrent sounds that are playing at the moment.
   FFI_PLUGIN_EXPORT unsigned int getActiveVoiceCount()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0;
-    return player.get()->getActiveVoiceCount_internal();
+    return pin.get()->getActiveVoiceCount_internal();
   }
 
   /// Returns the number of concurrent sounds that are playing a specific audio
   /// source.
   FFI_PLUGIN_EXPORT int countAudioSource(unsigned int soundHash)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0;
-    return player.get()->countAudioSource(soundHash);
+    return pin.get()->countAudioSource(soundHash);
   }
 
   /// Returns the number of voices the application has told SoLoud to play.
   FFI_PLUGIN_EXPORT unsigned int getVoiceCount()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0;
-    return player.get()->getVoiceCount();
+    return pin.get()->getVoiceCount();
   }
 
   /// Get a sound's protection state.
   FFI_PLUGIN_EXPORT bool getProtectVoice(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return false;
-    return player.get()->getProtectVoice(handle);
+    return pin.get()->getProtectVoice(handle);
   }
 
   /// Set a sound's protection state.
@@ -3469,10 +3561,11 @@ extern "C"
   /// [protect] whether to protect or not.
   FFI_PLUGIN_EXPORT void setProtectVoice(unsigned int handle, bool protect)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return;
-    player.get()->setProtectVoice(handle, protect);
+    pin.get()->setProtectVoice(handle, protect);
   }
 
   /// Set the inaudible behavior of a live sound. By default,
@@ -3487,18 +3580,20 @@ extern "C"
   FFI_PLUGIN_EXPORT void setInaudibleBehavior(unsigned int handle, bool mustTick,
                                               bool kill)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        !player.get()->isValidHandle(handle))
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        !pin.get()->isValidHandle(handle))
       return;
-    player.get()->setInaudibleBehavior(handle, mustTick, kill);
+    pin.get()->setInaudibleBehavior(handle, mustTick, kill);
   }
 
   /// Get the current maximum active voice count.
   FFI_PLUGIN_EXPORT unsigned int getMaxActiveVoiceCount()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return 0;
-    return player.get()->getMaxActiveVoiceCount();
+    return pin.get()->getMaxActiveVoiceCount();
   }
 
   /// Set the current maximum active voice count.
@@ -3515,9 +3610,10 @@ extern "C"
   /// changes in any case.
   FFI_PLUGIN_EXPORT void setMaxActiveVoiceCount(unsigned int maxVoiceCount)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->setMaxActiveVoiceCount(maxVoiceCount);
+    pin.get()->setMaxActiveVoiceCount(maxVoiceCount);
   }
 
   /////////////////////////////////////////
@@ -3527,9 +3623,10 @@ extern "C"
   /// Used to create a new voice group. Returns 0 if not successful.
   FFI_PLUGIN_EXPORT unsigned int createVoiceGroup()
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return -1;
-    auto ret = player.get()->createVoiceGroup();
+    auto ret = pin.get()->createVoiceGroup();
     return ret;
   }
 
@@ -3539,9 +3636,10 @@ extern "C"
   /// [handle] the group handle to destroy.
   FFI_PLUGIN_EXPORT void destroyVoiceGroup(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->destroyVoiceGroup(handle);
+    pin.get()->destroyVoiceGroup(handle);
   }
 
   /// Adds voice handle to the voice group. The voice handles can still be
@@ -3551,9 +3649,10 @@ extern "C"
   FFI_PLUGIN_EXPORT void addVoiceToGroup(unsigned int voiceGroupHandle,
                                          unsigned int voiceHandle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return;
-    player.get()->addVoiceToGroup(voiceGroupHandle, voiceHandle);
+    pin.get()->addVoiceToGroup(voiceGroupHandle, voiceHandle);
   }
 
   /// Checks if the handle is a valid voice group. Does not care if the
@@ -3563,9 +3662,10 @@ extern "C"
   /// Return true if [handle] is a group handle.
   FFI_PLUGIN_EXPORT int isVoiceGroup(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return false;
-    return player.get()->isVoiceGroup(handle);
+    return pin.get()->isVoiceGroup(handle);
   }
 
   /// Checks whether a voice group is empty. SoLoud automatically trims
@@ -3576,9 +3676,10 @@ extern "C"
   /// Return true if the group handle doesn't have any voices.
   FFI_PLUGIN_EXPORT int isVoiceGroupEmpty(unsigned int handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return false;
-    return player.get()->isVoiceGroupEmpty(handle);
+    return pin.get()->isVoiceGroupEmpty(handle);
   }
 
   /////////////////////////////////////////
@@ -3588,9 +3689,10 @@ extern "C"
   /// Smoothly change the global volume over specified time.
   FFI_PLUGIN_EXPORT enum PlayerErrors fadeGlobalVolume(float to, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->fadeGlobalVolume(to, time);
+    pin.get()->fadeGlobalVolume(to, time);
     return noError;
   }
 
@@ -3598,9 +3700,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors fadeVolume(unsigned int handle, float to,
                                                  float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->fadeVolume(handle, to, time);
+    pin.get()->fadeVolume(handle, to, time);
     return noError;
   }
 
@@ -3608,9 +3711,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors fadePan(unsigned int handle, float to,
                                               float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->fadePan(handle, to, time);
+    pin.get()->fadePan(handle, to, time);
     return noError;
   }
 
@@ -3618,9 +3722,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors
   fadeRelativePlaySpeed(unsigned int handle, float to, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->fadeRelativePlaySpeed(handle, to, time);
+    pin.get()->fadeRelativePlaySpeed(handle, to, time);
     return noError;
   }
 
@@ -3628,9 +3733,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors schedulePause(unsigned int handle,
                                                     float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->schedulePause(handle, time);
+    pin.get()->schedulePause(handle, time);
     return noError;
   }
 
@@ -3638,9 +3744,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors scheduleStop(unsigned int handle,
                                                    float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->scheduleStop(handle, time);
+    pin.get()->scheduleStop(handle, time);
     return noError;
   }
 
@@ -3648,9 +3755,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors
   oscillateVolume(unsigned int handle, float from, float to, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->oscillateVolume(handle, from, to, time);
+    pin.get()->oscillateVolume(handle, from, to, time);
     return noError;
   }
 
@@ -3658,9 +3766,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors
   oscillatePan(unsigned int handle, float from, float to, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->oscillatePan(handle, from, to, time);
+    pin.get()->oscillatePan(handle, from, to, time);
     return noError;
   }
 
@@ -3669,9 +3778,10 @@ extern "C"
   oscillateRelativePlaySpeed(unsigned int handle, float from, float to,
                              float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->oscillateRelativePlaySpeed(handle, from, to, time);
+    pin.get()->oscillateRelativePlaySpeed(handle, from, to, time);
     return noError;
   }
 
@@ -3679,9 +3789,10 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors oscillateGlobalVolume(float from, float to,
                                                             float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    player.get()->oscillateGlobalVolume(from, to, time);
+    pin.get()->oscillateGlobalVolume(from, to, time);
     return noError;
   }
 
@@ -3700,19 +3811,20 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors
   isFilterActive(unsigned int soundHash, unsigned int busId, enum FilterType filterType, int *index)
   {
+    const PlayerPin pin(PlayerPinKind::operation);
     *index = -1;
-    if (player.get() == nullptr || !player.get()->isInited())
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
 
     if (soundHash == 0 && busId == 0)
-      *index = player.get()->mFilters.isFilterActive(filterType);
+      *index = pin.get()->mFilters.isFilterActive(filterType);
     else
     {
       if (soundHash != 0)
       {
         // The sound is used under sounds_mutex: a disposal on another thread
         // must not destroy it in between.
-        return player.get()->useSoundByHash(
+        return pin.get()->useSoundByHash(
             soundHash, [&](ActiveSound &s)
             {
               *index = s.filters->isFilterActive(filterType);
@@ -3721,7 +3833,7 @@ extern "C"
       }
       else
       {
-        auto *busData = player.get()->findBusData(busId);
+        auto *busData = pin.get()->findBusData(busId);
         if (busData == nullptr)
           return busIdNotFound;
         *index = busData->filters.isFilterActive(filterType);
@@ -3739,11 +3851,12 @@ extern "C"
   getFilterParamNames(enum FilterType filterType, int *paramsCount,
                       char **names)
   {
+    const PlayerPin pin(PlayerPinKind::operation);
     *paramsCount = 0;
-    if (player.get() == nullptr || !player.get()->isInited())
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     std::vector<std::string> pNames =
-        player.get()->mFilters.getFilterParamNames(filterType);
+        pin.get()->mFilters.getFilterParamNames(filterType);
     *paramsCount = static_cast<int>(pNames.size());
     *names = (char *)malloc(sizeof(char *) * *paramsCount);
     // printf("C  paramsCount: %p  **names: %p\n", paramsCount, names);
@@ -3767,20 +3880,21 @@ extern "C"
                                                 unsigned int busId,
                                                 enum FilterType filterType)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     if (soundHash == 0 && busId == 0)
-      return player.get()->mFilters.addFilter(filterType);
+      return pin.get()->mFilters.addFilter(filterType);
 
     if (soundHash != 0)
     {
-      return player.get()->useSoundByHash(
+      return pin.get()->useSoundByHash(
           soundHash,
           [&](ActiveSound &s) { return s.filters->addFilter(filterType); });
     }
     else
     {
-      auto *busFilters = player.get()->findBusData(busId);
+      auto *busFilters = pin.get()->findBusData(busId);
       if (busFilters == nullptr)
         return busIdNotFound;
       return busFilters->filters.addFilter(filterType);
@@ -3800,18 +3914,19 @@ extern "C"
                                                    unsigned int busId,
                                                    enum FilterType filterType)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     if (soundHash == 0 && busId == 0)
     {
-      if (!player.get()->mFilters.removeFilter(filterType))
+      if (!pin.get()->mFilters.removeFilter(filterType))
         return filterNotFound;
     }
     else
     {
       if (soundHash != 0)
       {
-        return player.get()->useSoundByHash(
+        return pin.get()->useSoundByHash(
             soundHash, [&](ActiveSound &s)
             {
               return s.filters->removeFilter(filterType) ? noError
@@ -3820,7 +3935,7 @@ extern "C"
       }
       else
       {
-        auto *busFilters = player.get()->findBusData(busId);
+        auto *busFilters = pin.get()->findBusData(busId);
         if (busFilters == nullptr)
           return busIdNotFound;
         if (!busFilters->filters.removeFilter(filterType))
@@ -3848,19 +3963,20 @@ extern "C"
                                                       int attributeId,
                                                       float value)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     /// Not important to call the [SoLoud::AudioSource].setFilterParams() here,
     /// SoLoud will set the param globally or by [handle] if  [handle] is not ==0.
     if (handle == 0 && busId == 0)
     {
-      player.get()->mFilters.setFilterParams(handle, filterType, attributeId, value);
+      pin.get()->mFilters.setFilterParams(handle, filterType, attributeId, value);
     }
     else
     {
       if (busId > 0)
       {
-        auto *busFilters = player.get()->findBusData(busId);
+        auto *busFilters = pin.get()->findBusData(busId);
         if (busFilters == nullptr)
         {
           return busIdNotFound;
@@ -3872,7 +3988,7 @@ extern "C"
       }
       else if (handle > 0)
       {
-        return player.get()->useSoundByHandle(
+        return pin.get()->useSoundByHandle(
             handle, [&](ActiveSound &s)
             {
               s.filters->setFilterParams(handle, filterType, attributeId,
@@ -3898,22 +4014,23 @@ extern "C"
                                                       int attributeId,
                                                       float *filterValue)
   {
+    const PlayerPin pin(PlayerPinKind::operation);
     *filterValue = 9999.0f;
-    if (player.get() == nullptr || !player.get()->isInited())
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     /// If [handle] == 0 get the parameter from global filters else from
     /// the sound which owns [handle].
     if (handle == 0 && busId == 0)
     {
       *filterValue =
-          player.get()->mFilters.getFilterParams(handle, filterType, attributeId);
+          pin.get()->mFilters.getFilterParams(handle, filterType, attributeId);
       return noError;
     }
     else
     {
       if (busId > 0)
       {
-        auto *busFilters = player.get()->findBusData(busId);
+        auto *busFilters = pin.get()->findBusData(busId);
         if (busFilters == nullptr)
         {
           return busIdNotFound;
@@ -3931,7 +4048,7 @@ extern "C"
       }
       else
       {
-        return player.get()->useSoundByHandle(
+        return pin.get()->useSoundByHandle(
             handle, [&](ActiveSound &s)
             {
               *filterValue =
@@ -3962,18 +4079,19 @@ extern "C"
   fadeFilterParameter(unsigned int handle, unsigned int busId, enum FilterType filterType,
                       int attributeId, float to, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     if (handle == 0 && busId == 0)
     {
-      player.get()->mFilters.fadeFilterParameter(handle, filterType, attributeId,
-                                                 to, time);
+      pin.get()->mFilters.fadeFilterParameter(handle, filterType, attributeId,
+                                              to, time);
     }
     else
     {
       if (busId > 0)
       {
-        auto *busFilters = player.get()->findBusData(busId);
+        auto *busFilters = pin.get()->findBusData(busId);
         if (busFilters == nullptr)
         {
           return busIdNotFound;
@@ -3987,7 +4105,7 @@ extern "C"
       }
       else
       {
-        return player.get()->useSoundByHandle(
+        return pin.get()->useSoundByHandle(
             handle, [&](ActiveSound &s)
             {
               s.filters->fadeFilterParameter(handle, filterType, attributeId,
@@ -4015,18 +4133,19 @@ extern "C"
   oscillateFilterParameter(unsigned int handle, unsigned int busId, enum FilterType filterType,
                            int attributeId, float from, float to, float time)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     if (handle == 0 && busId == 0)
     {
-      player.get()->mFilters.oscillateFilterParameter(
+      pin.get()->mFilters.oscillateFilterParameter(
           handle, filterType, attributeId, from, to, time);
     }
     else
     {
       if (busId > 0)
       {
-        auto *busFilters = player.get()->findBusData(busId);
+        auto *busFilters = pin.get()->findBusData(busId);
         if (busFilters == nullptr)
         {
           return busIdNotFound;
@@ -4040,7 +4159,7 @@ extern "C"
       }
       else
       {
-        return player.get()->useSoundByHandle(
+        return pin.get()->useSoundByHandle(
             handle, [&](ActiveSound &s)
             {
               s.filters->oscillateFilterParameter(handle, filterType,
@@ -4073,14 +4192,15 @@ extern "C"
                                         bool looping, double loopingStartAt,
                                         unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return backendNotInited;
 
     PlayerErrors result =
-        player.get()->play3d(soundHash, *handle, busId, posX, posY, posZ, velX, velY,
-                             velZ, volume, paused, looping, loopingStartAt,
-                             0, -1, -1, 1.0f);
+        pin.get()->play3d(soundHash, *handle, busId, posX, posY, posZ, velX, velY,
+                          velZ, volume, paused, looping, loopingStartAt,
+                          0, -1, -1, 1.0f);
     return result;
   }
 
@@ -4096,15 +4216,16 @@ extern "C"
       float volume, bool paused, bool looping, double loopingStartAt,
       double loopingEndAt, int loopingStartOffsetAt, int loopingEndOffsetAt, float scale, unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return backendNotInited;
 
     PlayerErrors result =
-        player.get()->play3d(soundHash, *handle, busId, posX, posY, posZ, velX, velY,
-                             velZ, volume, paused, looping, loopingStartAt,
-                             loopingEndAt, loopingStartOffsetAt,
-                             loopingEndOffsetAt, scale);
+        pin.get()->play3d(soundHash, *handle, busId, posX, posY, posZ, velX, velY,
+                          velZ, volume, paused, looping, loopingStartAt,
+                          loopingEndAt, loopingStartOffsetAt,
+                          loopingEndOffsetAt, scale);
     return result;
   }
 
@@ -4133,16 +4254,17 @@ extern "C"
       int loopingStartOffsetAt, int loopingEndOffsetAt,
       unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return backendNotInited;
 
     PlayerErrors result =
-        player.get()->play3dClocked(soundHash, *handle, soundTime, busId,
-                                    posX, posY, posZ, velX, velY, velZ,
-                                    volume, scale, looping,
-                                    loopingStartAt, loopingEndAt,
-                                    loopingStartOffsetAt, loopingEndOffsetAt);
+        pin.get()->play3dClocked(soundHash, *handle, soundTime, busId,
+                                 posX, posY, posZ, velX, velY, velZ,
+                                 volume, scale, looping,
+                                 loopingStartAt, loopingEndAt,
+                                 loopingStartOffsetAt, loopingEndOffsetAt);
     return result;
   }
 
@@ -4178,16 +4300,17 @@ extern "C"
       int loopingStartOffsetAt, int loopingEndOffsetAt,
       unsigned int *handle)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return backendNotInited;
 
     PlayerErrors result =
-        player.get()->play3dScheduled(soundHash, *handle, atTime, duration, busId,
-                                      posX, posY, posZ, velX, velY, velZ,
-                                      volume, scale, looping,
-                                      loopingStartAt, loopingEndAt,
-                                      loopingStartOffsetAt, loopingEndOffsetAt);
+        pin.get()->play3dScheduled(soundHash, *handle, atTime, duration, busId,
+                                   posX, posY, posZ, velX, velY, velZ,
+                                   volume, scale, looping,
+                                   loopingStartAt, loopingEndAt,
+                                   loopingStartOffsetAt, loopingEndOffsetAt);
     return result;
   }
 
@@ -4203,20 +4326,22 @@ extern "C"
   /// and that the environment is dry air at around 20 degrees Celsius.
   FFI_PLUGIN_EXPORT void set3dSoundSpeed(float speed)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSoundSpeed(speed);
-    player.get()->update3dAudio();
+    pin.get()->set3dSoundSpeed(speed);
+    pin.get()->update3dAudio();
   }
 
   /// Get the sound speed
   FFI_PLUGIN_EXPORT float get3dSoundSpeed()
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return 0.0f;
-    return player.get()->get3dSoundSpeed();
+    return pin.get()->get3dSoundSpeed();
   }
 
   /// You can set the position, at-vector, up-vector and velocity
@@ -4226,55 +4351,60 @@ extern "C"
                           float atY, float atZ, float upX, float upY, float upZ,
                           float velocityX, float velocityY, float velocityZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dListenerParameters(posX, posY, posZ, atX, atY, atZ, upX,
-                                          upY, upZ, velocityX, velocityY,
-                                          velocityZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dListenerParameters(posX, posY, posZ, atX, atY, atZ, upX,
+                                       upY, upZ, velocityX, velocityY,
+                                       velocityZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the position parameter of the 3d audio listener
   FFI_PLUGIN_EXPORT void set3dListenerPosition(float posX, float posY,
                                                float posZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dListenerPosition(posX, posY, posZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dListenerPosition(posX, posY, posZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the "at" vector parameter of the 3d audio listener
   FFI_PLUGIN_EXPORT void set3dListenerAt(float atX, float atY, float atZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dListenerAt(atX, atY, atZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dListenerAt(atX, atY, atZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the "up" vector parameter of the 3d audio listener
   FFI_PLUGIN_EXPORT void set3dListenerUp(float upX, float upY, float upZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dListenerUp(upX, upY, upZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dListenerUp(upX, upY, upZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the listener's velocity vector parameter
   FFI_PLUGIN_EXPORT void set3dListenerVelocity(float velocityX, float velocityY,
                                                float velocityZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dListenerVelocity(velocityX, velocityY, velocityZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dListenerVelocity(velocityX, velocityY, velocityZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the position and velocity parameters of a live
@@ -4284,34 +4414,37 @@ extern "C"
                                                float velocityX, float velocityY,
                                                float velocityZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSourceParameters(handle, posX, posY, posZ, velocityX,
-                                        velocityY, velocityZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dSourceParameters(handle, posX, posY, posZ, velocityX,
+                                     velocityY, velocityZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the position parameters of a live 3d audio source
   FFI_PLUGIN_EXPORT void set3dSourcePosition(unsigned int handle, float posX,
                                              float posY, float posZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSourcePosition(handle, posX, posY, posZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dSourcePosition(handle, posX, posY, posZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the velocity parameters of a live 3d audio source
   FFI_PLUGIN_EXPORT void set3dSourceVelocity(unsigned int handle, float velocityX,
                                              float velocityY, float velocityZ)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSourceVelocity(handle, velocityX, velocityY, velocityZ);
-    player.get()->update3dAudio();
+    pin.get()->set3dSourceVelocity(handle, velocityX, velocityY, velocityZ);
+    pin.get()->update3dAudio();
   }
 
   /// You can set the minimum and maximum distance parameters
@@ -4320,11 +4453,12 @@ extern "C"
                                                    float minDistance,
                                                    float maxDistance)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSourceMinMaxDistance(handle, minDistance, maxDistance);
-    player.get()->update3dAudio();
+    pin.get()->set3dSourceMinMaxDistance(handle, minDistance, maxDistance);
+    pin.get()->update3dAudio();
   }
 
   /// You can change the attenuation model and rolloff factor parameters of
@@ -4339,23 +4473,25 @@ extern "C"
                                                 unsigned int attenuationModel,
                                                 float attenuationRolloffFactor)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSourceAttenuation(handle, attenuationModel,
-                                         attenuationRolloffFactor);
-    player.get()->update3dAudio();
+    pin.get()->set3dSourceAttenuation(handle, attenuationModel,
+                                      attenuationRolloffFactor);
+    pin.get()->update3dAudio();
   }
 
   /// You can change the doppler factor of a live 3d audio source
   FFI_PLUGIN_EXPORT void set3dSourceDopplerFactor(unsigned int handle,
                                                   float dopplerFactor)
   {
-    if (player.get() == nullptr || !player.get()->isInited() ||
-        player.get()->getSoundsCount() == 0)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited() ||
+        pin.get()->getSoundsCount() == 0)
       return;
-    player.get()->set3dSourceDopplerFactor(handle, dopplerFactor);
-    player.get()->update3dAudio();
+    pin.get()->set3dSourceDopplerFactor(handle, dopplerFactor);
+    pin.get()->update3dAudio();
   }
 
   /////////////////////////////////////////
@@ -4397,18 +4533,20 @@ extern "C"
   /// Returns a unique bus ID (>0) to reference this bus in other calls.
   FFI_PLUGIN_EXPORT unsigned int createBus()
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return 0;
-    return player.get()->createBus();
+    return pin.get()->createBus();
   }
 
   /// Destroy a mixing bus by its ID.
   /// Does not stop voices that were playing through the bus.
   FFI_PLUGIN_EXPORT void destroyBus(unsigned int busId)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return;
-    player.get()->destroyBus(busId);
+    pin.get()->destroyBus(busId);
   }
 
   /// Play the bus itself on the main SoLoud engine so it becomes audible.
@@ -4431,14 +4569,15 @@ extern "C"
                                                       float volume, bool paused,
                                                       unsigned int *handle)
   {
+    const PlayerPin pin(PlayerPinKind::operation);
     // Zero it before the guard below: `Player::busPlayOnEngine()` always sets
     // it, but this early return would otherwise leave the caller's buffer
     // untouched. On the web that buffer comes from `_malloc()`, which does not
     // zero, so Dart would read uninitialized memory as a handle.
     *handle = 0;
-    if (player.get() == nullptr)
+    if (pin.get() == nullptr)
       return backendNotInited;
-    return player.get()->busPlayOnEngine(busId, volume, paused, *handle);
+    return pin.get()->busPlayOnEngine(busId, volume, paused, *handle);
   }
 
   /// Set the number of output channels for the bus (default is 2 = stereo).
@@ -4450,9 +4589,10 @@ extern "C"
   FFI_PLUGIN_EXPORT int busSetChannels(unsigned int busId,
                                        unsigned int channels)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return -1;
-    return player.get()->busSetChannels(busId, channels);
+    return pin.get()->busSetChannels(busId, channels);
   }
 
   /// Enable or disable visualization for this bus. Its packets go to the
@@ -4470,10 +4610,11 @@ extern "C"
   FFI_PLUGIN_EXPORT enum PlayerErrors busSetVisualizationEnabled(
       unsigned int busId, bool enabled, int windowSize, int kind, int channel)
   {
-    if (player.get() == nullptr || !player.get()->isInited())
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
     Analyzer::setDataCallback(dispatchVisualizationToDart);
-    return player.get()->busSetVisualizationEnabled(
+    return pin.get()->busSetVisualizationEnabled(
         busId, enabled, windowSize, static_cast<VisualizationKind>(kind),
         channel);
   }
@@ -4484,9 +4625,10 @@ extern "C"
   /// Return 1 if enabled.
   FFI_PLUGIN_EXPORT int busGetVisualizationEnabled(unsigned int busId)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return 0;
-    return player.get()->busIsVisualizationEnabled(busId) ? 1 : 0;
+    return pin.get()->busIsVisualizationEnabled(busId) ? 1 : 0;
   }
 
   /// Get the approximate output volume for a specific channel of this bus.
@@ -4500,9 +4642,10 @@ extern "C"
   FFI_PLUGIN_EXPORT float busGetApproximateVolume(unsigned int busId,
                                                   unsigned int channel)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return 0.0f;
-    return player.get()->busGetApproximateVolume(busId, channel);
+    return pin.get()->busGetApproximateVolume(busId, channel);
   }
 
   /// Move a live voice (identified by its handle) into this bus.
@@ -4515,9 +4658,10 @@ extern "C"
   FFI_PLUGIN_EXPORT void busAnnexSound(unsigned int busId,
                                        unsigned int voiceHandle)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return;
-    player.get()->busAnnexSound(busId, voiceHandle);
+    pin.get()->busAnnexSound(busId, voiceHandle);
   }
 
   /// Get the number of voices currently playing through this bus.
@@ -4526,9 +4670,10 @@ extern "C"
   /// Returns the active voice count, or 0 if the bus is not found.
   FFI_PLUGIN_EXPORT unsigned int busGetActiveVoiceCount(unsigned int busId)
   {
-    if (player.get() == nullptr)
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr)
       return 0;
-    return player.get()->busGetActiveVoiceCount(busId);
+    return pin.get()->busGetActiveVoiceCount(busId);
   }
 
 #ifdef __cplusplus

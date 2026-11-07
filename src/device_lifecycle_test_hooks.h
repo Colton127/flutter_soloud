@@ -138,6 +138,11 @@ namespace soloud_test
     /// for one). A disposal started while a caller is parked here must not
     /// destroy the sound under it.
     soundUseLookedUp,
+    /// In the PlayerPin constructor, right after an operation pin has been
+    /// taken and player_pin_mutex released, before the export holding it
+    /// checks or uses the Player. A teardown started while an export is
+    /// parked here must not dispose, destroy or replace that Player.
+    playerOperationPinned,
     barrierCount
   };
 
