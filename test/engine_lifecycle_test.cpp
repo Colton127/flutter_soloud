@@ -140,6 +140,14 @@ extern "C"
                            int loopingStartOffsetAt, int loopingEndOffsetAt,
                            float scale, unsigned int *handle);
     double getLength(unsigned int soundHash);
+    enum PlayerErrors stop(unsigned int handle);
+    enum PlayerErrors setPause(unsigned int handle, bool pause);
+    enum PlayerErrors seek(unsigned int handle, float time);
+    double getPosition(unsigned int handle);
+    double getVolume(unsigned int handle);
+    enum PlayerErrors setVolume(unsigned int handle, float volume);
+    int countAudioSource(unsigned int soundHash);
+    void set3dListenerPosition(float posX, float posY, float posZ);
     enum PlayerErrors changeDevice(int deviceID);
     enum PlayerErrors startAudioDevice();
     enum PlayerErrors stopAudioDevice(unsigned int force);
@@ -1794,8 +1802,8 @@ bool isLoadedAndPlaying(const PlayingSound &sound)
 }
 
 /// The Dart contract: once the call returns the sound is gone and none of its
-/// voices is left. Read through sound pins, which a parked device operation
-/// does not hold up.
+/// voices is left. Read through operation pins, which a parked device
+/// operation does not hold up.
 void expectDisposed(const PlayingSound &sound, const char *call,
                     const char *scenario)
 {
@@ -2078,8 +2086,8 @@ void testDisposeDuringTeardownWaitingForADeviceOperation()
                              dispose();
                              disposed = true; });
 
-    // Device pins refused, sound pins still accepted: teardown is waiting for
-    // the parked change and has not started on the Player.
+    // Device pins refused, operation pins still accepted: teardown is waiting
+    // for the parked change and has not started on the Player.
     EXPECT(waitFor([]
                    { return soloudTestRefusedPlayerPins() == 1; }),
            "teardown should be waiting for the pinned device change (pins "
@@ -2217,10 +2225,181 @@ void testDisposeWhileTeardownDisposesThePlayer()
     resetGlobalState();
 }
 
+/// How long a teardown is given to finish while a call it must wait for is
+/// parked. One that does not wait finishes well within it.
+constexpr int kTeardownGraceMs = 100;
+
+/// Like playWaveform(), but a sampled sound, which unlike a waveform can be
+/// seeked.
+PlayingSound playSampled()
+{
+    PlayingSound sound;
+    const std::vector<unsigned char> wav = makeWavBytes();
+    char name[] = "control-call-check";
+    if (loadMem(name, const_cast<unsigned char *>(wav.data()),
+                static_cast<int>(wav.size()), 1, &sound.hash) != noError)
+        return PlayingSound();
+    for (unsigned int &voice : sound.voices)
+        play(sound.hash, 0, 0.0f, 0.0f, /*paused*/ false, /*looping*/ true, 0,
+             0, -1, -1, 1.0f, &voice);
+    return sound;
+}
+
+/// An export a teardown has to wait for, and how to tell what it ran against.
+struct ControlCall
+{
+    const char *name;
+    /// Run before the call is parked, to give it something to observe.
+    std::function<void(const PlayingSound &)> prepare;
+    /// Makes the call; true when its result is a live engine's.
+    std::function<bool(const PlayingSound &)> live;
+    /// Makes it again; true when its result is a torn-down engine's.
+    std::function<bool(const PlayingSound &)> tornDown;
+};
+
+/// The calls Dart makes synchronously to control playback -- setVolume(),
+/// getPosition(), seek(), play() and the rest -- pin the Player. A teardown
+/// started while one is running waits for it before disposing, destroying or
+/// replacing that Player, and a call made meanwhile is refused at once. Each
+/// call is parked right after taking its pin: before pins covered them, a
+/// teardown on another thread could destroy the Player under a call that had
+/// already found it initialized.
+void testControlCallsKeepThePlayerAcrossTeardown()
+{
+    std::printf("control calls keep the Player alive across a teardown\n");
+
+    const auto nothing = [](const PlayingSound &) {};
+    const auto playOnce = [](const PlayingSound &sound, unsigned int &voice)
+    {
+        return play(sound.hash, 0, 0.0f, 0.0f, /*paused*/ false,
+                    /*looping*/ true, 0, 0, -1, -1, 1.0f, &voice);
+    };
+    const std::vector<ControlCall> calls = {
+        {"setVolume()", nothing,
+         [](const PlayingSound &s)
+         { return setVolume(s.voices[0], 0.5f) == noError; },
+         [](const PlayingSound &s)
+         { return setVolume(s.voices[0], 0.5f) == backendNotInited; }},
+        {"getVolume()",
+         [](const PlayingSound &s)
+         { setVolume(s.voices[0], 0.25f); },
+         [](const PlayingSound &s)
+         { return std::fabs(getVolume(s.voices[0]) - 0.25) < 1e-6; },
+         [](const PlayingSound &s)
+         { return getVolume(s.voices[0]) == 0.0; }},
+        {"setPause()", nothing,
+         [](const PlayingSound &s)
+         { return setPause(s.voices[0], true) == noError; },
+         [](const PlayingSound &s)
+         { return setPause(s.voices[0], true) == backendNotInited; }},
+        {"seek()", nothing,
+         [](const PlayingSound &s)
+         { return seek(s.voices[0], 0.05f) == noError; },
+         [](const PlayingSound &s)
+         { return seek(s.voices[0], 0.05f) == backendNotInited; }},
+        {"getPosition()",
+         [](const PlayingSound &s)
+         {
+             // Paused, so the position stays where the seek put it.
+             setPause(s.voices[0], true);
+             seek(s.voices[0], 0.05f);
+         },
+         [](const PlayingSound &s)
+         { return std::fabs(getPosition(s.voices[0]) - 0.05) < 1e-3; },
+         [](const PlayingSound &s)
+         { return getPosition(s.voices[0]) == 0.0; }},
+        {"play()", nothing,
+         [playOnce](const PlayingSound &s)
+         {
+             unsigned int voice = 0;
+             return playOnce(s, voice) == noError && voice != 0;
+         },
+         [playOnce](const PlayingSound &s)
+         {
+             unsigned int voice = 0;
+             return playOnce(s, voice) == backendNotInited;
+         }},
+        {"countAudioSource()", nothing,
+         [](const PlayingSound &s)
+         { return countAudioSource(s.hash) == 2; },
+         [](const PlayingSound &s)
+         { return countAudioSource(s.hash) == 0; }},
+    };
+
+    using soloud_test::DeviceBarrier;
+    for (const ControlCall &call : calls)
+    {
+        resetGlobalState();
+        if (!initEngineAs(kEngineA))
+        {
+            EXPECT(false, "the engine should initialize");
+            return;
+        }
+        registerCallbacksFor(kEngineA);
+        const PlayingSound sound = playSampled();
+        EXPECT(isLoadedAndPlaying(sound),
+               "%s: the test sound should load and play", call.name);
+        call.prepare(sound);
+
+        soloud_test::armBarrier(DeviceBarrier::playerOperationPinned);
+        std::atomic<bool> ranLive{false};
+        std::thread caller([&]
+                           { ranLive = call.live(sound); });
+        soloud_test::waitBarrierReached(DeviceBarrier::playerOperationPinned);
+
+        std::atomic<bool> tornDown{false};
+        std::thread teardown([&tornDown]
+                             {
+                                 dispose();
+                                 tornDown = true; });
+
+        // Both kinds refused: teardown has nothing left to wait for but the
+        // parked call.
+        EXPECT(waitFor([]
+                       { return soloudTestRefusedPlayerPins() == 3; }),
+               "%s: teardown should be waiting for the parked call (pins "
+               "refused: %d)",
+               call.name, soloudTestRefusedPlayerPins());
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kTeardownGraceMs));
+        EXPECT(!tornDown.load(), "%s: teardown must wait for the parked call",
+               call.name);
+
+        std::atomic<bool> refused{false};
+        TimedCall late([&]
+                       { refused = call.tornDown(sound); });
+        const long long lateMs = late.waitMs();
+        EXPECT(lateMs >= 0 && lateMs < kDisposeBudgetMs && refused.load(),
+               "%s: a call made while teardown waits should be refused at "
+               "once: %lldms (-1: blocked), %s",
+               call.name, lateMs, refused.load() ? "refused" : "not refused");
+
+        soloud_test::releaseBarrier(DeviceBarrier::playerOperationPinned);
+        caller.join();
+        teardown.join();
+
+        EXPECT(ranLive.load(),
+               "%s, parked across the teardown, should have run against the "
+               "live engine",
+               call.name);
+        EXPECT(isInited() == 0 && soloudTestPlayerIsInited() == 0 &&
+                   soloudTestSoundCount() == 0,
+               "%s: the engine should be torn down once the call returned",
+               call.name);
+        EXPECT(soloudTestRefusedPlayerPins() == 0,
+               "%s: pins should be accepted again after teardown", call.name);
+        std::printf("  %s: teardown waited; a call meanwhile took %lldms\n",
+                    call.name, lateMs);
+    }
+
+    resetGlobalState();
+}
+
 /// Pins against teardown and re-initialization under ThreadSanitizer: device
-/// operations and dispose calls hammer the engine while it is torn down and
-/// brought back up. Nothing here is asserted beyond completing; a pin that
-/// let either reach a freed or replaced Player is a crash or a TSan report.
+/// operations, dispose calls and control calls hammer the engine while it is
+/// torn down and brought back up. Nothing here is asserted beyond completing;
+/// a pin that let any of them reach a freed or replaced Player is a crash, an
+/// ASan report or a TSan report.
 void testPinsSurviveConcurrentTeardownAndInit()
 {
     std::printf("pinned calls race teardown and re-initialization\n");
@@ -2229,6 +2408,7 @@ void testPinsSurviveConcurrentTeardownAndInit()
     std::atomic<bool> stop{false};
     std::atomic<int> deviceCalls{0};
     std::atomic<int> disposeCalls{0};
+    std::atomic<int> controlCalls{0};
 
     std::thread devices([&]
                         {
@@ -2249,6 +2429,26 @@ void testPinsSurviveConcurrentTeardownAndInit()
                                soloudTestSoundIsLoaded(hash);
                                disposeCalls += 2;
                            } });
+    std::thread controls([&]
+                         {
+                             while (!stop.load())
+                             {
+                                 unsigned int hash = 0;
+                                 unsigned int voice = 0;
+                                 loadWaveform(0, false, 1.0f, 1.0f, &hash);
+                                 play(hash, 0, 0.0f, 0.0f, false, true, 0, 0,
+                                      -1, -1, 1.0f, &voice);
+                                 setVolume(voice, 0.5f);
+                                 getVolume(voice);
+                                 setPause(voice, true);
+                                 setPause(voice, false);
+                                 seek(voice, 0.1f);
+                                 getPosition(voice);
+                                 countAudioSource(hash);
+                                 set3dListenerPosition(1.0f, 0.0f, 0.0f);
+                                 ::stop(voice); // `stop` is the flag here.
+                                 controlCalls += 11;
+                             } });
 
     for (int round = 0; round < 4; ++round)
     {
@@ -2261,12 +2461,13 @@ void testPinsSurviveConcurrentTeardownAndInit()
     stop = true;
     devices.join();
     sounds.join();
+    controls.join();
 
     EXPECT(soloudTestRefusedPlayerPins() == 0,
            "pins should be accepted again once teardown is done");
-    std::printf("  ok: %d device calls and %d dispose calls raced 4 "
-                "teardowns\n",
-                deviceCalls.load(), disposeCalls.load());
+    std::printf("  ok: %d device calls, %d dispose calls and %d control "
+                "calls raced 4 teardowns\n",
+                deviceCalls.load(), disposeCalls.load(), controlCalls.load());
     resetGlobalState();
 }
 
@@ -2326,6 +2527,7 @@ int main()
     testDisposeDoesNotWaitForInitialization();
     testDisposeDuringTeardownWaitingForADeviceOperation();
     testDisposeWhileTeardownDisposesThePlayer();
+    testControlCallsKeepThePlayerAcrossTeardown();
     testPinsSurviveConcurrentTeardownAndInit();
 
     {
