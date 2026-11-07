@@ -94,6 +94,23 @@ namespace soloud_test
     /// looked up by hash and before data is added to it. A disposal started
     /// while a feeder is parked here must not destroy the stream under it.
     pullDataSoundLookedUp,
+    /// At the end of a PullBufferStream seek out of the buffered range, in
+    /// PullBufferStreamInstance::seek(): the buffer has been discarded and the
+    /// seek stays pending until data at its target has been decoded. SoLoud
+    /// applies seeks with its audio mutex held, usually on the mixer thread.
+    pullSeekPending,
+    /// In PullBufferStream::addAudioData(), after the delivered bytes have
+    /// been queued for decoding and before the delivering thread decodes
+    /// them. While a feeder is parked here the mixer can decode them itself
+    /// (PullBufferStream::tryDecodePendingData()).
+    pullDataQueued,
+    /// In PullBufferStream::applyPendingSeek(), right after data decoded at
+    /// the target has completed a pending seek, before the buffering check a
+    /// delivering thread runs next.
+    pullSeekCompleted,
+    /// At the top of PullBufferStream::checkBuffering(), which runs only on a
+    /// thread delivering data, holding sounds_mutex, and never on the mixer.
+    pullBufferingCheckEntered,
     barrierCount
   };
 

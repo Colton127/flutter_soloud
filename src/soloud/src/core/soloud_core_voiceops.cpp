@@ -231,7 +231,11 @@ namespace SoLoud
 //   other lock holder applies only seeks whose source opts in as cheap.
 // - publishVoiceState(s)_internal(): run by stopVoice_internal(),
 //   insertVoice_internal() and unlockAudioMutex_internal().
-// - readVoiceState_internal(): lock-free reader for the getters.
+// - readVoiceState_internal(): lock-free reader for the getters. Not for
+//   the audio thread, nor for a source's getAudio() or seek() it runs: a
+//   reader spins, then yields, while a control thread is between its two
+//   sequence stores, and a voice group's read takes mVoiceGroupMutex. The
+//   mix reads mVoice directly.
 //
 // The audio thread blocks on nothing but the audio mutex. It never takes
 // mVoiceGroupMutex and only try-locks mVoiceCommandMutex (a control call

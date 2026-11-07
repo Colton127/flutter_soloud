@@ -118,12 +118,29 @@ private:
     Done           ///< Duration has been reported.
   };
 
+  /// Pauses the voice when the decoded audio runs low and resumes it once
+  /// enough is buffered again.
+  ///
+  /// Runs only on a thread delivering data, under Player::sounds_mutex
+  /// (Player::addPullBufferDataStream() is the only caller of addAudioData()),
+  /// and never on the audio thread. It reads the voice's entry in the sound's
+  /// handle list and writes its user-paused flag, which sounds_mutex protects,
+  /// and it calls Player::getPause()/setPause(): the getter can wait for
+  /// another thread that is publishing a queued command, and setPause() posts
+  /// device lifecycle requests. Mixing a voice never needs it: the mixer only
+  /// drains the buffer and asks for more, and the delivery that answers runs
+  /// the check.
   void checkBuffering();
   void requestMoreDataIfNeeded();
   void decodePendingData();
-  void decodePendingDataLocked();
+  /// [aOnAudioThread]: called from the mixer (tryDecodePendingData()), which
+  /// must not run checkBuffering(); see applyPendingSeek().
+  void decodePendingDataLocked(bool aOnAudioThread = false);
   void tryDecodePendingData();
-  void applyPendingSeek();
+  /// Completes a pending seek once data at the target has been decoded, then
+  /// runs checkBuffering() -- unless [aOnAudioThread]: the mixer completing
+  /// the seek leaves the check to the next delivery (see checkBuffering()).
+  void applyPendingSeek(bool aOnAudioThread = false);
   void drainBacklog();
   void drainBacklogLocked();
   void probeDurationFromFirstChunk();
