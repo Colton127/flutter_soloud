@@ -3738,24 +3738,12 @@ int Player::countAudioSource(unsigned int soundHash)
     SoundsLock lock(sounds_mutex, *this);
     auto const &s = findByHash(soundHash);
 
-    if (s == nullptr)
+    if (s == nullptr || !s->sound)
         return 0;
 
-    SoLoud::AudioSource *as;
-    switch (s->soundType)
-    {
-    case TYPE_SYNTH:
-        return 0;
-    case TYPE_WAV:
-        as = static_cast<SoLoud::Wav *>(s->sound.get());
-    case TYPE_WAVSTREAM:
-        as = static_cast<SoLoud::WavStream *>(s->sound.get());
-    case TYPE_BUFFER_STREAM:
-        as = static_cast<SoLoud::BufferStream *>(s->sound.get());
-    default:
-        return 0;
-    }
-    return soloud.countAudioSource(*as);
+    // Every kind of sound is a SoLoud::AudioSource, waveforms included, and
+    // SoLoud counts the voices playing it by the source's id.
+    return soloud.countAudioSource(*s->sound);
 }
 
 unsigned int Player::getVoiceCount()
