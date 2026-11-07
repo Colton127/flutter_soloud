@@ -111,6 +111,17 @@ namespace soloud_test
     /// At the top of PullBufferStream::checkBuffering(), which runs only on a
     /// thread delivering data, holding sounds_mutex, and never on the mixer.
     pullBufferingCheckEntered,
+    /// In PullBufferStreamInstance::seek(), for a target outside the buffered
+    /// range at a known encoded offset, and in rewind(): right before the
+    /// buffered audio and the queued bytes are discarded. SoLoud applies seeks
+    /// (and rewinds a looping voice) with its audio mutex held, usually on the
+    /// mixer thread.
+    pullSeekDiscarding,
+    /// In PullBufferStream::decodePendingDataLocked(), for raw PCM, after the
+    /// queued bytes have been converted and before they are written to the
+    /// buffer and dropped from the queue. The decoding thread holds the decode
+    /// mutex here: a delivery, or the mixer (tryDecodePendingData()).
+    pullDecoding,
     barrierCount
   };
 
