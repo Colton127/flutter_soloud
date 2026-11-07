@@ -1375,7 +1375,19 @@ PlayerErrors Player::addPullBufferDataStream(
     unsigned int aDataLen,
     uint64_t offset)
 {
+    // Held across the whole call, like addAudioDataStream(): a feeder thread
+    // must not decode into a stream that a concurrent disposeSound() or
+    // disposeAllSound() has destroyed. A SoundsLock: addAudioData() runs the
+    // stream's checkBuffering(), which can pause or unpause its voice and so
+    // ask for a device start or an idle evaluation.
+    //
+    // addAudioData() takes the stream's decode mutex under this one. Nothing
+    // holding the decode mutex waits for sounds_mutex (an automatic pause does
+    // not take it), and the audio thread only try-locks the decode mutex
+    // while it mixes, so this adds no cycle.
+    SoundsLock lock(sounds_mutex, *this);
     auto const s = findByHash(hash);
+    SOLOUD_TEST_BARRIER(pullDataSoundLookedUp);
 
     if (s == nullptr)
         return PlayerErrors::soundHashNotFound;
