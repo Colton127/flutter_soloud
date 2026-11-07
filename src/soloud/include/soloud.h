@@ -318,9 +318,15 @@ namespace SoLoud
 
 		// Called after a mix cycle in which a voice stopped or became paused.
 		// The callback runs after the audio mutex has been released.
-		std::atomic<void (*)()> _voiceInactiveCallback{nullptr};
+		// ###### flutter_soloud local patch (non-blocking idle request) ######
+		// It runs on the mixer's thread, so it must not wait for a lock. It
+		// returns false when it could not act without waiting; the mixer then
+		// calls it again after its next block (mVoiceInactiveCallbackRetry),
+		// until it returns true or no callback is set.
+		std::atomic<bool (*)()> _voiceInactiveCallback{nullptr};
 		bool mVoiceInactiveCallbackPending = false;
-		void setVoiceInactiveCallback(void (*voiceInactiveCallback)()) {
+		std::atomic<bool> mVoiceInactiveCallbackRetry{false};
+		void setVoiceInactiveCallback(bool (*voiceInactiveCallback)()) {
 			_voiceInactiveCallback.store(voiceInactiveCallback,
 				std::memory_order_release);
 		}

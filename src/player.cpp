@@ -381,7 +381,7 @@ void Player::setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int *))
     soloud.setVoiceEndedCallback(voiceEndedCallback);
 }
 
-void Player::setVoiceInactiveCallback(void (*voiceInactiveCallback)())
+void Player::setVoiceInactiveCallback(bool (*voiceInactiveCallback)())
 {
     soloud.setVoiceInactiveCallback(voiceInactiveCallback);
 }
@@ -1708,6 +1708,31 @@ void Player::evaluateAudioDeviceIdle()
         return;
     SOLOUD_TEST_LIFECYCLE_POST();
     std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    evaluateAudioDeviceIdleLocked();
+}
+
+bool Player::requestAudioDeviceIdleFromMixer()
+{
+    // Under a SoundsLock on this thread: posted when it is released.
+    if (deferLifecycleRequest(this, LifecycleRequest::idle))
+        return true;
+    // The mixer must not wait here. An OS interruption's handler holds this
+    // lock while it asks SoLoud for the active voice count, which waits for
+    // the audio mutex, applies queued voice commands, and can report ended
+    // voices on its thread (they take sounds_mutex); a lifecycle request
+    // from a control thread holds it too. While the mixer waited, nothing
+    // would be mixed, and on the web's AudioWorklet thread a wait on a
+    // contended lock aborts.
+    std::unique_lock<std::mutex> interruptionLock(mInterruptionMutex,
+                                                  std::try_to_lock);
+    if (!interruptionLock.owns_lock())
+        return false;
+    evaluateAudioDeviceIdleLocked();
+    return true;
+}
+
+void Player::evaluateAudioDeviceIdleLocked()
+{
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
         mInterruptionActive.load(std::memory_order_acquire))
@@ -1739,6 +1764,7 @@ void Player::audioInterruptionCallback(void *context, bool began)
 void Player::handleAudioInterruption(bool began)
 {
     std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    SOLOUD_TEST_BARRIER(audioInterruptionLocked);
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
         return;

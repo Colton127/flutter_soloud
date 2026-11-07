@@ -634,6 +634,36 @@ extern "C"
       player->evaluateAudioDeviceIdle();
   }
 
+#if defined(__EMSCRIPTEN__) && defined(MA_ENABLE_AUDIO_WORKLETS)
+  /// Entry point posted from the AudioWorklet rendering thread to the main
+  /// browser thread (see voiceInactiveFromMixer).
+  static void voiceInactiveForwardToMain()
+  {
+    if (player != nullptr)
+      player->evaluateAudioDeviceIdle();
+  }
+#endif
+
+  /// SoLoud's voice-inactive callback: the mixer, after a block in which a
+  /// voice stopped or paused, asks for a device-idle evaluation. It must not
+  /// wait for a lock (see Player::requestAudioDeviceIdleFromMixer()); false
+  /// makes the mixer ask again after its next block.
+  static bool voiceInactiveFromMixer()
+  {
+#if defined(__EMSCRIPTEN__) && defined(MA_ENABLE_AUDIO_WORKLETS)
+    if (!emscripten_is_main_browser_thread())
+    {
+      // On the AudioWorklet rendering thread the evaluation counts voices,
+      // which takes SoLoud's audio mutex; a contended lock there aborts (see
+      // voiceEndedCallback). Evaluate on the main browser thread instead.
+      emscripten_audio_worklet_post_function_v(EMSCRIPTEN_AUDIO_MAIN_THREAD,
+                                               voiceInactiveForwardToMain);
+      return true;
+    }
+#endif
+    return player == nullptr || player->requestAudioDeviceIdleFromMixer();
+  }
+
   /// The callback to monitor when a file is loaded.
   ///
   /// [registrationGeneration] is the global registration that was live when
@@ -1303,7 +1333,7 @@ extern "C"
 
     // Set the callback for when a voice is ended/stopped
     player.get()->setVoiceEndedCallback(voiceEndedCallback);
-    player.get()->setVoiceInactiveCallback(voiceInactiveCallback);
+    player.get()->setVoiceInactiveCallback(voiceInactiveFromMixer);
     Analyzer::setDataCallback(dispatchVisualizationToDart);
 
 #if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
