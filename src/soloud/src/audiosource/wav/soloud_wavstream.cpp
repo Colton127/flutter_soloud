@@ -111,7 +111,15 @@ namespace SoLoud
 		{
 			DiskFile *df = new DiskFile;
 			mFile = df;
-			df->open(aParent->mFilename);
+			// ###### flutter_soloud local patch (wavstream missing file) ######
+			// The file may have been deleted or moved since the source was
+			// loaded. Without it the voice has nothing to play and ends (see
+			// hasEnded()); the decoders must not read a file that is not open.
+			if (df->open(aParent->mFilename) != SO_NO_ERROR)
+			{
+				delete df;
+				mFile = 0;
+			}
 		}
 		else
 		if (aParent->mStreamFile)
@@ -912,6 +920,14 @@ namespace SoLoud
 
 	bool WavStreamInstance::hasEnded()
 	{
+		// ###### flutter_soloud local patch (wavstream missing file) ######
+		// No file: it could not be opened, or no decoder accepted it.
+		// getAudio() plays nothing, so the voice ends instead of staying
+		// silent forever.
+		if (mFile == NULL)
+		{
+			return 1;
+		}
 		// ###### flutter_soloud local patch (bounded wavstream seek) ######
 		// A seek at or past the end, or one that ran into the end.
 		if (mSeekAtEnd)
