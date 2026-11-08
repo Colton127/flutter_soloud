@@ -2604,6 +2604,9 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// Throws [SoLoudFileNotFoundException] if [sound] streams from a file
+  /// ([LoadMode.disk]) that has been deleted or moved since it was loaded.
   SoundHandle play(
     AudioSource sound, {
     int busId = 0,
@@ -2746,6 +2749,9 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// Throws [SoLoudFileNotFoundException] if [sound] streams from a file
+  /// ([LoadMode.disk]) that has been deleted or moved since it was loaded.
   SoundHandle playClocked(
     AudioSource sound,
     Duration soundTime, {
@@ -2991,6 +2997,9 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// Throws [SoLoudFileNotFoundException] if [sound] streams from a file
+  /// ([LoadMode.disk]) that has been deleted or moved since it was loaded.
   SoundHandle playScheduled(
     AudioSource sound,
     Duration atTime, {
@@ -4521,6 +4530,9 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// Throws [SoLoudFileNotFoundException] if [sound] streams from a file
+  /// ([LoadMode.disk]) that has been deleted or moved since it was loaded.
   SoundHandle play3d(
     AudioSource sound,
     double posX,
@@ -4647,6 +4659,9 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// Throws [SoLoudFileNotFoundException] if [sound] streams from a file
+  /// ([LoadMode.disk]) that has been deleted or moved since it was loaded.
   SoundHandle play3dClocked(
     AudioSource sound,
     Duration soundTime,
@@ -4770,6 +4785,9 @@ interface class SoLoud {
   ///
   /// Throws [SoLoudFailedToStartPlaybackCppException] if the audio engine
   /// could not create a voice for this sound.
+  ///
+  /// Throws [SoLoudFileNotFoundException] if [sound] streams from a file
+  /// ([LoadMode.disk]) that has been deleted or moved since it was loaded.
   ///
   /// The schedule is expressed in samples against the engine clock, which only
   /// advances while the output device is mixing, so a voice scheduled against a

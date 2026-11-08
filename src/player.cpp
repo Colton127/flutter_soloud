@@ -8,6 +8,7 @@
 #include "soloud/include/soloud.h"
 #include "soloud_wav.h"
 // #include "soloud_thread.h"
+#include "soloud_file.h"
 #include "soloud_wavstream.h"
 #include "synth/basic_wave.h"
 #include "soloud/src/backend/miniaudio/miniaudio.h"
@@ -2800,6 +2801,26 @@ unsigned int Player::getActiveVoiceCount_internal()
     return count;
 }
 
+/// A sound streamed from disk (LoadMode.disk) keeps only its file's path, and
+/// each voice opens the file again. If the file has been deleted or moved since
+/// the sound was loaded, report that instead of starting a voice that has
+/// nothing to play: it would end as soon as it is mixed or, looping, stay
+/// silent until stopped. A file that goes between this check and the voice
+/// opening it only gives a voice that ends (see WavStreamInstance::hasEnded()).
+static PlayerErrors checkStreamedFile(const ActiveSound &sound)
+{
+    if (sound.soundType != TYPE_WAVSTREAM)
+        return PlayerErrors::noError;
+    const char *path =
+        static_cast<const SoLoud::WavStream *>(sound.sound.get())->mFilename;
+    // Streamed from memory.
+    if (path == nullptr)
+        return PlayerErrors::noError;
+    SoLoud::DiskFile file;
+    return file.open(path) == SoLoud::SO_NO_ERROR ? PlayerErrors::noError
+                                                  : PlayerErrors::fileNotFound;
+}
+
 PlayerErrors Player::play(
     unsigned int soundHash,
     unsigned int &handle,
@@ -2839,6 +2860,10 @@ PlayerErrors Player::play(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if playing this sound will exceed the maximum number of voice counts. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -2964,6 +2989,10 @@ PlayerErrors Player::playClocked(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if playing this sound will exceed the maximum number of voice counts. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -3091,6 +3120,10 @@ PlayerErrors Player::playScheduled(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if playing this sound will exceed the maximum number of voice counts. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -3970,6 +4003,10 @@ PlayerErrors Player::play3d(
         return bufferStreamCanBePlayedOnlyOnce;
     }
 
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
+
     // Check if by playing this sound will exceed the maximum number of voice count. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
@@ -4106,6 +4143,10 @@ PlayerErrors Player::play3dClocked(
         return bufferStreamCanBePlayedOnlyOnce;
     }
 
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
+
     // Check if by playing this sound will exceed the maximum number of voice count. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
@@ -4220,6 +4261,10 @@ PlayerErrors Player::play3dScheduled(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if by playing this sound will exceed the maximum number of voice count. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
