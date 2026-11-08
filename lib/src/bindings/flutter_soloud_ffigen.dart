@@ -2885,7 +2885,18 @@ enum PlayerStateEvents {
   ///
   /// WARNING: Keep in sync with `PlayerStateNotification` in
   /// `lib/src/enums.dart`; the Dart side indexes this by ordinal.
-  event_audio_device_start_failed(6);
+  event_audio_device_start_failed(6),
+
+  /// The output device has kept reporting itself started while its data
+  /// callback stopped being called for longer than the stall threshold, so
+  /// nothing is mixed and voices do not advance. Emitted once per stall by the
+  /// player's device-callback watchdog, not by the OS. Report only: nothing
+  /// is recovered automatically.
+  ///
+  /// WARNING: Keep in sync with `PlayerStateNotification` in
+  /// `lib/src/enums.dart`; the Dart side indexes this by ordinal. Append new
+  /// events after this one, never before.
+  event_audio_device_stalled(7);
 
   final int value;
   const PlayerStateEvents(this.value);
@@ -2898,6 +2909,7 @@ enum PlayerStateEvents {
     4 => event_interruption_ended,
     5 => event_unlocked,
     6 => event_audio_device_start_failed,
+    7 => event_audio_device_stalled,
     _ => throw ArgumentError('Unknown value for PlayerStateEvents: $value'),
   };
 }

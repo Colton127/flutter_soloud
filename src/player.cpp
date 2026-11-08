@@ -8,6 +8,7 @@
 #include "soloud/include/soloud.h"
 #include "soloud_wav.h"
 // #include "soloud_thread.h"
+#include "soloud_file.h"
 #include "soloud_wavstream.h"
 #include "synth/basic_wave.h"
 #include "soloud/src/backend/miniaudio/miniaudio.h"
@@ -40,6 +41,37 @@ namespace
     constexpr unsigned int kOggXiphBufferStreamMaxBytes = 512u * 1024u * 1024u;
     constexpr int64_t kDefaultIdleTimeoutMs = 500;
     constexpr int64_t kMaxIdleWaitChunkMs = 24LL * 60 * 60 * 1000;
+
+    // Device-callback stall watchdog (see Player::stallWatchdogLoop()).
+    //
+    // A started device calls its data callback about once per device period:
+    // tens of milliseconds at the configured buffer sizes. Legitimate gaps are
+    // a few periods at most -- a backend that batches periods (Bluetooth, an
+    // OS that raises the IO buffer duration in the background), or a reroute
+    // reopening its stream -- and stay well under a second. So a started
+    // device is reported once its callback has been silent for
+    // kDeviceStallThresholdPeriods periods, but never sooner than
+    // kMinDeviceStallThresholdMs: the floor is what keeps scheduling hiccups
+    // and backend quirks from ever looking like a stall, and is still short
+    // enough that an app returning to the foreground learns within seconds.
+    // The period term only matters for very large buffers (2 s / 8 = 250 ms
+    // per period), where a fixed floor would undercut the cadence itself.
+    constexpr int64_t kMinDeviceStallThresholdMs = 2000;
+    constexpr int64_t kDeviceStallThresholdPeriods = 8;
+#ifndef __EMSCRIPTEN__
+    // (The web build has no watchdog thread; see stallWatchdogLoop().)
+    //
+    // The watchdog samples this many times per threshold, so a stall is
+    // reported between one threshold and one threshold plus a sample interval
+    // after the last callback, and has been seen by several consecutive
+    // samples by then.
+    constexpr int64_t kDeviceStallSamplesPerThreshold = 4;
+    // A wake-up later than its interval plus this slack (and never less than
+    // this floor) is taken for a frozen watchdog: a suspended process, not a
+    // scheduling delay. Ordinary wake-up jitter, even under load, is far
+    // below it; an iOS or Android process freeze is seconds to hours.
+    constexpr int64_t kMinDeviceStallWakeSlackMs = 250;
+#endif
 
     // Device lifecycle configuration outlives each Player instance so a native
     // deinit/reinit cycle preserves the user's timeout policy.
@@ -268,6 +300,8 @@ Player::Player() : mFilters(&soloud, nullptr, nullptr),
                        gAudioDeviceIdleTimeoutMs.load(
                            std::memory_order_acquire))
 {
+    mDeferredHandleRemovals.reserve(kMaxDeferredHandleRemovals);
+    mHandleRemovalsToApply.reserve(kMaxDeferredHandleRemovals);
 }
 
 Player::~Player()
@@ -297,6 +331,13 @@ Player::~Player()
         {
         }
     }
+    try
+    {
+        stopStallWatchdog();
+    }
+    catch (...)
+    {
+    }
 #endif
 }
 
@@ -313,6 +354,10 @@ void Player::dispose()
     mInterruptionActive.store(false, std::memory_order_release);
     mInited.store(false, std::memory_order_release);
     stopPauseEngineScheduler();
+    // Joined before the backend goes away, so no sample or event can outlive
+    // the engine. Never blocks for long: the watchdog only ever waits on its
+    // own condition variable.
+    stopStallWatchdog();
 
     // The scheduler join above waits for any device operation it was already
     // performing. Keep the same serialization lock held through the remaining
@@ -339,7 +384,7 @@ void Player::setVoiceEndedCallback(void (*voiceEndedCallback)(unsigned int *))
     soloud.setVoiceEndedCallback(voiceEndedCallback);
 }
 
-void Player::setVoiceInactiveCallback(void (*voiceInactiveCallback)())
+void Player::setVoiceInactiveCallback(bool (*voiceInactiveCallback)())
 {
     soloud.setVoiceInactiveCallback(voiceInactiveCallback);
 }
@@ -357,6 +402,7 @@ namespace SoLoud { ma_result miniaudio_listPlaybackDevices(std::vector<ma_device
 namespace SoLoud { SoLoud::result miniaudio_stopAudioDevice(); }
 namespace SoLoud { SoLoud::result miniaudio_startAudioDevice(); }
 namespace SoLoud { unsigned int miniaudio_getAudioDeviceState(); }
+namespace SoLoud { bool miniaudio_sampleDataCallbackLiveness(unsigned int *aState, unsigned int *aCallbackCount, unsigned int *aRunGeneration); }
 
 PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsigned int channels, int deviceID, bool lowLatency, unsigned int devicePeriodFrames, unsigned int renderAheadFrames)
 {
@@ -430,12 +476,17 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
         mSampleRate = sampleRate;
         mBufferSize = bufferSize;
         mChannels = channels;
-        // Start the deferred-pause scheduler now that the engine is in use.
-        // Thread creation is part of initialization: if it fails, leave no
-        // initialized backend or partially published lifecycle state behind.
+        // Before the watchdog thread exists: it reads this without a lock.
+        mStallThresholdMs = computeDeviceStallThresholdMs();
+        // Start the deferred-pause scheduler and the device-callback stall
+        // watchdog now that the engine is in use. Thread creation is part of
+        // initialization: if it fails, leave no initialized backend or
+        // partially published lifecycle state behind.
         try {
             startPauseEngineScheduler();
+            startStallWatchdog();
         } catch (...) {
+            stopStallWatchdog();
             stopPauseEngineScheduler();
             soloud.deinit();
             return backendNotInited;
@@ -642,8 +693,17 @@ bool Player::isInited()
 
 int Player::getSoundsCount()
 {
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     return (int)sounds.size();
+}
+
+int Player::getSoundHandleCount(unsigned int soundHash)
+{
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
+    for (const auto &sound : sounds)
+        if (sound && sound->soundHash == soundHash)
+            return (int)sound->handle.size();
+    return 0;
 }
 
 const std::string Player::getErrorString(PlayerErrors errorCode) const
@@ -904,7 +964,7 @@ PlayerErrors Player::registerSound(PendingSound pending, unsigned int &hash)
 
     pending.sound->filters = std::make_unique<Filters>(&soloud, pending.sound.get(), nullptr);
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
         sounds.push_back(std::move(pending.sound));
     }
     hash = newHash;
@@ -1116,6 +1176,155 @@ Player::PendingSound Player::decodeJoinedSources(
     return pending;
 }
 
+namespace
+{
+    /// Device lifecycle requests this thread made while it held
+    /// Player::sounds_mutex through a SoundsLock, kept for the outermost
+    /// SoundsLock to post once the mutex is released.
+    struct DeferredLifecycleRequests
+    {
+        const Player *player = nullptr; // the outermost SoundsLock's Player
+        int depth = 0;                  // SoundsLocks held on this thread
+        bool resume = false;            // resumeEngine() wanted
+        bool idle = false;              // evaluateAudioDeviceIdle() wanted
+    };
+
+    thread_local DeferredLifecycleRequests tDeferredLifecycle;
+
+    enum class LifecycleRequest
+    {
+        resume,
+        idle,
+    };
+
+    /// Record [request] for [player] when this thread holds a SoundsLock of
+    /// that Player. Returns false, recording nothing, when the caller must
+    /// post it itself.
+    bool deferLifecycleRequest(const Player *player, LifecycleRequest request)
+    {
+        DeferredLifecycleRequests &d = tDeferredLifecycle;
+        if (d.depth == 0 || d.player != player)
+            return false;
+        if (request == LifecycleRequest::resume)
+            d.resume = true;
+        else
+            d.idle = true;
+        return true;
+    }
+
+    /// Player::sounds_mutex, for a Player path that uses an ActiveSound or
+    /// calls into SoLoud while holding it.
+    ///
+    /// findByHash()/findByHandle() return a raw ActiveSound*, and
+    /// disposeSound()/disposeAllSound() stop a sound's voices, take it out of
+    /// `sounds` under this mutex, and destroy it after releasing it. Holding
+    /// the mutex from the lookup to the last use of the sound makes a use and
+    /// a disposal atomic with respect to each other: a play, for instance,
+    /// either finishes first, and its voice is among the ones the disposal
+    /// stops, or starts after, and finds no sound.
+    ///
+    /// No device lifecycle request is posted while it is held. A
+    /// resumeEngine() or evaluateAudioDeviceIdle() made on this thread under
+    /// it -- a buffer stream's checkBuffering() pausing or unpausing a voice,
+    /// a voice evicted at the active-voice limit, a pull stream's buffering
+    /// run by a mix ahead while this thread takes the audio mutex -- is
+    /// recorded instead and posted when the outermost SoundsLock on the
+    /// thread is released: the mutex first, then resumeEngine(), then
+    /// evaluateAudioDeviceIdle(). The idle evaluation goes last because the
+    /// scheduler's active-voice check is the authoritative one, and an idle
+    /// request never displaces a pending start (see requestDeviceLifecycle()),
+    /// so posting both is right when one voice paused and another unpaused.
+    /// Those posts take mInterruptionMutex. Nothing that holds it waits for
+    /// sounds_mutex -- an OS interruption's handler counts the active voices
+    /// without it, and a voice's end never waits for sounds_mutex (see
+    /// removeHandle()) -- and posting only once sounds_mutex is released keeps
+    /// it so: neither lock is ever taken while the other is held.
+    ///
+    /// Nesting is allowed (the mutex is recursive): an inner SoundsLock only
+    /// unlocks, and the outermost one posts. A plain lock_guard on
+    /// sounds_mutex is still right for a holder that neither calls into
+    /// SoLoud nor can pause, unpause or stop a voice.
+    ///
+    /// An automatic (buffering) pause or unpause does not take sounds_mutex
+    /// itself (see applyPauseState()): the buffering checks that make one
+    /// already hold it.
+    class SoundsLock
+    {
+    public:
+        SoundsLock(Player::SoundsMutex &mutex, Player &player)
+            : mLock(mutex), mPlayer(player)
+        {
+            enter();
+        }
+        /// Only tries the mutex: see ownsLock().
+        SoundsLock(Player::SoundsMutex &mutex, Player &player,
+                   std::try_to_lock_t)
+            : mLock(mutex, std::try_to_lock), mPlayer(player)
+        {
+            if (mLock.owns_lock())
+                enter();
+        }
+        bool ownsLock() const { return mLock.owns_lock(); }
+        ~SoundsLock() { release(); }
+        SoundsLock(const SoundsLock &) = delete;
+        SoundsLock &operator=(const SoundsLock &) = delete;
+
+        /// Release the mutex. The outermost SoundsLock on this thread then
+        /// posts what was deferred. Later calls do nothing.
+        void release()
+        {
+            if (!mLock.owns_lock())
+                return;
+            mLock.unlock();
+
+            DeferredLifecycleRequests &d = tDeferredLifecycle;
+            if (--d.depth > 0)
+                return;
+            const bool resume = d.resume;
+            const bool idle = d.idle;
+            d = DeferredLifecycleRequests();
+            if (resume)
+                mPlayer.resumeEngine();
+            if (idle)
+                mPlayer.evaluateAudioDeviceIdle();
+        }
+
+    private:
+        void enter()
+        {
+            DeferredLifecycleRequests &d = tDeferredLifecycle;
+            if (d.depth++ == 0)
+                d.player = &mPlayer;
+        }
+
+        std::unique_lock<Player::SoundsMutex> mLock;
+        Player &mPlayer;
+    };
+} // namespace
+
+bool Player::runWithSoundsLockUnlessCancelled(
+    const std::function<bool()> &cancelled, const std::function<void()> &work)
+{
+    for (;;)
+    {
+        {
+            SoundsLock lock(sounds_mutex, *this, std::try_to_lock);
+            if (lock.ownsLock())
+            {
+                if (cancelled())
+                    return false;
+                work();
+                return true;
+            }
+        }
+        if (cancelled())
+            return false;
+        // Held for as long as a play, a delivery or a disposal takes: rarely
+        // long, and this thread has nothing else to do meanwhile.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 PlayerErrors Player::setBufferStream(
     unsigned int &hash,
     unsigned long maxBufferSize,
@@ -1145,7 +1354,7 @@ PlayerErrors Player::setBufferStream(
 
     newSound.get()->filters = std::make_unique<Filters>(&soloud, newSound.get(), nullptr);
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
         sounds.push_back(std::move(newSound));
     }
 
@@ -1190,7 +1399,7 @@ PlayerErrors Player::setPullBufferStream(
 
     newSound.get()->filters = std::make_unique<Filters>(&soloud, newSound.get(), nullptr);
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
         sounds.push_back(std::move(newSound));
     }
 
@@ -1199,6 +1408,8 @@ PlayerErrors Player::setPullBufferStream(
 
 PlayerErrors Player::resetPullBufferStream(unsigned int hash)
 {
+    // See addAudioDataStream() for why the lock must span the whole call.
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(hash);
 
     if (s == nullptr || s->soundType != SoundType::TYPE_PULL_BUFFER_STREAM)
@@ -1214,7 +1425,19 @@ PlayerErrors Player::addPullBufferDataStream(
     unsigned int aDataLen,
     uint64_t offset)
 {
+    // Held across the whole call, like addAudioDataStream(): a feeder thread
+    // must not decode into a stream that a concurrent disposeSound() or
+    // disposeAllSound() has destroyed. A SoundsLock: addAudioData() runs the
+    // stream's checkBuffering(), which can pause or unpause its voice and so
+    // ask for a device start or an idle evaluation.
+    //
+    // addAudioData() takes the stream's decode mutex under this one. Nothing
+    // holding the decode mutex waits for sounds_mutex (an automatic pause does
+    // not take it), and the audio thread only try-locks the decode mutex
+    // while it mixes, so this adds no cycle.
+    SoundsLock lock(sounds_mutex, *this);
     auto const s = findByHash(hash);
+    SOLOUD_TEST_BARRIER(pullDataSoundLookedUp);
 
     if (s == nullptr)
         return PlayerErrors::soundHashNotFound;
@@ -1231,6 +1454,8 @@ PlayerErrors Player::getPullBufferTimeRange(
     double *startTime,
     double *endTime)
 {
+    // See addAudioDataStream() for why the lock must span the whole call.
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(hash);
 
     if (s == nullptr)
@@ -1258,7 +1483,10 @@ PlayerErrors Player::addAudioDataStream(
     // it, so this guarantees the BufferStream outlives the addData() call.
     // Otherwise a feeder thread can lock a destroyed std::mutex, which
     // aborts on Android (HandleUsingDestroyedMutex).
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    //
+    // A SoundsLock: addData() runs checkBuffering(), which can pause or
+    // unpause voices and so ask for a device start or an idle evaluation.
+    SoundsLock lock(sounds_mutex, *this);
     auto const s = findByHash(hash);
 
     if (s == nullptr)
@@ -1272,8 +1500,10 @@ PlayerErrors Player::addAudioDataStream(
 
 PlayerErrors Player::resetBufferStream(unsigned int hash)
 {
-    // See addAudioDataStream() for why the lock must span the whole call.
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    // See addAudioDataStream() for why the lock must span the whole call. A
+    // SoundsLock: resetBuffer() seeks the stream's voices, which takes SoLoud's
+    // audio mutex.
+    SoundsLock lock(sounds_mutex, *this);
     auto const s = findByHash(hash);
 
     if (s == nullptr || s->soundType != SoundType::TYPE_BUFFER_STREAM)
@@ -1288,7 +1518,7 @@ PlayerErrors Player::resetBufferStream(unsigned int hash)
 PlayerErrors Player::setBufferIcyMetaInt(unsigned int hash, int icyMetaInt)
 {
     // See addAudioDataStream() for why the lock must span the whole call.
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(hash);
 
     if (s == nullptr || s->soundType != SoundType::TYPE_BUFFER_STREAM)
@@ -1303,7 +1533,7 @@ PlayerErrors Player::setBufferIcyMetaInt(unsigned int hash, int icyMetaInt)
 PlayerErrors Player::getStreamTimeConsumed(unsigned int hash, float *timeConsumed)
 {
     // See addAudioDataStream() for why the lock must span the whole call.
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(hash);
 
     if (s == nullptr || s->soundType != SoundType::TYPE_BUFFER_STREAM)
@@ -1318,8 +1548,9 @@ PlayerErrors Player::getStreamTimeConsumed(unsigned int hash, float *timeConsume
 
 PlayerErrors Player::setDataIsEnded(unsigned int hash)
 {
-    // See addAudioDataStream() for why the lock must span the whole call.
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    // See addAudioDataStream() for why the lock must span the whole call, and
+    // why it is a SoundsLock: setDataIsEnded() runs checkBuffering() too.
+    SoundsLock lock(sounds_mutex, *this);
     auto const s = findByHash(hash);
 
     if (s == nullptr || s->soundType != SoundType::TYPE_BUFFER_STREAM)
@@ -1332,7 +1563,7 @@ PlayerErrors Player::setDataIsEnded(unsigned int hash)
 PlayerErrors Player::getBufferSize(unsigned int hash, unsigned int *sizeInBytes)
 {
     // See addAudioDataStream() for why the lock must span the whole call.
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(hash);
 
     if (s == nullptr || s->soundType != SoundType::TYPE_BUFFER_STREAM)
@@ -1365,7 +1596,7 @@ PlayerErrors Player::loadWaveform(
     hash = dist(g);
 
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
         sounds.push_back(std::make_unique<ActiveSound>());
         sounds.back().get()->completeFileName = "";
         sounds.back().get()->soundHash = hash;
@@ -1379,8 +1610,11 @@ PlayerErrors Player::loadWaveform(
     return noError;
 }
 
+// The setWaveform* setters hold sounds_mutex across their use of the sound, so
+// a concurrent disposeSound()/disposeAllSound() cannot destroy it under them.
 void Player::setWaveformScale(unsigned int soundHash, float newScale)
 {
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(soundHash);
 
     if (s == nullptr || s->soundType != TYPE_SYNTH)
@@ -1391,6 +1625,7 @@ void Player::setWaveformScale(unsigned int soundHash, float newScale)
 
 void Player::setWaveformDetune(unsigned int soundHash, float newDetune)
 {
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(soundHash);
 
     if (s == nullptr || s->soundType != TYPE_SYNTH)
@@ -1401,6 +1636,7 @@ void Player::setWaveformDetune(unsigned int soundHash, float newDetune)
 
 void Player::setWaveform(unsigned int soundHash, int newWaveform)
 {
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(soundHash);
 
     if (s == nullptr || s->soundType != TYPE_SYNTH)
@@ -1411,6 +1647,7 @@ void Player::setWaveform(unsigned int soundHash, int newWaveform)
 
 void Player::setWaveformFreq(unsigned int soundHash, float newFreq)
 {
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(soundHash);
 
     if (s == nullptr || s->soundType != TYPE_SYNTH)
@@ -1421,6 +1658,7 @@ void Player::setWaveformFreq(unsigned int soundHash, float newFreq)
 
 void Player::setWaveformSuperwave(unsigned int soundHash, bool superwave)
 {
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const s = findByHash(soundHash);
 
     if (s == nullptr || s->soundType != TYPE_SYNTH)
@@ -1436,19 +1674,36 @@ void Player::applyPauseState(unsigned int handle, bool pause, bool isUserAction)
     // Track whether this handle was paused by the user, so the BufferStream
     // buffering logic does not automatically unpause it when data becomes
     // available. The user must explicitly unpause it again.
-    auto s = findByHandle(handle);
-    if (s != nullptr)
+    //
+    // Only a user action writes the flag, and only it takes sounds_mutex, held
+    // while the sound is used so a concurrent disposal cannot destroy it in
+    // between. Automatic (buffering) pauses and unpauses keep the flag
+    // themselves: BufferStream and PullBufferStream checkBuffering() clear it
+    // before an automatic pause and only unpause automatically a voice whose
+    // flag is already clear, so writing it here would change nothing for
+    // them. They already hold sounds_mutex, taken before check_buffer_mutex
+    // as a play() of the stream takes them, and run on a thread adding data
+    // or on a BufferStream's background decode thread, never on the audio
+    // thread.
+    if (isUserAction)
     {
-        for (size_t i = 0; i < s->handle.size(); i++)
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
+        auto s = findByHandle(handle);
+        if (s != nullptr)
         {
-            if (s->handle[i].handle == handle)
+            for (size_t i = 0; i < s->handle.size(); i++)
             {
-                s->handle[i].isUserPaused = pause && isUserAction;
-                break;
+                if (s->handle[i].handle == handle)
+                {
+                    s->handle[i].isUserPaused = pause;
+                    break;
+                }
             }
         }
     }
 
+    // Both requests below are deferred to the release when this thread holds
+    // a SoundsLock (a checkBuffering() run under one, for instance).
     if (!pause)
     {
         // Unpausing queues device startup on the lifecycle scheduler instead of
@@ -1497,7 +1752,36 @@ PlayerErrors Player::pauseSwitch(unsigned int handle)
 
 void Player::evaluateAudioDeviceIdle()
 {
+    // Under a SoundsLock on this thread: posted when it is released.
+    if (deferLifecycleRequest(this, LifecycleRequest::idle))
+        return;
+    SOLOUD_TEST_LIFECYCLE_POST();
     std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    evaluateAudioDeviceIdleLocked();
+}
+
+bool Player::requestAudioDeviceIdleFromMixer()
+{
+    // Under a SoundsLock on this thread: posted when it is released.
+    if (deferLifecycleRequest(this, LifecycleRequest::idle))
+        return true;
+    // The mixer must not wait here. An OS interruption's handler holds this
+    // lock while it asks SoLoud for the active voice count, which waits for
+    // the audio mutex, applies queued voice commands, and can report ended
+    // voices on its thread (they take sounds_mutex); a lifecycle request
+    // from a control thread holds it too. While the mixer waited, nothing
+    // would be mixed, and on the web's AudioWorklet thread a wait on a
+    // contended lock aborts.
+    std::unique_lock<std::mutex> interruptionLock(mInterruptionMutex,
+                                                  std::try_to_lock);
+    if (!interruptionLock.owns_lock())
+        return false;
+    evaluateAudioDeviceIdleLocked();
+    return true;
+}
+
+void Player::evaluateAudioDeviceIdleLocked()
+{
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
         mInterruptionActive.load(std::memory_order_acquire))
@@ -1528,40 +1812,71 @@ void Player::audioInterruptionCallback(void *context, bool began)
 
 void Player::handleAudioInterruption(bool began)
 {
-    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
-    if (!mInited.load(std::memory_order_acquire) ||
-        !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
-        return;
+    {
+        std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+        SOLOUD_TEST_BARRIER(audioInterruptionLocked);
+        if (!mInited.load(std::memory_order_acquire) ||
+            !mLifecycleRequestsAccepted.load(std::memory_order_acquire))
+            return;
 
-    mInterruptionActive.store(began, std::memory_order_release);
+        mInterruptionActive.store(began, std::memory_order_release);
+        if (began)
+        {
 #ifdef __EMSCRIPTEN__
-    if (began)
-    {
-        soloud.pause();
-    }
-    else if (soloud.getActiveVoiceCount() != 0 ||
-             mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
-    {
-        // Web has no lifecycle scheduler thread. Its AudioContext operations
-        // are nonblocking, so recover inline when policy requires it.
-        soloud.resume();
-    }
+            soloud.pause();
 #else
-    if (began)
-    {
-        // This immediate stop supersedes pending starts/idle deadlines. The
-        // callback only posts work; the backend call runs on the scheduler.
-        requestDeviceLifecycle(DeviceLifecycleRequest::interruptionStop);
-    }
-    else if (soloud.getActiveVoiceCount() != 0 ||
-             mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
-    {
-        // Resume only for active playback or indefinite keep-alive. A finite
-        // timeout with an idle engine leaves the interruption-stopped device
-        // stopped; later play/unpause starts it normally.
-        requestDeviceLifecycle(DeviceLifecycleRequest::start);
-    }
+            // This immediate stop supersedes pending starts/idle deadlines.
+            // The callback only posts work; the backend call runs on the
+            // scheduler.
+            requestDeviceLifecycle(DeviceLifecycleRequest::interruptionStop);
 #endif
+            return;
+        }
+
+        if (mIdleTimeoutMs.load(std::memory_order_acquire) < 0)
+        {
+            // Indefinite keep-alive: recover whether or not anything plays.
+#ifdef __EMSCRIPTEN__
+            // Web has no lifecycle scheduler thread. Its AudioContext
+            // operations are nonblocking, so recover inline.
+            soloud.resume();
+#else
+            requestDeviceLifecycle(DeviceLifecycleRequest::start);
+#endif
+            return;
+        }
+    }
+
+    // Recover only for active playback. A finite timeout with an idle engine
+    // leaves the interruption-stopped device stopped; a later play or unpause
+    // starts it normally.
+    //
+    // Counting the active voices waits for SoLoud's audio mutex: for the
+    // mixer's block, a stream's seek inside it, or with render-ahead a
+    // re-mix of the ring. That wait is made without mInterruptionMutex,
+    // which every lifecycle request takes: a play's start request on the UI
+    // thread would otherwise wait for the mix along with this handler.
+    SOLOUD_TEST_BARRIER(audioInterruptionCounting);
+    if (soloud.getActiveVoiceCount() == 0)
+        return;
+    SOLOUD_TEST_BARRIER(audioInterruptionCounted);
+
+    std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
+    // A teardown or a new interruption may have begun meanwhile.
+    if (!mInited.load(std::memory_order_acquire) ||
+        !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
+        mInterruptionActive.load(std::memory_order_acquire))
+        return;
+#ifdef __EMSCRIPTEN__
+    soloud.resume();
+#else
+    requestDeviceLifecycle(DeviceLifecycleRequest::start);
+#endif
+    // The voices counted may have stopped since, and asked for an idle stop
+    // that this start has just superseded. Evaluate again, after the start:
+    // the device stops once idle, as the timeout says, only if no voice is
+    // active by then.
+    evaluateAudioDeviceIdleLocked();
 }
 
 // On some platforms (notably iOS) the OS can take a short time to fully
@@ -1608,6 +1923,10 @@ void Player::pauseEngine()
 // coalescing window keeps the device running.
 void Player::resumeEngine()
 {
+    // Under a SoundsLock on this thread: posted when it is released.
+    if (deferLifecycleRequest(this, LifecycleRequest::resume))
+        return;
+    SOLOUD_TEST_LIFECYCLE_POST();
     std::lock_guard<std::mutex> interruptionLock(mInterruptionMutex);
     if (!mInited.load(std::memory_order_acquire) ||
         !mLifecycleRequestsAccepted.load(std::memory_order_acquire) ||
@@ -1687,6 +2006,19 @@ PlayerErrors Player::performAudioDeviceStart()
 
     SOLOUD_TEST_BARRIER(performAudioDeviceStartEntered);
 
+    // This is the only way the device goes from stopped to started after
+    // init() -- the scheduler, startAudioDevice(), changeDevice() and the
+    // rebuild below all come through here, and miniaudio never starts a
+    // stopped device on its own (a reroute only restarts the streams of a
+    // device that is still started) -- so it is what wakes a stall watchdog
+    // parked on a stopped device. On every exit, whatever the outcome: a
+    // failed start can still have rebuilt the device.
+    struct StallWatchdogKick
+    {
+        Player *player;
+        ~StallWatchdogKick() { player->kickStallWatchdog(); }
+    } stallWatchdogKick{this};
+
     // Use the normal resume hook so iOS reactivates AVAudioSession before the
     // Audio Unit is restarted.
     SoLoud::result result = soloud.resume();
@@ -1724,6 +2056,222 @@ void Player::reportAutomaticDeviceStartFailure()
 {
     soloud.notifyStateChanged(
         (unsigned int)PlayerStateEvents::event_audio_device_start_failed);
+}
+
+int64_t Player::computeDeviceStallThresholdMs() const
+{
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+    // Lets a test exercise detection, re-arming and suspension handling in
+    // seconds instead of with the production threshold.
+    const long long overrideMs = soloud_test::deviceStallThresholdOverrideMs();
+    if (overrideMs > 0)
+        return overrideMs;
+#endif
+    // The longest gap between two device callbacks a healthy device produces
+    // is about one device period. With the render-ahead ring the device runs
+    // a small period of its own, decoupled from the engine quantum; take the
+    // larger of the two so the estimate errs towards a longer threshold.
+    unsigned int periodFrames = soloud.mBufferSize;
+    if (soloud.isRenderAheadEnabled() &&
+        soloud.mDevicePeriodFrames > periodFrames)
+        periodFrames = soloud.mDevicePeriodFrames;
+    const unsigned int sampleRate =
+        soloud.mSamplerate != 0 ? soloud.mSamplerate : mSampleRate;
+    int64_t periodMs = 0;
+    if (sampleRate != 0)
+        periodMs = ((int64_t)periodFrames * 1000 + sampleRate - 1) / sampleRate;
+    return std::max(kMinDeviceStallThresholdMs,
+                    kDeviceStallThresholdPeriods * periodMs);
+}
+
+void Player::reportDeviceCallbackStall()
+{
+    soloud_platform_log(
+        "flutter_soloud: the audio output device reports started but its data "
+        "callback has not run for %lld ms\n",
+        (long long)mStallThresholdMs);
+    soloud.notifyStateChanged(
+        (unsigned int)PlayerStateEvents::event_audio_device_stalled);
+}
+
+void Player::startStallWatchdog()
+{
+#ifndef __EMSCRIPTEN__
+    // Created under the lock, as the scheduler is: the thread's first act is
+    // to take it, so it cannot observe a half-reset state.
+    std::lock_guard<std::mutex> lock(mStallWatchdogMutex);
+    if (mStallWatchdogThread.joinable())
+        return;
+    mStallWatchdogStop = false;
+    mStallWatchdogThread = std::thread(&Player::stallWatchdogLoop, this);
+#endif
+}
+
+void Player::stopStallWatchdog()
+{
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(mStallWatchdogMutex);
+        mStallWatchdogStop = true;
+    }
+    mStallWatchdogCv.notify_all();
+    // Prompt: the watchdog never blocks on anything but its own condition
+    // variable, which the stop flag above wakes. At worst it finishes one
+    // non-blocking sample, or one event dispatch, first.
+    if (mStallWatchdogThread.joinable())
+        mStallWatchdogThread.join();
+#endif
+}
+
+void Player::kickStallWatchdog()
+{
+#ifndef __EMSCRIPTEN__
+    {
+        std::lock_guard<std::mutex> lock(mStallWatchdogMutex);
+        ++mStallWatchdogWakeEpoch;
+    }
+    mStallWatchdogCv.notify_all();
+#endif
+}
+
+// Watches the device data callback while the backend reports the device
+// started, and reports a callback that has stopped running.
+//
+// The signal is the backend's callback heartbeat, never the mixer: see
+// gDataCallbackCount in soloud_miniaudio.cpp. A stall is a started device
+// whose heartbeat has not moved for mStallThresholdMs, as seen by consecutive
+// on-time samples. Everything that is not "started, and nobody is operating
+// it" discards the baseline instead of counting towards a stall:
+//
+//   * a stopped, starting, stopping or uninitialized device, and a sample the
+//     backend refused because a device operation was in flight;
+//   * an OS interruption (mInterruptionActive), during which a silent device
+//     is expected, and an engine that is not initialized or is shutting down;
+//   * a device transition between two samples (start, stop, reroute, rebuild:
+//     gDeviceRunGeneration moved), which also re-arms a reported stall;
+//   * a late wake-up of the watchdog itself. iOS suspends every thread of a
+//     backgrounded app, and Android freezes cached apps: the audio callback
+//     and this thread stop together, and on resume this thread can run before
+//     the callback has had a chance to. A sample that comes much later than
+//     scheduled therefore restarts the observation rather than counting the
+//     frozen time as silence. (A system-wide sleep needs no handling: the
+//     steady clock does not advance through it.)
+//
+// One event per stall. It re-arms once the heartbeat moves again, or once the
+// device has been stopped, restarted or rebuilt.
+void Player::stallWatchdogLoop()
+{
+#ifndef __EMSCRIPTEN__
+    using Clock = std::chrono::steady_clock;
+    const std::chrono::milliseconds threshold(mStallThresholdMs);
+    const std::chrono::milliseconds interval(std::max<int64_t>(
+        1, mStallThresholdMs / kDeviceStallSamplesPerThreshold));
+    // A sample further than this from the previous one means the watchdog
+    // was frozen in between.
+    const std::chrono::milliseconds maxSampleGap =
+        interval + std::chrono::milliseconds(std::max<int64_t>(
+                       interval.count(), kMinDeviceStallWakeSlackMs));
+
+    // Watchdog-thread state only.
+    bool haveBaseline = false;
+    unsigned int baselineCount = 0;
+    Clock::time_point lastProgress;
+    Clock::time_point lastSample;
+    bool haveGeneration = false;
+    unsigned int lastGeneration = 0;
+    bool reported = false;
+
+    std::unique_lock<std::mutex> lock(mStallWatchdogMutex);
+    while (!mStallWatchdogStop)
+    {
+        // Read before sampling, so a start that lands after the sample has
+        // already moved it and a park below cannot miss the kick.
+        const uint64_t wakeEpoch = mStallWatchdogWakeEpoch;
+        lock.unlock();
+
+        SOLOUD_TEST_BARRIER(stallWatchdogWoke);
+
+        // The clock is read before the sample: a freeze between the two then
+        // shows up as a late *next* sample, instead of as silence here.
+        const Clock::time_point now = Clock::now();
+        unsigned int state = audioDeviceUninitialized;
+        unsigned int callbackCount = 0;
+        unsigned int generation = 0;
+        const bool sampled = SoLoud::miniaudio_sampleDataCallbackLiveness(
+            &state, &callbackCount, &generation);
+
+        if (sampled)
+        {
+            if (haveGeneration && generation != lastGeneration)
+            {
+                // Stopped, restarted, rerouted or rebuilt since the last
+                // sample: whatever is observed from here on is a new episode.
+                haveBaseline = false;
+                reported = false;
+            }
+            haveGeneration = true;
+            lastGeneration = generation;
+            if (state != audioDeviceStarted)
+                reported = false;
+        }
+
+        const bool monitorable =
+            sampled && state == audioDeviceStarted &&
+            mInited.load(std::memory_order_acquire) &&
+            mLifecycleRequestsAccepted.load(std::memory_order_acquire) &&
+            !mInterruptionActive.load(std::memory_order_acquire);
+
+        bool park = false;
+        if (!monitorable)
+        {
+            haveBaseline = false;
+            // Nothing to watch until something starts the device, and that
+            // kicks. Everything else is transient, so keep polling.
+            park = sampled && (state == audioDeviceStopped ||
+                               state == audioDeviceUninitialized);
+        }
+        else if (!haveBaseline || now - lastSample > maxSampleGap)
+        {
+            haveBaseline = true;
+            baselineCount = callbackCount;
+            lastProgress = now;
+            lastSample = now;
+        }
+        else
+        {
+            lastSample = now;
+            if (callbackCount != baselineCount)
+            {
+                baselineCount = callbackCount;
+                lastProgress = now;
+                reported = false;
+            }
+            else if (!reported && now - lastProgress >= threshold)
+            {
+                reported = true;
+                reportDeviceCallbackStall();
+            }
+        }
+
+        lock.lock();
+        if (park)
+        {
+            mStallWatchdogCv.wait(lock, [this, wakeEpoch] {
+                return mStallWatchdogStop ||
+                       mStallWatchdogWakeEpoch != wakeEpoch;
+            });
+        }
+        else
+        {
+            // Kicks do not cut this short: only stopping does. A burst of
+            // start requests against a device that is already started (every
+            // play() posts one) must neither busy-loop the watchdog nor keep
+            // resetting what it has observed.
+            mStallWatchdogCv.wait_for(lock, interval,
+                                      [this] { return mStallWatchdogStop; });
+        }
+    }
+#endif
 }
 
 void Player::invalidatePendingDeviceRequest()
@@ -2244,13 +2792,33 @@ float Player::getApproximateVolume(unsigned int channel)
 
 unsigned int Player::getActiveVoiceCount_internal()
 {
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     unsigned int count = 0;
     for (auto &s : sounds)
     {
         count += s->handle.size();
     }
     return count;
+}
+
+/// A sound streamed from disk (LoadMode.disk) keeps only its file's path, and
+/// each voice opens the file again. If the file has been deleted or moved since
+/// the sound was loaded, report that instead of starting a voice that has
+/// nothing to play: it would end as soon as it is mixed or, looping, stay
+/// silent until stopped. A file that goes between this check and the voice
+/// opening it only gives a voice that ends (see WavStreamInstance::hasEnded()).
+static PlayerErrors checkStreamedFile(const ActiveSound &sound)
+{
+    if (sound.soundType != TYPE_WAVSTREAM)
+        return PlayerErrors::noError;
+    const char *path =
+        static_cast<const SoLoud::WavStream *>(sound.sound.get())->mFilename;
+    // Streamed from memory.
+    if (path == nullptr)
+        return PlayerErrors::noError;
+    SoLoud::DiskFile file;
+    return file.open(path) == SoLoud::SO_NO_ERROR ? PlayerErrors::noError
+                                                  : PlayerErrors::fileNotFound;
 }
 
 PlayerErrors Player::play(
@@ -2269,7 +2837,10 @@ PlayerErrors Player::play(
 {
     handle = 0;
 
+    // Held until `sound` is no longer used; see SoundsLock.
+    SoundsLock soundLock(sounds_mutex, *this);
     ActiveSound *sound = findByHash(soundHash);
+    SOLOUD_TEST_BARRIER(playSoundLookedUp);
 
     if (sound == nullptr)
         return soundHashNotFound;
@@ -2290,6 +2861,10 @@ PlayerErrors Player::play(
         return bufferStreamCanBePlayedOnlyOnce;
     }
 
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
+
     // Check if playing this sound will exceed the maximum number of voice counts. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
@@ -2298,6 +2873,7 @@ PlayerErrors Player::play(
     {
         if (sound->handle.size() > 0)
         {
+            // Its idle evaluation is deferred to the release (see SoundsLock).
             stop(sound->handle[0].handle);
         }
         else
@@ -2328,13 +2904,10 @@ PlayerErrors Player::play(
     if (newHandle == 0)
         return failedToStartPlayback;
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-        // A voice the caller asked to start paused is user-paused: the
-        // BufferStream buffering logic must not silently unpause it once
-        // enough data has arrived.
-        sound->handle.push_back({newHandle, MAX_DOUBLE, paused});
-    }
+    // A voice the caller asked to start paused is user-paused: the
+    // BufferStream buffering logic must not silently unpause it once enough
+    // data has arrived.
+    sound->handle.push_back({newHandle, MAX_DOUBLE, paused});
 
     if (scale != 1.0f && scale > 0.0f)
     {
@@ -2376,6 +2949,7 @@ PlayerErrors Player::play(
     }
 
     handle = newHandle;
+    soundLock.release();
 
     if (soloud.isValidVoiceHandle(newHandle) &&
         !soloud.getPause(newHandle))
@@ -2400,7 +2974,10 @@ PlayerErrors Player::playClocked(
 {
     handle = 0;
 
+    // Held until `sound` is no longer used; see SoundsLock.
+    SoundsLock soundLock(sounds_mutex, *this);
     ActiveSound *sound = findByHash(soundHash);
+    SOLOUD_TEST_BARRIER(playSoundLookedUp);
 
     if (sound == nullptr)
         return soundHashNotFound;
@@ -2412,6 +2989,10 @@ PlayerErrors Player::playClocked(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if playing this sound will exceed the maximum number of voice counts. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -2458,6 +3039,7 @@ PlayerErrors Player::playClocked(
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+    soundLock.release();
 
     // Queue the device start rather than performing it inline. The scheduled
     // delay is expressed in *samples* against mStreamTime, which only advances
@@ -2523,7 +3105,10 @@ PlayerErrors Player::playScheduled(
 {
     handle = 0;
 
+    // Held until `sound` is no longer used; see SoundsLock.
+    SoundsLock soundLock(sounds_mutex, *this);
     ActiveSound *sound = findByHash(soundHash);
+    SOLOUD_TEST_BARRIER(playSoundLookedUp);
 
     if (sound == nullptr)
         return soundHashNotFound;
@@ -2535,6 +3120,10 @@ PlayerErrors Player::playScheduled(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if playing this sound will exceed the maximum number of voice counts. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -2588,6 +3177,7 @@ PlayerErrors Player::playScheduled(
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+    soundLock.release();
 
     // Queue the device start rather than performing it inline. The scheduled
     // delay is expressed in *samples* against mStreamTime, which only advances
@@ -2662,7 +3252,10 @@ void Player::stopAudioSource(unsigned int soundHash)
         return;
 
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        // A SoundsLock, like every holder that calls into SoLoud: taking the
+        // audio mutex can mix ahead on this thread, where a pull stream's
+        // checkBuffering() can pause or unpause a voice.
+        SoundsLock lock(sounds_mutex, *this);
         auto it = std::find_if(sounds.begin(), sounds.end(),
                                [soundHash](const std::unique_ptr<ActiveSound> &sound)
                                {
@@ -2686,7 +3279,52 @@ void Player::stopAudioSource(unsigned int soundHash)
 
 void Player::removeHandle(unsigned int handle)
 {
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    // SoLoud reports a voice ended on the thread that ended it, after it has
+    // released its audio mutex: the mixer's, after a block in which a voice
+    // ended, or a control thread's. Any thread may hold sounds_mutex for as
+    // long as a play, a disposal or a stream's delivery takes, and while the
+    // mixer waited for it nothing would be mixed. So only try it, and when
+    // another thread holds it, leave the removal to the next thread that
+    // takes it (SoundsMutex applies it before that thread does anything).
+    std::unique_lock<SoundsMutex> lock(sounds_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        {
+            std::lock_guard<std::mutex> removalLock(remove_handle_mutex);
+            if (mDeferredHandleRemovals.size() <
+                mDeferredHandleRemovals.capacity())
+            {
+                mDeferredHandleRemovals.push_back(handle);
+                mHasDeferredHandleRemovals.store(true,
+                                                 std::memory_order_release);
+                return;
+            }
+        }
+        // No room left: wait, as every removal used to.
+        lock.lock();
+    }
+    removeHandleLocked(handle);
+}
+
+void Player::applyDeferredHandleRemovals()
+{
+    if (!mHasDeferredHandleRemovals.load(std::memory_order_acquire))
+        return;
+    {
+        std::lock_guard<std::mutex> removalLock(remove_handle_mutex);
+        // Both are reserved alike, so this copy never allocates.
+        mHandleRemovalsToApply.assign(mDeferredHandleRemovals.begin(),
+                                      mDeferredHandleRemovals.end());
+        mDeferredHandleRemovals.clear();
+        mHasDeferredHandleRemovals.store(false, std::memory_order_relaxed);
+    }
+    for (const unsigned int handle : mHandleRemovalsToApply)
+        removeHandleLocked(handle);
+    mHandleRemovalsToApply.clear();
+}
+
+void Player::removeHandleLocked(unsigned int handle)
+{
     if (sounds.empty())
     {
         return;
@@ -2719,7 +3357,8 @@ void Player::disposeSound(unsigned int soundHash)
     std::unique_ptr<ActiveSound> soundToDestroy;
 
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        // A SoundsLock: see stopAudioSource().
+        SoundsLock lock(sounds_mutex, *this);
         if (sounds.empty())
         {
             return;
@@ -2735,7 +3374,13 @@ void Player::disposeSound(unsigned int soundHash)
         {
             // Stop all handles for this sound before destroying to prevent
             // the audio thread from accessing filters during destruction.
-            for (auto &handleInfo : it->get()->handle)
+            //
+            // Walk a copy: each stop reports the voice ended on this thread,
+            // and removeHandle() then erases it from this very list (the
+            // mutex is recursive), which made the loop skip handles. A
+            // skipped voice stayed alive until the sound's destructor.
+            const std::vector<ActiveHandle> handles = it->get()->handle;
+            for (const auto &handleInfo : handles)
             {
                 soloud.stop(handleInfo.handle);
             }
@@ -2784,20 +3429,44 @@ void Player::disposeSound(unsigned int soundHash)
 void Player::stopDeviceAndDestroyAllSounds()
 {
     // Stop all voices first. This stops all active audio processing.
+    // destroyAllSounds() stops them again under sounds_mutex, which is what
+    // excludes a concurrent play(); this one runs before the device pause.
     soloud.stopAll();
 
-    // Pause the audio device BEFORE destroying sounds to ensure the audio thread
-    // is not accessing filter memory. This prevents race conditions where the
-    // audio thread crashes trying to access freed filter instances.
+    // Teardown is about to close the device anyway, so pause it BEFORE
+    // destroying sounds as well, as a second guard against the audio thread
+    // touching filter memory. Runtime disposal (disposeAllSound()) cannot
+    // afford this: it would put a device stop, and a wait for any device
+    // operation in flight, on the UI thread. Never under sounds_mutex.
     soloud.pause();
 
+    destroyAllSounds();
+}
+
+void Player::destroyAllSounds()
+{
     std::vector<std::unique_ptr<ActiveSound>> soundsToDestroy;
 
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        // A SoundsLock: see stopAudioSource().
+        SoundsLock lock(sounds_mutex, *this);
 
-        // First, remove all filters from sounds while the audio thread is paused.
-        // This prevents the audio thread from accessing filter instances during destruction.
+        // Stop every voice in the same critical section that takes the
+        // sounds out. A play* call holds sounds_mutex from its lookup until
+        // its voice is registered (see SoundsLock), so it either finished
+        // before this point, and its voice is stopped here, or runs after it
+        // and finds no sound. Stopped before the lock was taken, a play()
+        // could create a voice in between on a sound about to be destroyed.
+        //
+        // The voice-ended callbacks run on this thread once the audio mutex
+        // is released and take sounds_mutex again (removeHandle()), which the
+        // recursive mutex allows.
+        soloud.stopAll();
+
+        // First, remove all filters from the sounds. Their voices have been
+        // stopped under the audio mutex, so the audio thread holds no filter
+        // instance of theirs any more; this keeps it from creating one while
+        // the sounds are destroyed.
         for (auto &sound : sounds)
         {
             if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
@@ -2841,27 +3510,28 @@ void Player::stopDeviceAndDestroyAllSounds()
 
 void Player::disposeAllSound()
 {
-    {
-        // Stopping the device is a real backend operation, so serialize it
-        // with automatic/explicit lifecycle work and teardown.
-        std::lock_guard<std::mutex> operationLock(
-            mDeviceLifecycleOperationMutex);
-        stopDeviceAndDestroyAllSounds();
-    }
+    // Dart calls this synchronously on the UI thread, so it must not operate
+    // the device: pausing it here meant taking mDeviceLifecycleOperationMutex
+    // and the backend's device lock, i.e. waiting for whatever device start,
+    // stop or rebuild was in flight (tens of seconds on some Android devices),
+    // and then running ma_device_stop() on the UI thread.
+    //
+    // The device does not need to be stopped for the sounds to be destroyed
+    // safely. destroyAllSounds() removes every voice under the audio mutex,
+    // inside the sounds_mutex critical section that takes the sounds out,
+    // which is the same guarantee disposeSound() relies on, and the global
+    // filter instances are swapped out under that mutex too.
+    destroyAllSounds();
 
+    // The engine is idle now. As after disposeSound(), the idle policy decides
+    // when the device stops, on the lifecycle scheduler; an indefinite
+    // keep-alive simply leaves it running.
     evaluateAudioDeviceIdle();
-
-    // The unconditional soloud.pause() above may have stopped the device. If
-    // the app asked for the device to stay alive while idle (indefinite
-    // timeout), restart it (off the UI thread) now that the sounds have been
-    // destroyed.
-    if (mIdleTimeoutMs.load() < 0)
-        resumeEngine();
 }
 
 void Player::clearDartCallbackRegistrations()
 {
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     for (auto &sound : sounds)
     {
         if (sound != nullptr && sound->sound != nullptr)
@@ -2930,7 +3600,7 @@ PlayerErrors Player::textToSpeech(const std::string &textToSpeech, unsigned int 
         return failedToStartPlayback;
 
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
         auto activeSpeech = std::make_unique<ActiveSound>();
         activeSpeech->completeFileName = std::string("");
         activeSpeech->soundHash = newHandle;
@@ -2995,6 +3665,9 @@ float *Player::getWave(bool *isTheSameAsBefore)
 // The length in seconds
 double Player::getLength(unsigned int soundHash)
 {
+    // Held across the use of the sound, so a concurrent disposal cannot
+    // destroy it in between.
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const &s = findByHash(soundHash);
 
     if (s == nullptr || s->soundType == TYPE_SYNTH || s->soundType == TYPE_TEXT_TO_SPEECH)
@@ -3018,17 +3691,24 @@ PlayerErrors Player::seek(SoLoud::handle handle, float time)
     if (!mInited.load(std::memory_order_acquire))
         return backendNotInited;
 
-    ActiveSound *sound = findByHandle(handle);
     bool isGroupHandle = soloud.isVoiceGroup(handle);
 
-    if ((sound == nullptr || sound->soundType == TYPE_SYNTH) && !isGroupHandle)
-        return invalidParameter;
-
-    // A BufferStream using `release` buffer type cannot use seek.
-    if (sound != nullptr && sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
-        static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED)
     {
-        return bufferStreamWithReleasedBufferTypeCannotBeSeeked;
+        // Held while the sound is inspected, so a concurrent disposal cannot
+        // destroy it in between. The seek itself addresses the voice by
+        // handle and does not need it.
+        std::lock_guard<SoundsMutex> lock(sounds_mutex);
+        ActiveSound *sound = findByHandle(handle);
+
+        if ((sound == nullptr || sound->soundType == TYPE_SYNTH) && !isGroupHandle)
+            return invalidParameter;
+
+        // A BufferStream using `release` buffer type cannot use seek.
+        if (sound != nullptr && sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
+            static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED)
+        {
+            return bufferStreamWithReleasedBufferTypeCannotBeSeeked;
+        }
     }
 
     SoLoud::result result = soloud.seek(handle, time);
@@ -3086,26 +3766,17 @@ bool Player::isValidHandle(SoLoud::handle handle)
 
 int Player::countAudioSource(unsigned int soundHash)
 {
+    // Held across the use of the sound, so a concurrent disposal cannot
+    // destroy it in between. A SoundsLock: see stopAudioSource().
+    SoundsLock lock(sounds_mutex, *this);
     auto const &s = findByHash(soundHash);
 
-    if (s == nullptr)
+    if (s == nullptr || !s->sound)
         return 0;
 
-    SoLoud::AudioSource *as;
-    switch (s->soundType)
-    {
-    case TYPE_SYNTH:
-        return 0;
-    case TYPE_WAV:
-        as = static_cast<SoLoud::Wav *>(s->sound.get());
-    case TYPE_WAVSTREAM:
-        as = static_cast<SoLoud::WavStream *>(s->sound.get());
-    case TYPE_BUFFER_STREAM:
-        as = static_cast<SoLoud::BufferStream *>(s->sound.get());
-    default:
-        return 0;
-    }
-    return soloud.countAudioSource(*as);
+    // Every kind of sound is a SoLoud::AudioSource, waveforms included, and
+    // SoLoud counts the voices playing it by the source's id.
+    return soloud.countAudioSource(*s->sound);
 }
 
 unsigned int Player::getVoiceCount()
@@ -3140,7 +3811,7 @@ void Player::setMaxActiveVoiceCount(unsigned int maxVoiceCount)
 
 ActiveSound *Player::findByHandle(SoLoud::handle handle)
 {
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     int i = 0;
     while (i < (int)sounds.size())
     {
@@ -3161,7 +3832,7 @@ ActiveSound *Player::findByHandle(SoLoud::handle handle)
 
 ActiveSound *Player::findByHash(unsigned int soundHash)
 {
-    std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
     auto const &s = std::find_if(sounds.begin(), sounds.end(),
                                  [&](std::unique_ptr<ActiveSound> const &f)
                                  { return f->soundHash == soundHash; });
@@ -3169,6 +3840,30 @@ ActiveSound *Player::findByHash(unsigned int soundHash)
         return nullptr;
 
     return s->get();
+}
+
+PlayerErrors Player::useSoundByHash(
+    unsigned int soundHash,
+    const std::function<PlayerErrors(ActiveSound &)> &use)
+{
+    SoundsLock lock(sounds_mutex, *this);
+    ActiveSound *const s = findByHash(soundHash);
+    if (s == nullptr)
+        return PlayerErrors::soundHashNotFound;
+    SOLOUD_TEST_BARRIER(soundUseLookedUp);
+    return use(*s);
+}
+
+PlayerErrors Player::useSoundByHandle(
+    SoLoud::handle handle,
+    const std::function<PlayerErrors(ActiveSound &)> &use)
+{
+    SoundsLock lock(sounds_mutex, *this);
+    ActiveSound *const s = findByHandle(handle);
+    if (s == nullptr)
+        return PlayerErrors::soundHandleNotFound;
+    SOLOUD_TEST_BARRIER(soundUseLookedUp);
+    return use(*s);
 }
 
 /////////////////////////////////////////
@@ -3285,7 +3980,10 @@ PlayerErrors Player::play3d(
 {
     handle = 0;
 
+    // Held until `sound` is no longer used; see SoundsLock.
+    SoundsLock soundLock(sounds_mutex, *this);
     ActiveSound *sound = findByHash(soundHash);
+    SOLOUD_TEST_BARRIER(playSoundLookedUp);
     if (sound == 0)
         return soundHashNotFound;
 
@@ -3304,6 +4002,10 @@ PlayerErrors Player::play3d(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if by playing this sound will exceed the maximum number of voice count. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -3351,13 +4053,10 @@ PlayerErrors Player::play3d(
     if (newHandle == 0)
         return failedToStartPlayback;
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-        // A voice the caller asked to start paused is user-paused: the
-        // BufferStream buffering logic must not silently unpause it once
-        // enough data has arrived.
-        sound->handle.push_back({newHandle, MAX_DOUBLE, paused});
-    }
+    // A voice the caller asked to start paused is user-paused: the
+    // BufferStream buffering logic must not silently unpause it once enough
+    // data has arrived.
+    sound->handle.push_back({newHandle, MAX_DOUBLE, paused});
 
     if (scale != 1.0f && scale > 0.0f)
     {
@@ -3399,6 +4098,7 @@ PlayerErrors Player::play3d(
     }
 
     handle = newHandle;
+    soundLock.release();
 
     if (soloud.isValidVoiceHandle(newHandle) &&
         !soloud.getPause(newHandle))
@@ -3428,7 +4128,10 @@ PlayerErrors Player::play3dClocked(
 {
     handle = 0;
 
+    // Held until `sound` is no longer used; see SoundsLock.
+    SoundsLock soundLock(sounds_mutex, *this);
     ActiveSound *sound = findByHash(soundHash);
+    SOLOUD_TEST_BARRIER(playSoundLookedUp);
     if (sound == 0)
         return soundHashNotFound;
 
@@ -3439,6 +4142,10 @@ PlayerErrors Player::play3dClocked(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if by playing this sound will exceed the maximum number of voice count. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -3497,16 +4204,14 @@ PlayerErrors Player::play3dClocked(
     if (newHandle == 0)
         return failedToStartPlayback;
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
-        sound->handle.push_back({newHandle, MAX_DOUBLE, false});
-    }
+    sound->handle.push_back({newHandle, MAX_DOUBLE, false});
     // Check if this buffer has enough data to be played
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM)
     {
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+    soundLock.release();
 
     // Queue the device start rather than performing it inline. The scheduled
     // delay is expressed in *samples* against mStreamTime, which only advances
@@ -3542,7 +4247,10 @@ PlayerErrors Player::play3dScheduled(
 {
     handle = 0;
 
+    // Held until `sound` is no longer used; see SoundsLock.
+    SoundsLock soundLock(sounds_mutex, *this);
     ActiveSound *sound = findByHash(soundHash);
+    SOLOUD_TEST_BARRIER(playSoundLookedUp);
     if (sound == 0)
         return soundHashNotFound;
 
@@ -3553,6 +4261,10 @@ PlayerErrors Player::play3dScheduled(
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
+
+    const PlayerErrors fileError = checkStreamedFile(*sound);
+    if (fileError != PlayerErrors::noError)
+        return fileError;
 
     // Check if by playing this sound will exceed the maximum number of voice count. If true, then
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
@@ -3613,7 +4325,6 @@ PlayerErrors Player::play3dScheduled(
 
     if (soloud.isValidVoiceHandle(newHandle))
     {
-        std::lock_guard<std::recursive_mutex> lock(sounds_mutex);
         sound->handle.push_back({newHandle, MAX_DOUBLE, false});
         if (duration > 0.0)
         {
@@ -3626,6 +4337,7 @@ PlayerErrors Player::play3dScheduled(
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->checkBuffering(0);
     }
     handle = newHandle;
+    soundLock.release();
 
     // Queue the device start rather than performing it inline. The scheduled
     // delay is expressed in *samples* against mStreamTime, which only advances

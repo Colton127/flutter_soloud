@@ -26,139 +26,165 @@ freely, subject to the following restrictions:
 
 // Voice group operations
 
+// ###### flutter_soloud local patch (non-blocking voice control) ######
+// The voice group table (mVoiceGroup, mVoiceGroupCount) is written with both
+// the audio mutex and mVoiceGroupMutex held, in that order, so it can be read
+// with either one: the mixer and the FOR_ALL_VOICES_PRE operations read it
+// under the audio mutex; isVoiceGroup() and the queued voice control calls
+// (setVolume, seek, ...) read it under mVoiceGroupMutex alone, without
+// waiting for a mix block. mVoiceGroupMutex is released before the audio
+// mutex: unlocking that can dispatch voice-ended callbacks, which may call
+// back into these functions.
+
 namespace SoLoud
 {
 	// Create a voice group. Returns 0 if unable (out of voice groups / out of memory)
 	handle Soloud::createVoiceGroup()
 	{
 		lockAudioMutex_internal();
+		mVoiceGroupMutex.lock();
 
+		handle result = 0;
 		unsigned int i;
+		bool reused = false;
 		// Check if there's any deleted voice groups and re-use if found
 		for (i = 0; i < mVoiceGroupCount; i++)
 		{
 			if (mVoiceGroup[i] == NULL)
 			{
+				reused = true;
 				mVoiceGroup[i] = new unsigned int[17];
-				if (mVoiceGroup[i] == NULL)
+				if (mVoiceGroup[i] != NULL)
 				{
-					unlockAudioMutex_internal();
-					return 0;
+					mVoiceGroup[i][0] = 16;
+					mVoiceGroup[i][1] = 0;
+					result = 0xfffff000 | i;
 				}
-				mVoiceGroup[i][0] = 16;
-				mVoiceGroup[i][1] = 0;
-				unlockAudioMutex_internal();
-				return 0xfffff000 | i;
-			}		
+				break;
+			}
 		}
-		if (mVoiceGroupCount == 4096)
+		if (!reused && mVoiceGroupCount != 4096)
 		{
-			unlockAudioMutex_internal();
-			return 0;
-		}
-		unsigned int oldcount = mVoiceGroupCount;
-		if (mVoiceGroupCount == 0)
-		{
-			mVoiceGroupCount = 4;
-		}
-		mVoiceGroupCount *= 2;
-		unsigned int **vg = new unsigned int * [mVoiceGroupCount];
-		if (vg == NULL)
-		{
-			mVoiceGroupCount = oldcount;
-			unlockAudioMutex_internal();
-			return 0;
-		}
-		for (i = 0; i < oldcount; i++)
-		{
-			vg[i] = mVoiceGroup[i];
+			unsigned int oldcount = mVoiceGroupCount;
+			if (mVoiceGroupCount == 0)
+			{
+				mVoiceGroupCount = 4;
+			}
+			mVoiceGroupCount *= 2;
+			unsigned int **vg = new unsigned int * [mVoiceGroupCount];
+			if (vg == NULL)
+			{
+				mVoiceGroupCount = oldcount;
+			}
+			else
+			{
+				for (i = 0; i < oldcount; i++)
+				{
+					vg[i] = mVoiceGroup[i];
+				}
+
+				for (; i < mVoiceGroupCount; i++)
+				{
+					vg[i] = NULL;
+				}
+
+				delete[] mVoiceGroup;
+				mVoiceGroup = vg;
+				i = oldcount;
+				mVoiceGroup[i] = new unsigned int[17];
+				if (mVoiceGroup[i] != NULL)
+				{
+					mVoiceGroup[i][0] = 16;
+					mVoiceGroup[i][1] = 0;
+					result = 0xfffff000 | i;
+				}
+			}
 		}
 
-		for (; i < mVoiceGroupCount; i++)
-		{
-			vg[i] = NULL;
-		}
-
-		delete[] mVoiceGroup;
-		mVoiceGroup = vg;
-		i = oldcount;
-		mVoiceGroup[i] = new unsigned int[17];
-		if (mVoiceGroup[i] == NULL)
-		{
-			unlockAudioMutex_internal();
-			return 0;
-		}
-		mVoiceGroup[i][0] = 16;
-		mVoiceGroup[i][1] = 0;
+		mVoiceGroupMutex.unlock();
 		unlockAudioMutex_internal();
-		return 0xfffff000 | i;
+		return result;
 	}
 
-	// Destroy a voice group. 
+	// Destroy a voice group.
 	result Soloud::destroyVoiceGroup(handle aVoiceGroupHandle)
 	{
-		if (!isVoiceGroup(aVoiceGroupHandle))
-			return INVALID_PARAMETER;
-		int c = aVoiceGroupHandle & 0xfff;
-		
 		lockAudioMutex_internal();
-		delete[] mVoiceGroup[c];
-		mVoiceGroup[c] = NULL;
+		mVoiceGroupMutex.lock();
+		result res = INVALID_PARAMETER;
+		if (isVoiceGroupLocked_internal(aVoiceGroupHandle))
+		{
+			int c = aVoiceGroupHandle & 0xfff;
+			delete[] mVoiceGroup[c];
+			mVoiceGroup[c] = NULL;
+			res = SO_NO_ERROR;
+		}
+		mVoiceGroupMutex.unlock();
 		unlockAudioMutex_internal();
-		return SO_NO_ERROR;
+		return res;
 	}
 
 	// Add a voice handle to a voice group
 	result Soloud::addVoiceToGroup(handle aVoiceGroupHandle, handle aVoiceHandle)
 	{
-		if (!isVoiceGroup(aVoiceGroupHandle))
-			return INVALID_PARAMETER;
-		
-		// Don't consider adding invalid voice handles as an error, since the voice may just have ended.
-		if (!isValidVoiceHandle(aVoiceHandle))
-			return SO_NO_ERROR;
-
-		trimVoiceGroup_internal(aVoiceGroupHandle);
-		
-		int c = aVoiceGroupHandle & 0xfff;
-		unsigned int i;
-
 		lockAudioMutex_internal();
+		mVoiceGroupMutex.lock();
 
-		for (i = 1; i < mVoiceGroup[c][0]; i++)
+		result res = SO_NO_ERROR;
+		if (!isVoiceGroupLocked_internal(aVoiceGroupHandle))
 		{
-			if (mVoiceGroup[c][i] == aVoiceHandle)
+			res = INVALID_PARAMETER;
+		}
+		// Don't consider adding invalid voice handles as an error, since the voice may just have ended.
+		else if (isValidVoiceHandle(aVoiceHandle))
+		{
+			trimVoiceGroupLocked_internal(aVoiceGroupHandle);
+
+			int c = aVoiceGroupHandle & 0xfff;
+			unsigned int i;
+			bool done = false;
+
+			for (i = 1; i < mVoiceGroup[c][0]; i++)
 			{
-				unlockAudioMutex_internal();
-				return SO_NO_ERROR; // already there
+				if (mVoiceGroup[c][i] == aVoiceHandle)
+				{
+					done = true; // already there
+					break;
+				}
+
+				if (mVoiceGroup[c][i] == 0)
+				{
+					mVoiceGroup[c][i] = aVoiceHandle;
+					mVoiceGroup[c][i + 1] = 0;
+					done = true;
+					break;
+				}
 			}
 
-			if (mVoiceGroup[c][i] == 0)
+			if (!done)
 			{
-				mVoiceGroup[c][i] = aVoiceHandle;
-				mVoiceGroup[c][i + 1] = 0;
-				
-				unlockAudioMutex_internal();
-				return SO_NO_ERROR;
+				// Full group, allocate more memory
+				unsigned int * n = new unsigned int[mVoiceGroup[c][0] * 2 + 1];
+				if (n == NULL)
+				{
+					res = OUT_OF_MEMORY;
+				}
+				else
+				{
+					for (i = 0; i < mVoiceGroup[c][0]; i++)
+						n[i] = mVoiceGroup[c][i];
+					n[n[0]] = aVoiceHandle;
+					n[n[0]+1] = 0;
+					n[0] *= 2;
+					delete[] mVoiceGroup[c];
+					mVoiceGroup[c] = n;
+				}
 			}
 		}
-		
-		// Full group, allocate more memory
-		unsigned int * n = new unsigned int[mVoiceGroup[c][0] * 2 + 1];
-		if (n == NULL)
-		{
-			unlockAudioMutex_internal();
-			return OUT_OF_MEMORY;
-		}
-		for (i = 0; i < mVoiceGroup[c][0]; i++)
-			n[i] = mVoiceGroup[c][i];
-		n[n[0]] = aVoiceHandle;
-		n[n[0]+1] = 0;
-		n[0] *= 2;
-		delete[] mVoiceGroup[c];
-		mVoiceGroup[c] = n;
+
+		mVoiceGroupMutex.unlock();
 		unlockAudioMutex_internal();
-		return SO_NO_ERROR;
+		return res;
 	}
 
 	// Is this handle a valid voice group?
@@ -166,45 +192,62 @@ namespace SoLoud
 	{
 		if ((aVoiceGroupHandle & 0xfffff000) != 0xfffff000)
 			return 0;
+		// mVoiceGroupMutex alone: callers (the FFI layer's handle check
+		// before every voice control call) must not wait for a mix block.
+		std::lock_guard<std::mutex> groupLock(mVoiceGroupMutex);
+		return isVoiceGroupLocked_internal(aVoiceGroupHandle);
+	}
+
+	bool Soloud::isVoiceGroupLocked_internal(handle aVoiceGroupHandle) const
+	{
+		if ((aVoiceGroupHandle & 0xfffff000) != 0xfffff000)
+			return 0;
 		unsigned int c = aVoiceGroupHandle & 0xfff;
 		if (c >= mVoiceGroupCount)
 			return 0;
-
-		lockAudioMutex_internal();
-		bool res = mVoiceGroup[c] != NULL;		
-		unlockAudioMutex_internal();
-
-		return res;
+		return mVoiceGroup[c] != NULL;
 	}
 
 	// Is this voice group empty?
 	bool Soloud::isVoiceGroupEmpty(handle aVoiceGroupHandle)
 	{
-		// If not a voice group, yeah, we're empty alright..
-		if (!isVoiceGroup(aVoiceGroupHandle))
-			return 1;
-		trimVoiceGroup_internal(aVoiceGroupHandle);
-		int c = aVoiceGroupHandle & 0xfff;
-
 		lockAudioMutex_internal();
-		bool res = mVoiceGroup[c][1] == 0;
+		mVoiceGroupMutex.lock();
+		// If not a voice group, yeah, we're empty alright..
+		bool res = 1;
+		if (isVoiceGroupLocked_internal(aVoiceGroupHandle))
+		{
+			trimVoiceGroupLocked_internal(aVoiceGroupHandle);
+			int c = aVoiceGroupHandle & 0xfff;
+			res = mVoiceGroup[c][1] == 0;
+		}
+		mVoiceGroupMutex.unlock();
 		unlockAudioMutex_internal();
-
 		return res;
 	}
 
 	// Remove all non-active voices from group
 	void Soloud::trimVoiceGroup_internal(handle aVoiceGroupHandle)
 	{
-		if (!isVoiceGroup(aVoiceGroupHandle))
-			return;
+		lockAudioMutex_internal();
+		mVoiceGroupMutex.lock();
+		if (isVoiceGroupLocked_internal(aVoiceGroupHandle))
+			trimVoiceGroupLocked_internal(aVoiceGroupHandle);
+		mVoiceGroupMutex.unlock();
+		unlockAudioMutex_internal();
+	}
+
+	// Both locks held for the whole trim. isValidVoiceHandle() no longer takes
+	// the audio mutex, so this no longer drops and re-takes it around every
+	// check the way the original loop did.
+	void Soloud::trimVoiceGroupLocked_internal(handle aVoiceGroupHandle)
+	{
+		SOLOUD_ASSERT(mInsideAudioThreadMutex);
 		int c = aVoiceGroupHandle & 0xfff;
 
-		lockAudioMutex_internal();
 		// empty group
 		if (mVoiceGroup[c][1] == 0)
 		{
-			unlockAudioMutex_internal();
 			return;
 		}
 
@@ -213,16 +256,13 @@ namespace SoLoud
 		for (i = 1; i < mVoiceGroup[c][0]; i++)
 		{
 			// If we hit a voice in the group that's not set, we're done
-			if (mVoiceGroup[c][i] == 0) 
+			if (mVoiceGroup[c][i] == 0)
 			{
-				unlockAudioMutex_internal();
 				return;
 			}
-			
-			unlockAudioMutex_internal();
-			while (!isValidVoiceHandle(mVoiceGroup[c][i])) // function locks mutex, so we need to unlock it before the call
+
+			while (!isValidVoiceHandle(mVoiceGroup[c][i]))
 			{
-				lockAudioMutex_internal();
 				// current index is an invalid handle, move all following handles backwards
 				unsigned int j;
 				for (j = i; j < mVoiceGroup[c][0] - 1; j++)
@@ -237,14 +277,10 @@ namespace SoLoud
 				// did we end up with an empty group? we're done then
 				if (mVoiceGroup[c][i] == 0)
 				{
-					unlockAudioMutex_internal();
 					return;
 				}
-				unlockAudioMutex_internal();
 			}
-			lockAudioMutex_internal();
 		}
-		unlockAudioMutex_internal();
 	}
 
 	handle *Soloud::voiceGroupHandleToArray_internal(handle aVoiceGroupHandle) const

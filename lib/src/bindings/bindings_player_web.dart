@@ -446,6 +446,13 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   @override
   Future<void> prepareEngineInitAsync() async {}
 
+  /// There is no Android plugin on the web, not even in a browser on Android.
+  @override
+  bool get needsNativeLibraryInUseSignal => false;
+
+  @override
+  Future<void> markNativeLibraryInUse() async {}
+
   @override
   void requestEngineShutdown() {
     if (!_isModuleInstantiated()) {

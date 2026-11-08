@@ -1092,13 +1092,7 @@ namespace SoLoud
 	bool Soloud::retroactiveParam_internal(unsigned int aSlot, int aParam, float aValue, time aDuration, time aEventTime)
 	{
 		SOLOUD_ASSERT(mInsideAudioThreadMutex);
-		if (!mRenderRing.isInited() || aSlot >= VOICE_COUNT || mVoice[aSlot] == NULL)
-			return false;
-		// Paused voices make no sound inside the window; apply immediately
-		// (legacy path). Unpausing is not retroactive either (v1).
-		if (mVoice[aSlot]->mFlags & AudioSourceInstance::PAUSED)
-			return false;
-		if (aParam == RetroJournalEntry::PARAM_PAUSE && aValue == 0.0f)
+		if (!retroactiveParamEligible_internal(aSlot, aParam, aValue))
 			return false;
 		const unsigned int playIndex = mVoice[aSlot]->mPlayIndex;
 		time t = aEventTime;
@@ -1108,12 +1102,34 @@ namespace SoLoud
 		const int ci = retroactiveBegin_internal(t);
 		if (ci < 0)
 			return false;
-		AudioSourceInstance *v = mVoice[aSlot];
-		if (v == NULL || v->mPlayIndex != playIndex)
-		{
-			retroactiveEnd_internal(ci);
+		const bool placed = retroactiveParamInWindow_internal(aSlot, playIndex, aParam, aValue, aDuration, t);
+		retroactiveEnd_internal(ci);
+		return placed;
+	}
+
+	// ###### flutter_soloud local patch (non-blocking voice control) ######
+	bool Soloud::retroactiveParamEligible_internal(unsigned int aSlot, int aParam, float aValue)
+	{
+		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+		if (!mRenderRing.isInited() || aSlot >= VOICE_COUNT || mVoice[aSlot] == NULL)
 			return false;
-		}
+		// Paused voices make no sound inside the window; apply immediately
+		// (legacy path). Unpausing is not retroactive either (v1).
+		if (mVoice[aSlot]->mFlags & AudioSourceInstance::PAUSED)
+			return false;
+		if (aParam == RetroJournalEntry::PARAM_PAUSE && aValue == 0.0f)
+			return false;
+		return true;
+	}
+
+	bool Soloud::retroactiveParamInWindow_internal(unsigned int aSlot, unsigned int aPlayIndex, int aParam, float aValue, time aDuration, time aEventTime)
+	{
+		SOLOUD_ASSERT(mInsideAudioThreadMutex);
+		SOLOUD_ASSERT(mRemixing);
+		const time t = aEventTime;
+		AudioSourceInstance *v = aSlot < VOICE_COUNT ? mVoice[aSlot] : NULL;
+		if (v == NULL || v->mPlayIndex != aPlayIndex)
+			return false;
 		// Apply the change as a scheduled fader anchored on the voice's own
 		// stream clock (which the restore and the journal replay have already
 		// placed at the checkpoint time), so it takes effect at the event
@@ -1137,8 +1153,7 @@ namespace SoLoud
 			v->mPauseScheduler.set(1, 0, dur, voiceTime);
 			break;
 		}
-		journalParam_internal(aSlot, playIndex, aParam, aValue, t, aDuration);
-		retroactiveEnd_internal(ci);
+		journalParam_internal(aSlot, aPlayIndex, aParam, aValue, t, aDuration);
 		return true;
 	}
 };

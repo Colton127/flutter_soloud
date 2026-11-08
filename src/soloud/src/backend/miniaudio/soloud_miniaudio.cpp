@@ -105,6 +105,29 @@ namespace SoLoud
     ma_context context;
     std::atomic<bool> gDeviceStopped{true};
 
+    // Liveness of the device data callback, read by Player's stall watchdog
+    // through miniaudio_sampleDataCallbackLiveness().
+    //
+    // gDataCallbackCount is bumped once per soloud_miniaudio_audiomixer() call,
+    // which is once per *device* callback, in both mixing modes. It is
+    // deliberately not bumped by the mixer, nor derived from the mix clock: the
+    // mixer also runs off the device callback (with the render-ahead ring, the
+    // retroactive re-mix mixes on API threads and moves the mix clock), so a
+    // mixer-side heartbeat could keep moving while the device has gone silent.
+    // Relaxed and lock-free, because it is the only thing the audio thread does
+    // for the watchdog; the watchdog only ever compares two samples for
+    // inequality, so neither ordering nor wrap-around matters.
+    //
+    // gDeviceRunGeneration is bumped by every started, stopped and rerouted
+    // notification: every real transition of the device, including the ones
+    // miniaudio makes on its own (an iOS interruption stops the device inside
+    // miniaudio, an AAudio reroute reopens its stream). It lets the watchdog
+    // tell a device that was stopped, restarted or rebuilt between two of its
+    // samples from one that simply kept reporting started, which is what
+    // re-arms a stall it already reported.
+    static std::atomic<uint32_t> gDataCallbackCount{0};
+    static std::atomic<uint32_t> gDeviceRunGeneration{0};
+
     // Every operation that can initialize, start, stop, uninitialize, or
     // replace gDevice passes through this mutex. It is recursive because some
     // miniaudio backends can deliver notifications inline from an operation.
@@ -531,17 +554,88 @@ namespace SoLoud
         return result;
     }
 
+    // Oboe's bounds on the wait before a close (kMinDelayBeforeCloseMillis,
+    // kMaxDelayBeforeCloseMillis).
+    constexpr ma_int64 kMinDelayBeforeCloseMs = 10;
+    constexpr ma_int64 kMaxDelayBeforeCloseMs = 100;
+
+    /// Stop [pStream] and wait about one burst, before it is closed. Ported
+    /// from Oboe's close workaround (google/oboe 8c13e5e2:
+    /// AudioStreamAAudio::close() and requestStop_l(), and
+    /// AudioStream::calculateDefaultDelayBeforeCloseMillis()).
+    ///
+    /// On Android 11 and earlier a legacy (non-MMAP) stream is an AudioTrack
+    /// whose callbacks hold a raw pointer to the stream: its audio data, and
+    /// the route changes it registers for when it is opened, started or not.
+    /// AAudioStream_close() deletes the stream at once, so a callback already
+    /// being delivered then runs on a freed stream and crashes the process,
+    /// in AudioStreamLegacy_callback() or AudioStreamLegacy::
+    /// onAudioDeviceUpdate(). From Android 12 the stream is reference counted
+    /// and closing it only drops a reference. Stopping it and waiting lets the
+    /// callbacks in flight finish first.
+    ///
+    /// miniaudio closes AAudio streams directly on every path: a device's
+    /// uninit, the reroute job after a disconnect, and the streams it opens to
+    /// probe a device. Each goes through `context`'s AAudioStream_close, so
+    /// the wait is added there, in closeAAudioStream(), and miniaudio is
+    /// unchanged.
+    ///
+    /// As in Oboe, a device stream gets it on every SDK, and on SDK <= 27 (O_MR1)
+    /// one that is already stopping or stopped is not stopped again. A probe,
+    /// which is never started, gets it only on SDK <= 30, where the
+    /// raw-pointer callback exists: enumeration runs on the caller's thread,
+    /// for flutter_soloud the UI thread, and on an API 36 emulator the wait
+    /// added about 65 ms to each.
+    ///
+    /// Never called on an AAudio callback thread, where AAudio refuses stop
+    /// and close: miniaudio closes streams only on application threads and on
+    /// its job thread.
+    static void stopAndWaitBeforeClose(ma_AAudioStream *pStream)
+    {
+        bool requestStop = true;
+        if (ma_android_sdk_version() <= 27)
+        {
+            const ma_aaudio_stream_state_t state =
+                ((MA_PFN_AAudioStream_getState)
+                     context.aaudio.AAudioStream_getState)(pStream);
+            requestStop = state != MA_AAUDIO_STREAM_STATE_STOPPING &&
+                          state != MA_AAUDIO_STREAM_STATE_STOPPED;
+        }
+        // The result is ignored, as in Oboe's close().
+        if (requestStop)
+            ((MA_PFN_AAudioStream_requestStop)
+                 context.aaudio.AAudioStream_requestStop)(pStream);
+
+        const ma_int64 framesPerBurst =
+            ((MA_PFN_AAudioStream_getFramesPerBurst)
+                 context.aaudio.AAudioStream_getFramesPerBurst)(pStream);
+        const ma_int64 sampleRate =
+            ((MA_PFN_AAudioStream_getSampleRate)
+                 context.aaudio.AAudioStream_getSampleRate)(pStream);
+        ma_int64 delayMs = kMinDelayBeforeCloseMs;
+        if (framesPerBurst > 0 && sampleRate > 0)
+            delayMs = std::clamp<ma_int64>(1 + framesPerBurst * 1000 / sampleRate,
+                                           kMinDelayBeforeCloseMs,
+                                           kMaxDelayBeforeCloseMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+
     static ma_aaudio_result_t closeAAudioStream(ma_AAudioStream *pStream)
     {
+        bool deviceStream;
         {
             std::lock_guard<std::mutex> lock(gAAudioStreamGate);
-            gOpenDeviceStreams.erase(std::remove(gOpenDeviceStreams.begin(),
-                                                 gOpenDeviceStreams.end(),
-                                                 pStream),
-                                     gOpenDeviceStreams.end());
+            const auto closed = std::remove(gOpenDeviceStreams.begin(),
+                                            gOpenDeviceStreams.end(), pStream);
+            deviceStream = closed != gOpenDeviceStreams.end();
+            gOpenDeviceStreams.erase(closed, gOpenDeviceStreams.end());
         }
         // Not under the lock: closing joins the stream's callback thread,
-        // which may be waiting for it in gateAAudioStreamError().
+        // which may be waiting for it in gateAAudioStreamError(). Already out
+        // of gOpenDeviceStreams, so an error the stream reports while it is
+        // stopped and waited out queues no reroute.
+        if (deviceStream || ma_android_sdk_version() <= 30)
+            stopAndWaitBeforeClose(pStream);
         return gCloseAAudioStream(pStream);
     }
 
@@ -647,6 +741,7 @@ namespace SoLoud
         {
             soloud_platform_log("miniaudio: closing an AAudio stream a failed "
                                 "device initialization left open\n");
+            stopAndWaitBeforeClose(pStream);
             gCloseAAudioStream(pStream);
         }
 #endif
@@ -678,6 +773,15 @@ namespace SoLoud
             gDeviceStopped.store(false, std::memory_order_release);
         else if (pNotification->type == ma_device_notification_type_stopped)
             gDeviceStopped.store(true, std::memory_order_release);
+
+        // A device transition, for the stall watchdog. Device-level like the
+        // flag above, so counted before admission: it says nothing about the
+        // engine, and must not be lost while notifications are retired across
+        // a device swap.
+        if (pNotification->type == ma_device_notification_type_started ||
+            pNotification->type == ma_device_notification_type_stopped ||
+            pNotification->type == ma_device_notification_type_rerouted)
+            gDeviceRunGeneration.fetch_add(1, std::memory_order_relaxed);
 
         // Admit and pin the engine for the whole dispatch. A bare load of
         // gSoloud only rules out notifications that have not started; one that
@@ -1121,6 +1225,21 @@ namespace SoLoud
         // ended-voice queue is drained with correct bookkeeping.
         soloud->unlockAudioMutex_internal();
 #else
+        // Heartbeat for the stall watchdog: this device callback ran. Taken
+        // before either mixing mode, because it is the device that is being
+        // watched, not the mixer (see gDataCallbackCount).
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        if (soloud_test::deviceCallbackStalled())
+        {
+            // A device that keeps reporting started while no callback reaches
+            // the engine: nothing is mixed and the heartbeat does not move.
+            std::memset(pOutput, 0,
+                        (size_t)frameCount * outChannels * sizeof(float));
+            return;
+        }
+#endif
+        gDataCallbackCount.fetch_add(1, std::memory_order_relaxed);
+
         if (soloud->isRenderAheadEnabled())
         {
             // Render-ahead ring path: the engine has already mixed
@@ -1379,6 +1498,29 @@ namespace SoLoud
         if (!gDeviceInitialized.load(std::memory_order_acquire))
             return ma_device_state_uninitialized;
         return (unsigned int)ma_device_get_state(&gDevice);
+    }
+
+    bool miniaudio_sampleDataCallbackLiveness(unsigned int *aState,
+                                              unsigned int *aCallbackCount,
+                                              unsigned int *aRunGeneration)
+    {
+        // Only try the lock: the watchdog must never wait behind a device
+        // operation, which can block for seconds. A busy lock means the device
+        // is being opened, started, stopped or replaced, which is not a
+        // stalled started device, so the caller skips the sample.
+        //
+        // Taken at all because ma_device_uninit() ends by zeroing gDevice,
+        // state included, with a plain memset, and every caller of it holds
+        // this lock. Reading the state without it races that memset.
+        std::unique_lock<std::recursive_mutex> operationLock(
+            gDeviceOperationMutex, std::try_to_lock);
+        if (!operationLock.owns_lock())
+            return false;
+
+        *aState = miniaudio_getAudioDeviceState();
+        *aRunGeneration = gDeviceRunGeneration.load(std::memory_order_relaxed);
+        *aCallbackCount = gDataCallbackCount.load(std::memory_order_relaxed);
+        return true;
     }
 
     // Engine mix quantum to hand to postinit_internal. With the render-ahead

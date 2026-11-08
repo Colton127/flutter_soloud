@@ -2,6 +2,7 @@
 
 #if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -20,6 +21,10 @@ namespace soloud_test
     Barrier gBarriers[static_cast<int>(DeviceBarrier::barrierCount)];
     int gForcedStartFailures = 0;
     int gBackendDeviceStarts = 0;
+    // Atomics rather than gMutex: the stall flag is read on the audio
+    // callback path, which must never take a lock, test build or not.
+    std::atomic<bool> gDeviceCallbackStalled{false};
+    std::atomic<long long> gDeviceStallThresholdMs{0};
 
     Barrier &slot(DeviceBarrier barrier)
     {
@@ -108,6 +113,26 @@ namespace soloud_test
       return false;
     --gForcedStartFailures;
     return true;
+  }
+
+  void setDeviceCallbackStalled(bool stalled)
+  {
+    gDeviceCallbackStalled.store(stalled, std::memory_order_relaxed);
+  }
+
+  bool deviceCallbackStalled()
+  {
+    return gDeviceCallbackStalled.load(std::memory_order_relaxed);
+  }
+
+  void setDeviceStallThresholdMs(long long thresholdMs)
+  {
+    gDeviceStallThresholdMs.store(thresholdMs, std::memory_order_relaxed);
+  }
+
+  long long deviceStallThresholdOverrideMs()
+  {
+    return gDeviceStallThresholdMs.load(std::memory_order_relaxed);
   }
 } // namespace soloud_test
 

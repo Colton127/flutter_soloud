@@ -52,6 +52,12 @@ namespace SoLoud
 
 		unsigned int getAudio(float *aBuffer, unsigned int aSamplesToRead, unsigned int aBufferSize) override;
 		result seek(time aSeconds, float *aScratch, unsigned int aScratchSize) override;
+		/// Cheap: seek() never decodes or reads the file, it only posts a
+		/// request to this voice's decoder thread (~3 us measured), and it is
+		/// thread-safe under the engine's audio mutex. So a queued seek can be
+		/// applied by the next call that takes the mutex, and the worker starts
+		/// on the target without waiting for the next mix block.
+		bool hasCheapSeek() const override { return true; }
 		result rewind() override;
 		bool hasEnded() override;
 		SourceStateSnapshot *captureSourceState() override;

@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:flutter_soloud/src/bindings/flutter_soloud_ffigen.dart'
+    as native;
 import 'package:flutter_soloud/src/enums.dart';
 import 'package:test/test.dart';
 
@@ -49,6 +51,7 @@ void main() {
       'event_unlocked': PlayerStateNotification.unlocked,
       'event_audio_device_start_failed':
           PlayerStateNotification.audioDeviceStartFailed,
+      'event_audio_device_stalled': PlayerStateNotification.audioDeviceStalled,
     };
 
     for (var i = 0; i < names.length; i++) {
@@ -69,5 +72,49 @@ void main() {
             '${expectedOrder[nativeName]!.index}.',
       );
     }
+  });
+
+  test('the ffigen PlayerStateEvents agree with PlayerStateNotification', () {
+    // The generated binding carries explicit values; a stale one would decode
+    // events by a different numbering than the native side sends.
+    expect(
+      native.PlayerStateEvents.values.length,
+      PlayerStateNotification.values.length,
+      reason:
+          'lib/src/bindings/flutter_soloud_ffigen.dart is stale: '
+          'run `dart run ffigen --config ffigen.yaml`.',
+    );
+    for (final e in native.PlayerStateEvents.values) {
+      expect(
+        e.value,
+        native.PlayerStateEvents.values.indexOf(e),
+        reason: '${e.name} has value ${e.value} out of declaration order.',
+      );
+    }
+  });
+
+  test('existing notifications are not renumbered', () {
+    // New notifications are appended. An insertion would renumber every
+    // notification after it, on both sides of the boundary at once, which the
+    // sync test above cannot notice.
+    const expected = {
+      PlayerStateNotification.started: 0,
+      PlayerStateNotification.stopped: 1,
+      PlayerStateNotification.rerouted: 2,
+      PlayerStateNotification.interruptionBegan: 3,
+      PlayerStateNotification.interruptionEnded: 4,
+      PlayerStateNotification.unlocked: 5,
+      PlayerStateNotification.audioDeviceStartFailed: 6,
+      PlayerStateNotification.audioDeviceStalled: 7,
+    };
+    for (final MapEntry(key: notification, value: index) in expected.entries) {
+      expect(notification.index, index, reason: '$notification moved');
+    }
+    expect(
+      native.PlayerStateEvents.fromValue(
+        PlayerStateNotification.audioDeviceStalled.index,
+      ),
+      native.PlayerStateEvents.event_audio_device_stalled,
+    );
   });
 }
