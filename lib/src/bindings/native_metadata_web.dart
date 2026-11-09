@@ -1,5 +1,7 @@
 // ignore_for_file: public_member_api_docs
 
+import 'dart:convert';
+
 import 'package:flutter_soloud/src/bindings/js_extension.dart';
 import 'package:flutter_soloud/src/metadata.dart';
 
@@ -73,9 +75,9 @@ abstract class _MetadataJS {
     for (var i = 0; i < length; i++) {
       final charCode = wasmGetI32Value(ptr + offset + i, 'i8');
       if (charCode == 0) break;
-      bytes.add(charCode);
+      bytes.add(charCode & 0xff);
     }
-    return String.fromCharCodes(bytes);
+    return utf8.decode(bytes, allowMalformed: true);
   }
 }
 
