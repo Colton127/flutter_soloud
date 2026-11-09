@@ -447,6 +447,14 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   @override
+  bool isCurrentMixerOutputCapture() {
+    final id = _mixerCaptureId;
+    return id != null &&
+        isMixerOutputCaptureRunning() &&
+        native.getMixerCaptureId() == id;
+  }
+
+  @override
   int getMixerOutputBufferSize() {
     return native.getMixerCaptureBufferSize();
   }

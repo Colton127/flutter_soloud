@@ -34,6 +34,9 @@ class MixerOutputStreamManager {
   /// The broadcast stream of captured mixer output data.
   StreamController<Uint8List>? _streamController;
 
+  /// Whether this manager owns a Dart stream, even if native capture stopped.
+  bool get hasStream => _streamController != null;
+
   /// Captures the master mixer output as a [Stream] of [Uint8List] chunks.
   ///
   /// The signature mirrors SoLoud.startMixerOutputStream. See the public
@@ -63,7 +66,12 @@ class MixerOutputStreamManager {
     }
 
     if (_streamController != null) {
-      return _streamController!.stream;
+      if (bindings.isCurrentMixerOutputCapture()) {
+        return _streamController!.stream;
+      }
+      // An engine teardown can stop a worker isolate's native capture without
+      // closing its Dart stream. Finalize that stream before starting again.
+      stop();
     }
 
     // The controller must be synchronous: [stop] flushes the captured tail

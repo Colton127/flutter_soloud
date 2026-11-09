@@ -2,6 +2,8 @@ import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 
+import 'package:flutter_soloud/src/enums.dart';
+
 import 'package:web/web.dart' as web;
 
 /// Models the native packet contract: stop/start preserves untaken tokens;
@@ -31,12 +33,17 @@ class WebCaptureModule {
                 int threshold,
                 int chunkFrames,
               ) {
+                if (running) return PlayerErrors.playerAlreadyInited.index;
+                running = true;
                 captureId++;
                 return 0;
               })
               .toJS
-      ..['_stopMixerCapture'] = (() {}).toJS
+      ..['_stopMixerCapture'] = (() {
+        running = false;
+      }).toJS
       ..['_stopMixerCaptureAndDrain'] = ((int id, int lengthPtr) {
+        if (id == captureId) running = false;
         final tokens = packets.keys.where((t) => packets[t]!.id == id).toList()
           ..sort();
         final bytes = Uint8List.fromList([
@@ -51,6 +58,7 @@ class WebCaptureModule {
         return ptr;
       }).toJS
       ..['_getMixerCaptureId'] = (() => captureId).toJS
+      ..['_isMixerCaptureRunning'] = (() => running ? 1 : 0).toJS
       ..['_getMixerCaptureAvailableBytes'] = (() => tail.length).toJS
       ..['_getMixerCaptureBufferPointer'] = (() => tailPtr).toJS
       ..['_getMixerCaptureBufferSize'] = (() => 1 << 20).toJS
@@ -92,6 +100,7 @@ class WebCaptureModule {
   }
 
   int captureId = 0;
+  bool running = false;
   var _top = 8;
   var _nextToken = 0;
 

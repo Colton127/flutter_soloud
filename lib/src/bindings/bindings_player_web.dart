@@ -307,6 +307,14 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
+  bool isCurrentMixerOutputCapture() {
+    final id = _mixerCaptureId;
+    return id != null &&
+        isMixerOutputCaptureRunning() &&
+        wasmGetMixerCaptureId().toUnsigned(32) == id;
+  }
+
+  @override
   int getMixerOutputBufferSize() => wasmGetMixerCaptureBufferSize();
 
   @override

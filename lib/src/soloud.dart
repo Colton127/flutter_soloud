@@ -1068,7 +1068,11 @@ interface class SoLoud {
       _lifecycleGeneration++;
     }
     _nativeCallbacksInitialized = false;
-    if (_controller.soLoudFFI.isMixerOutputCaptureRunning()) {
+    if (_mixerOutputStreamManager.hasStream) {
+      _mixerOutputStreamManager.stop();
+    } else if (_controller.soLoudFFI.isMixerOutputCaptureRunning()) {
+      // A worker isolate owns its Dart stream; native teardown still stops
+      // that capture, and the worker finalizes its stream on stop or restart.
       _controller.soLoudFFI.stopMixerOutputCapture();
     }
     if (_isVisualizationEnabled) {

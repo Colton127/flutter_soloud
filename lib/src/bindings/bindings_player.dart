@@ -133,6 +133,10 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   bool isMixerOutputCaptureRunning();
 
+  /// Whether the running native capture is the one this binding started.
+  @mustBeOverridden
+  bool isCurrentMixerOutputCapture();
+
   /// Total size of the native capture buffer in bytes.
   @mustBeOverridden
   int getMixerOutputBufferSize();
