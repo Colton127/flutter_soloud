@@ -221,7 +221,9 @@ typedef void (*dartOnMoreDataIsNeededCallback_t)(uint64_t offset);
 // callback to tell dart the total audio duration of a pull-buffer stream
 typedef void (*dartOnAudioDurationCallback_t)(double duration);
 
-// callback handing dart a chunk of captured mixer output. Declared here rather
+// callback handing Dart an opaque capture-packet token and its byte length.
+// Claim the token with takeMixerOutputPacket, then free the returned bytes.
+// Declared here rather
 // than in bindings.cpp so `bindings.h` -- the ffigen entry point -- can name
 // it in the exports that take one.
 typedef void (*dartMixerOutputDataCallback_t)(unsigned char *data,

@@ -903,3 +903,9 @@ jsDecodeAudioDataWeb(Uint8List bytes) async {
     return null;
   }
 }
+
+@JS('Module_soloud._takeMixerOutputPacket')
+external int wasmTakeMixerOutputPacket(int token, int captureIdPtr);
+
+@JS('Module_soloud._getMixerCaptureId')
+external int wasmGetMixerCaptureId();

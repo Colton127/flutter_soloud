@@ -48,11 +48,6 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   /// session (see engineGeneration in bindings.cpp).
   int _engineGeneration = 0;
 
-  /// Whether the current mixer output capture is using fixed-size PCM chunks.
-  /// When true, the native side advances the circular buffer read position
-  /// before invoking the callback, so Dart must not advance it again.
-  bool _mixerOutputChunkMode = false;
-
   /// Serializes native engine lifecycle calls (initEngine / changeDevice /
   /// deinit / disposeAllSound).
   ///
@@ -193,26 +188,23 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
         );
         voiceEndedEventController.add((message['value'] as num).toInt());
       case 'mixerOutputData':
-        final offset = (message['offset'] as num).toInt();
+        final token = (message['offset'] as num).toInt();
         final length = (message['length'] as num).toInt();
-        _log.finest(
-          () => 'MIXER OUTPUT DATA EVENT offset: $offset length: $length',
-        );
-        if (length <= 0) return;
-
-        // Copy the data out of the WASM memory buffer and advance the native
-        // read position so the circular buffer can reuse the memory. In fixed
-        // PCM chunk mode the native side already advances the read position,
-        // so Dart must not advance it again.
-        final heapU8 = wasmHeapU8;
-        final bytes = Uint8List.sublistView(
-          heapU8.toDart,
-          offset,
-          offset + length,
-        );
-        mixerOutputChunkController.add(Uint8List.fromList(bytes));
-        if (!_mixerOutputChunkMode) {
-          advanceMixerOutputReadPosition(length);
+        final idPtr = wasmMalloc(4);
+        final data = wasmTakeMixerOutputPacket(token, idPtr);
+        try {
+          if (data == 0) {
+            return;
+          }
+          final bytes = Uint8List.sublistView(
+            wasmHeapU8.toDart,
+            data,
+            data + length,
+          );
+          mixerOutputChunkController.add(Uint8List.fromList(bytes));
+        } finally {
+          wasmFree(data);
+          wasmFree(idPtr);
         }
     }
   }
@@ -239,7 +231,6 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     int notificationThresholdBytes,
     int chunkPCMFrames,
   ) {
-    _mixerOutputChunkMode = format.isPcm && chunkPCMFrames > 0;
     final ret = wasmStartMixerCapture(
       format.value,
       sampleRate,
@@ -253,7 +244,6 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   void stopMixerOutputCapture() {
-    _mixerOutputChunkMode = false;
     wasmStopMixerCapture();
   }
 

@@ -146,6 +146,9 @@ namespace soloud_test
     /// After the mixer removed pull-stream samples from the circular buffer,
     /// before it accounts for them. Reset must not split these two updates.
     pullSamplesRead,
+    /// After native capture packet allocation, before the ring-copy lock.
+    /// Parking here must never prevent the device from writing another block.
+    mixerPacketStorageAllocated,
     barrierCount
   };
 

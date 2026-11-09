@@ -26,14 +26,22 @@ elif [ "${1:-}" == "--tsan" ]; then
     shift
 fi
 
+MODEL=()
+if [ "${1:-}" == "--web-model" ]; then
+    MODEL=(-D__EMSCRIPTEN__)
+    SUFFIX="${SUFFIX}_web"
+    shift
+fi
+
 OUT="${TMPDIR:-/tmp}/mixer_output_test$SUFFIX"
 
 c++ -std=c++17 -O1 -w -pthread "${SANITIZER[@]}" \
-    -DNO_XIPH_LIBS  \
+    -DNO_XIPH_LIBS -DSOLOUD_LIFECYCLE_TEST_HOOKS "${MODEL[@]}" \
     -I src \
     -I src/soloud/include \
     -o "$OUT" \
     test/mixer_output_test.cpp \
-    src/mixeroutput/*.cpp
+    src/mixeroutput/*.cpp \
+    src/device_lifecycle_test_hooks.cpp
 
 "$OUT" "$@"

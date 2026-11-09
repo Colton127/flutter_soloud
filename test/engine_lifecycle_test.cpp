@@ -253,7 +253,15 @@ void onStateChanged(enum PlayerStateEvents *state)
     ++gStateChangedCalls;
 }
 
-void onMixerOutput(unsigned char *, uint64_t) { ++gMixerOutputCalls; }
+extern "C" unsigned char *takeMixerOutputPacket(unsigned char *, unsigned int *);
+extern "C" void nativeFree(void *);
+
+void onMixerOutput(unsigned char *token, uint64_t) {
+    unsigned int captureId = 0;
+    auto *bytes = takeMixerOutputPacket(token, &captureId);
+    nativeFree(bytes);
+    ++gMixerOutputCalls;
+}
 
 // Stand-in for the Dart event loop a NativeCallable.listener posts to. The
 // visualization callable only queues its packet; this thread reports it done,

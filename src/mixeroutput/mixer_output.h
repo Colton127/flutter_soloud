@@ -29,9 +29,11 @@ using MixerOutputMutex = std::mutex;
 #endif
 
 /// Callback used to notify Dart that new mixer output data is available.
-/// [data] points to the start of the contiguous unread region in the
-/// circular buffer. [length] is the number of valid bytes, which may be
-/// smaller than the notification threshold when the buffer wraps.
+/// [data] is an opaque immutable-packet token, not an address to dereference.
+/// [takePacket] claims its owned byte allocation exactly once; the consumer
+/// frees those bytes with free(). Retirement can discard an unclaimed token,
+/// in which case takePacket returns nullptr. Tokens are never allocation
+/// addresses, so a stale notification cannot claim a reused allocation.
 ///
 /// A plain function pointer rather than a `std::function` so it can be stored
 /// in an atomic: [setDataCallback] is called from lifecycle paths -- engine
@@ -103,6 +105,15 @@ class MixerOutput {
   /// previous capture (especially important on the web where callbacks are
   /// proxied asynchronously to the main thread).
   uint32_t captureId() const { return m_captureId.load(); }
+
+  /// Packet ownership for asynchronous consumers. These functions never
+  /// borrow ring storage. A stopped capture's packets remain readable until
+  /// claimed or explicitly discarded when their callback is retired.
+  static uint8_t *takePacket(uint8_t *token, uint32_t &captureId);
+  static void discardPacket(uint8_t *token);
+  static void discardPackets();
+  static uint8_t *copyPacket(const uint8_t *data, size_t length,
+                             uint32_t captureId, uint64_t readThrough = 0);
 
   /// Encoder currently in use, or nullptr for PCM formats.
   MixerOutputEncoder *encoder() const { return m_encoder.get(); }

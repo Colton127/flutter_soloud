@@ -29,6 +29,7 @@
 // allocation or surround) runs only that scenario.
 
 #include "mixeroutput/mixer_output.h"
+#include "device_lifecycle_test_hooks.h"
 
 #include <atomic>
 #include <chrono>
@@ -178,8 +179,11 @@ std::vector<std::vector<float>> gChunks; // copied when the callback runs
 
 void copyChunk(uint8_t *data, size_t length)
 {
+    uint32_t captureId = 0;
+    data = MixerOutput::takePacket(data, captureId);
     std::vector<float> chunk(length / sizeof(float));
     std::memcpy(chunk.data(), data, chunk.size() * sizeof(float));
+    std::free(data);
     std::lock_guard<std::mutex> lock(gChunkMutex);
     gChunks.push_back(std::move(chunk));
 }
@@ -222,6 +226,179 @@ void everyBufferedChunkIsDelivered()
         EXPECT(inOrder, "chunks: chunk %zu must hold samples %zu.. in order", c, c * kChunkFloats);
     }
 }
+
+// Dart receives notifications through a NativeCallable.listener: the native
+// call only queues them, and Dart reads the bytes later. These callbacks keep
+// the pointer and read it after the capture has moved on.
+struct Held
+{
+    uint8_t *data;
+    size_t length;
+};
+std::mutex gHeldMutex;
+std::vector<Held> gHeld;
+
+void holdPointer(uint8_t *data, size_t length)
+{
+    std::lock_guard<std::mutex> lock(gHeldMutex);
+    gHeld.push_back({data, length});
+}
+
+size_t heldCount()
+{
+    std::lock_guard<std::mutex> lock(gHeldMutex);
+    return gHeld.size();
+}
+
+/// The first [count] floats a held notification points at, read now.
+std::vector<float> readHeld(size_t index, size_t count)
+{
+    std::lock_guard<std::mutex> lock(gHeldMutex);
+    std::vector<float> floats(count);
+    uint32_t captureId = 0;
+    auto *bytes = MixerOutput::takePacket(gHeld[index].data, captureId);
+    EXPECT(bytes != nullptr, "held packet must remain claimable");
+    if (bytes != nullptr) std::memcpy(floats.data(), bytes, count * sizeof(float));
+    std::free(bytes);
+    return floats;
+}
+
+void heldNotificationsStayValid()
+{
+    std::printf("held notifications: data stays valid and unchanged\n");
+    {
+        std::lock_guard<std::mutex> lock(gHeldMutex);
+        gHeld.clear();
+    }
+
+    // Fixed chunks: the first chunk's data must not become the second's.
+    constexpr int kChunkFrames = 2048;
+    constexpr size_t kChunkFloats = kChunkFrames * kChannels;
+    capture().setDataCallback(holdPointer);
+    EXPECT(startPcm(1 << 20, 4096, kChunkFrames) == noError, "held chunks: start");
+    float next = 0;
+    feed(kChunkFrames, next);
+    EXPECT(waitFor([] { return heldCount() >= 1; }, 2000), "held chunks: first chunk");
+    // Let the notification thread see the ring drained before the next chunk,
+    // so this does not depend on the backlog handling the chunks scenario
+    // checks.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    feed(kChunkFrames, next);
+    EXPECT(waitFor([] { return heldCount() >= 2; }, 2000), "held chunks: second chunk");
+    if (heldCount() >= 2)
+    {
+        const auto first = readHeld(0, 4);
+        EXPECT(first[0] == 0 && first[3] == 3,
+               "held chunks: the first chunk read late must still hold samples 0.., got %g..",
+               first[0]);
+        const auto second = readHeld(1, 4);
+        EXPECT(second[0] == static_cast<float>(kChunkFloats),
+               "held chunks: the second chunk must hold samples %zu.., got %g..",
+               kChunkFloats, second[0]);
+    }
+    capture().setDataCallback(nullptr);
+    capture().stop();
+
+    // A pending chunk also survives a restart that grows the packet pool's
+    // slot capacity. The replacement capture must use independent storage.
+    capture().setDataCallback(holdPointer);
+    EXPECT(startPcm(1 << 20, 4096, kChunkFrames) == noError, "held resize: start");
+    const size_t oldIndex = heldCount();
+    next = 0;
+    feed(kChunkFrames, next);
+    EXPECT(waitFor([&] { return heldCount() > oldIndex; }, 2000), "held resize: packet");
+    capture().stop();
+    EXPECT(startPcm(1 << 20, 4096, kChunkFrames * 2) == noError, "held resize: restart");
+    next = 90000;
+    feed(kChunkFrames * 2, next);
+    if (heldCount() > oldIndex) {
+        const auto first = readHeld(oldIndex, 4);
+        EXPECT(first[0] == 0 && first[3] == 3,
+               "held resize: growing a slot must preserve the old payload");
+    }
+    capture().setDataCallback(nullptr);
+    capture().stop();
+    MixerOutput::discardPackets();
+
+    // Threshold mode: a notification pending when the capture is restarted
+    // with a larger ring must not read the old, freed ring.
+    {
+        std::lock_guard<std::mutex> lock(gHeldMutex);
+        gHeld.clear();
+    }
+    capture().setDataCallback(holdPointer);
+    EXPECT(startPcm(256 * 1024, 4096, -1) == noError, "held ring: start");
+    next = 0;
+    feed(1024, next); // 8192 bytes, past the threshold
+    EXPECT(waitFor([] { return heldCount() >= 1; }, 2000), "held ring: notification");
+    capture().setDataCallback(nullptr);
+    capture().stop();
+    EXPECT(startPcm(4 * 1024 * 1024, 4096, -1) == noError, "held ring: restart larger");
+    // Overwrite whatever might reuse the old storage.
+    std::vector<uint8_t> scribble(256 * 1024, 0xAB);
+    if (heldCount() >= 1)
+    {
+        // Under AddressSanitizer a read of the freed ring aborts the run here.
+        const auto first = readHeld(0, 4);
+        EXPECT(first[0] == 0 && first[3] == 3,
+               "held ring: data read after a restart must still be the first samples, got %g..",
+               first[0]);
+    }
+    capture().stop();
+}
+
+// Retirement owns unclaimed packets, including events a closed listener can
+// never receive. Tokens cannot become valid again if an allocation is reused.
+void retiredPacketsCannotBeClaimedAgain()
+{
+    const uint8_t bytes[] = {1, 2, 3, 4};
+    auto *old = MixerOutput::copyPacket(bytes, sizeof(bytes), 1);
+    MixerOutput::discardPackets();
+    uint32_t id = 0;
+    EXPECT(MixerOutput::takePacket(old, id) == nullptr,
+           "retired packet must be inert");
+    auto *current = MixerOutput::copyPacket(bytes, sizeof(bytes), 2);
+    EXPECT(current != old, "packet tokens must not be reused");
+    EXPECT(MixerOutput::takePacket(old, id) == nullptr,
+           "old token must not claim a replacement allocation");
+    auto *copy = MixerOutput::takePacket(current, id);
+    EXPECT(copy != nullptr && id == 2 && std::memcmp(copy, bytes, sizeof(bytes)) == 0,
+           "current packet remains readable");
+    std::free(copy);
+    EXPECT(MixerOutput::takePacket(current, id) == nullptr,
+           "packet can only be claimed once");
+    size_t queued = 0;
+    for (int i = 0; i < 128; ++i)
+        if (MixerOutput::copyPacket(bytes, sizeof(bytes), 2) != nullptr) ++queued;
+    EXPECT(queued > 0 && queued <= 64,
+           "a stalled consumer must have a bounded pending packet queue");
+    MixerOutput::discardPackets();
+}
+
+#ifndef __EMSCRIPTEN__
+void allocationDoesNotHoldTheRingLock()
+{
+    capture().setDataCallback(holdPointer);
+    EXPECT(startPcm(256 * 1024, 4096, -1) == noError, "allocation: start");
+    soloud_test::armBarrier(soloud_test::DeviceBarrier::mixerPacketStorageAllocated);
+    float next = 0;
+    feed(1024, next);
+    soloud_test::waitBarrierReached(soloud_test::DeviceBarrier::mixerPacketStorageAllocated);
+    std::atomic<bool> completed{false};
+    std::thread device([&] {
+        float deviceNext = 8192;
+        feed(256, deviceNext);
+        completed.store(true);
+    });
+    EXPECT(waitFor([&] { return completed.load(); }, 1000),
+           "allocation: audio callback waited for packet allocation");
+    soloud_test::releaseBarrier(soloud_test::DeviceBarrier::mixerPacketStorageAllocated);
+    device.join();
+    capture().setDataCallback(nullptr);
+    capture().stop();
+    MixerOutput::discardPackets();
+}
+#endif
 
 void surroundDefaultKeepsWholeFrames()
 {
@@ -279,14 +456,43 @@ void surroundDefaultKeepsWholeFrames()
 
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
     const char *only = argc > 1 ? argv[1] : nullptr;
+    const char *const kScenarios[] = {"fill", "overrun", "oversized", "chunks", "deferred", "allocation", "surround"};
+    if (only != nullptr)
+    {
+        bool known = false;
+        for (const char *name : kScenarios)
+            known = known || std::strcmp(only, name) == 0;
+        if (!known)
+        {
+            std::fprintf(stderr,
+                         "Unknown scenario '%s': use fill, overrun, oversized, chunks, deferred, allocation or surround.\n",
+                         only);
+            return 2;
+        }
+    }
     auto wanted = [&](const char *name) { return only == nullptr || std::strcmp(only, name) == 0; };
-    if (wanted("fill")) exactFillKeepsEveryByte();
-    if (wanted("overrun")) overrunKeepsTheNewestBytes();
-    if (wanted("oversized")) oversizedWriteStaysInsideTheRing();
-    if (wanted("chunks")) everyBufferedChunkIsDelivered();
-    if (wanted("surround")) surroundDefaultKeepsWholeFrames();
+
+    if (wanted("fill"))
+        exactFillKeepsEveryByte();
+    if (wanted("overrun"))
+        overrunKeepsTheNewestBytes();
+    if (wanted("oversized"))
+        oversizedWriteStaysInsideTheRing();
+    if (wanted("chunks"))
+        everyBufferedChunkIsDelivered();
+    if (wanted("deferred"))
+        heldNotificationsStayValid();
+#ifndef __EMSCRIPTEN__
+    if (wanted("allocation"))
+        allocationDoesNotHoldTheRingLock();
+#endif
+    if (wanted("surround"))
+        surroundDefaultKeepsWholeFrames();
+    retiredPacketsCannotBeClaimedAgain();
+
     if (gFailures == 0)
         std::printf("All %d assertions passed.\n", gAssertions);
     else

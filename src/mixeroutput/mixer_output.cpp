@@ -4,17 +4,199 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <unordered_map>
+#include <array>
 
 #include "../device_lifecycle_test_hooks.h"
 #include "pcm_converter.h"
 #include "wav_output_encoder.h"
+
+namespace {
+struct CapturePacket {
+  uint8_t *bytes;
+  size_t length;
+  uint32_t captureId;
+  uint64_t readThrough;
+};
+MixerOutputMutex gPacketMutex;
+constexpr size_t kThresholdPacketBytes = 64 * 1024;
+#ifndef __EMSCRIPTEN__
+std::unordered_map<uintptr_t, CapturePacket> gPackets;
+constexpr size_t kMaxPendingPackets = 64;
+size_t gReservedPackets = 0;
+uintptr_t gNextPacket = 0;
+
+// Reserve registry capacity and allocate without holding the ring-copy lock.
+// Retirement cannot free this private storage before publication.
+class NativePacketBuffer {
+ public:
+  explicit NativePacketBuffer(size_t capacity) : mBytes(nullptr, &std::free) {
+    {
+      std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+      if (gPackets.size() + gReservedPackets >= kMaxPendingPackets ||
+          gNextPacket == UINTPTR_MAX) return;
+      mToken = ++gNextPacket;
+      ++gReservedPackets;
+    }
+    mBytes.reset(static_cast<uint8_t *>(std::malloc(capacity)));
+    SOLOUD_TEST_BARRIER(mixerPacketStorageAllocated);
+  }
+  ~NativePacketBuffer() {
+    if (mToken != 0) {
+      std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+      --gReservedPackets;
+    }
+  }
+  uint8_t *data() const { return mBytes.get(); }
+  uint8_t *publish(size_t length, uint32_t captureId, uint64_t readThrough) {
+    std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+    const uintptr_t token = mToken;
+    gPackets.emplace(token, CapturePacket{data(), length, captureId, readThrough});
+    mBytes.release();
+    --gReservedPackets;
+    mToken = 0;
+    return reinterpret_cast<uint8_t *>(token);
+  }
+ private:
+  uintptr_t mToken = 0;
+  std::unique_ptr<uint8_t, decltype(&std::free)> mBytes;
+};
+#else
+// The worklet cannot allocate: a contended allocator can wait on a futex,
+// which is forbidden there. Start prepares a bounded pool on the main thread.
+// Slots stay immutable until claimed or retired, including across restarts.
+struct WebCapturePacket {
+  std::vector<uint8_t> storage;
+  uintptr_t token = 0;
+  CapturePacket packet{};
+};
+std::array<WebCapturePacket, 8> gWebPackets;
+WebCapturePacket *findWebPacket(uintptr_t token) {
+  if (token == 0) return nullptr;
+  for (auto &slot : gWebPackets)
+    if (slot.token == token) return &slot;
+  return nullptr;
+}
+void prepareWebPackets(size_t size) {
+  std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+  for (auto &slot : gWebPackets) {
+    // Grow even occupied slots: vector growth preserves their payload, and
+    // consumers only hold tokens. Otherwise a restart with larger chunks
+    // could leave every subsequently freed slot too small to use.
+    if (slot.storage.size() < size) slot.storage.resize(size);
+    slot.packet.bytes = slot.storage.data();
+  }
+}
+#endif
+#ifdef __EMSCRIPTEN__
+uintptr_t gNextPacket = 0;
+#endif
+}
+
+uint8_t *MixerOutput::copyPacket(const uint8_t *data, size_t length,
+                                uint32_t captureId, uint64_t readThrough) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+  if (gNextPacket == UINTPTR_MAX) return nullptr;
+  for (auto &slot : gWebPackets) {
+    if (slot.token != 0 || slot.storage.size() < length) continue;
+    std::memcpy(slot.storage.data(), data, length);
+    slot.token = ++gNextPacket;
+    slot.packet = {slot.storage.data(), length, captureId, readThrough};
+    return reinterpret_cast<uint8_t *>(slot.token);
+  }
+  return nullptr;
+#else
+  NativePacketBuffer packet(length);
+  if (packet.data() == nullptr) return nullptr;
+  std::memcpy(packet.data(), data, length);
+  return packet.publish(length, captureId, readThrough);
+#endif
+}
+
+uint8_t *MixerOutput::takePacket(uint8_t *token, uint32_t &captureId) {
+  CapturePacket packet{};
+#ifdef __EMSCRIPTEN__
+  {
+    std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+    auto *slot = findWebPacket(reinterpret_cast<uintptr_t>(token));
+    if (slot == nullptr) return nullptr;
+    packet.length = slot->packet.length;
+  }
+  // Allocation belongs to the main-thread consumer, outside the copy lock.
+  // The worklet only ever waits for a bounded copy or token lookup.
+  auto *bytes = static_cast<uint8_t *>(std::malloc(packet.length));
+  if (bytes == nullptr) return nullptr;
+  {
+    std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+    auto *slot = findWebPacket(reinterpret_cast<uintptr_t>(token));
+    if (slot != nullptr) {
+      packet = slot->packet;
+      std::memcpy(bytes, slot->storage.data(), packet.length);
+      slot->token = 0;
+    }
+  }
+  if (packet.bytes == nullptr) { std::free(bytes); return nullptr; }
+  packet.bytes = bytes;
+#else
+  {
+    std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+    auto it = gPackets.find(reinterpret_cast<uintptr_t>(token));
+    if (it == gPackets.end()) return nullptr;
+    packet = it->second;
+    gPackets.erase(it);
+  }
+#endif
+  captureId = packet.captureId;
+  // An acknowledgement belongs to its original ring, never a replacement.
+  // Admission also excludes start()/stop() while touching the ring's state.
+  MixerOutput &capture = instance();
+  const CapturePass pass(capture);
+  if (pass && packet.readThrough != 0 && capture.captureId() == packet.captureId) {
+    std::lock_guard<MixerOutputMutex> lock(capture.m_bufferMutex);
+    // Overrun may already have dropped some or all of this packet's range.
+    // Acknowledge its absolute end, not the same length from a newer read head.
+    const uint64_t read = capture.m_readOffset.load(std::memory_order_relaxed);
+    const uint64_t write = capture.m_writeOffset.load(std::memory_order_relaxed);
+    capture.m_readOffset.store(std::max(read, std::min(write, packet.readThrough)),
+                               std::memory_order_release);
+    capture.m_notified.store(false, std::memory_order_release);
+  }
+  return packet.bytes;
+}
+
+void MixerOutput::discardPacket(uint8_t *token) {
+  // Discard without acknowledging ring data (it may still be flushed on stop).
+  std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+#ifdef __EMSCRIPTEN__
+  for (auto &slot : gWebPackets)
+    if (slot.token == reinterpret_cast<uintptr_t>(token)) slot.token = 0;
+#else
+  auto it = gPackets.find(reinterpret_cast<uintptr_t>(token));
+  if (it == gPackets.end()) return;
+  std::free(it->second.bytes);
+  gPackets.erase(it);
+#endif
+}
+
+void MixerOutput::discardPackets() {
+  std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+#ifdef __EMSCRIPTEN__
+  for (auto &slot : gWebPackets) slot.token = 0;
+#else
+  for (const auto &entry : gPackets) std::free(entry.second.bytes);
+  gPackets.clear();
+#endif
+  instance().m_notified.store(false, std::memory_order_release);
+}
 
 MixerOutput &MixerOutput::instance() {
   static MixerOutput instance;
   return instance;
 }
 
-MixerOutput::~MixerOutput() { stop(); }
+MixerOutput::~MixerOutput() { stop(); discardPackets(); }
 
 bool MixerOutput::isRunning() const { return m_running.load(); }
 
@@ -118,6 +300,11 @@ PlayerErrors MixerOutput::start(MixerOutputFormat format, int sampleRate,
     }
   }
 
+#ifdef __EMSCRIPTEN__
+  prepareWebPackets(chunkPCMFrames > 0
+      ? static_cast<size_t>(chunkPCMFrames) * bytesPerFrame
+      : std::min(bufferSizeBytes, kThresholdPacketBytes));
+#endif
 
   m_format = format;
   m_sampleRate = sampleRate;
@@ -328,8 +515,20 @@ void MixerOutput::onAudioData(const float *data, unsigned int frames) {
 bool MixerOutput::notifyOnePacket(size_t minimum, size_t fixedBytes) {
   const auto callback = m_callback.load(std::memory_order_acquire);
   if (callback == nullptr) return false;
-  uint8_t *data;
+  uint8_t *token;
   size_t length;
+#ifndef __EMSCRIPTEN__
+  // Only bounded copies and offset accounting run under m_bufferMutex.
+  // The audio thread can wait for that copy, never for allocation, registry
+  // insertion, packet retirement or a consumer callback.
+  const uint64_t observedRead = m_readOffset.load(std::memory_order_acquire);
+  if (m_writeOffset.load(std::memory_order_acquire) - observedRead < minimum ||
+      (fixedBytes == 0 && m_notified.load())) return false;
+  NativePacketBuffer packet(fixedBytes > 0 ? fixedBytes :
+                           std::min(m_bufferSize, kThresholdPacketBytes));
+  if (packet.data() == nullptr) return false;
+  uint64_t readThrough = 0;
+#endif
   {
     std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
     const uint64_t read = m_readOffset.load(std::memory_order_relaxed);
@@ -337,19 +536,38 @@ bool MixerOutput::notifyOnePacket(size_t minimum, size_t fixedBytes) {
     if (available < minimum || (fixedBytes == 0 && m_notified.load())) return false;
     const size_t offset = read % m_bufferSize;
     length = fixedBytes > 0 ? fixedBytes : std::min(available, m_bufferSize - offset);
+    // Threshold packets need not span the entire ring. Bound this copy so
+    // the audio producer cannot wait for an arbitrarily large snapshot.
+    if (fixedBytes == 0) length = std::min(length, kThresholdPacketBytes);
+    // Each queued notification owns a distinct snapshot. Neither the next
+    // chunk nor a capture restart can change bytes an event has already sent.
+#ifdef __EMSCRIPTEN__
     if (fixedBytes > 0) {
       const size_t first = std::min(length, m_bufferSize - offset);
       std::memcpy(m_chunkBuffer.data(), m_buffer.data() + offset, first);
       if (first < length)
         std::memcpy(m_chunkBuffer.data() + first, m_buffer.data(), length - first);
-      data = m_chunkBuffer.data();
-      m_readOffset.store(read + length, std::memory_order_release);
+      token = copyPacket(m_chunkBuffer.data(), length, captureId());
     } else {
-      data = m_buffer.data() + offset;
-      m_notified.store(true, std::memory_order_release);
+      token = copyPacket(m_buffer.data() + offset, length, captureId(), read + length);
     }
+    if (token == nullptr) return false;
+#else
+    const size_t first = std::min(length, m_bufferSize - offset);
+    std::memcpy(packet.data(), m_buffer.data() + offset, first);
+    if (first < length)
+      std::memcpy(packet.data() + first, m_buffer.data(), length - first);
+    if (fixedBytes == 0) readThrough = read + length;
+#endif
+    if (fixedBytes > 0)
+      m_readOffset.store(read + length, std::memory_order_release);
+    else
+      m_notified.store(true, std::memory_order_release);
   }
-  callback(data, length);
+#ifndef __EMSCRIPTEN__
+  token = packet.publish(length, captureId(), readThrough);
+#endif
+  callback(token, length);
   return true;
 }
 
@@ -470,6 +688,6 @@ void MixerOutput::notificationThreadFunc() {
 
 size_t MixerOutput::contiguousAvailable() const {
   const size_t available = getAvailableBytes();
-  const size_t readOffset = m_readOffset.load(std::memory_order_relaxed);
+  const size_t readOffset = getReadOffset();
   return std::min(available, m_bufferSize - readOffset);
 }

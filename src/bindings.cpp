@@ -535,7 +535,7 @@ extern "C"
   static void postMixerOutputToEventWorker(int offset, int length,
                                            int captureId)
   {
-    EM_ASM(
+    const int posted = EM_ASM_INT(
         {
           if (Module_soloud.wasmWorker)
           {
@@ -545,14 +545,17 @@ extern "C"
               length : $1,
               captureId : $2,
             });
+            return 1;
           }
+          return 0;
         },
         offset, length, captureId);
+    if (!posted) MixerOutput::discardPacket(reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(static_cast<uint32_t>(offset))));
   }
 
   /// Notify the web worker that new mixer output data is available.
-  /// [offset] byte offset into the mixer output circular buffer.
-  /// [length] number of contiguous valid bytes.
+  /// [offset] opaque immutable-packet token, passed without dereferencing it.
+  /// [length] number of bytes in the owned packet.
   /// [captureId] identifies the active capture session so the Dart side
   /// can discard stale notifications.
   static void sendMixerOutputToWorker(size_t offset, size_t length,
@@ -767,6 +770,7 @@ extern "C"
                                    std::memory_order_release);
     // Claiming here retires every earlier registration, this engine's included,
     // and every source that recorded an earlier generation.
+    MixerOutput::discardPackets();
     globalCallbackGeneration = registration.claim(owner_engine_id);
   }
 
@@ -784,6 +788,7 @@ extern "C"
     dartVisualizationCallback.store(nullptr, std::memory_order_release);
     // The packets in flight went to the callable just retired.
     Analyzer::abandonDartDispatches();
+    MixerOutput::discardPackets();
     globalCallbackGeneration = dart_callbacks::kNoGeneration;
     mixerCallbackGeneration = dart_callbacks::kNoGeneration;
     visualizationCallbackGeneration = dart_callbacks::kNoGeneration;
@@ -984,6 +989,20 @@ extern "C"
         chunkPCMFrames);
   }
 
+  // A queued listener receives a token, never a borrowed ring pointer. Taking
+  // it removes its immutable allocation from native ownership. Retirement
+  // frees tokens a closed listener can no longer claim; a late take is inert.
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacket(
+      unsigned char *token, unsigned int *captureId)
+  {
+    return MixerOutput::takePacket(token, *captureId);
+  }
+
+  FFI_PLUGIN_EXPORT unsigned int getMixerCaptureId()
+  {
+    return MixerOutput::instance().captureId();
+  }
+
   FFI_PLUGIN_EXPORT void stopMixerCapture()
   {
     // Serialized against engine teardown's own stop, and against another
@@ -1084,12 +1103,17 @@ extern "C"
     // registration it joined.
     const dart_callbacks::InvocationPass pass;
     if (!pass.isLive(mixerCallbackGeneration))
+    {
+      MixerOutput::discardPacket(data);
       return;
+    }
     auto cb = dartMixerOutputDataCallback.load(std::memory_order_acquire);
     if (cb != nullptr)
     {
       cb(data, static_cast<uint64_t>(length));
     }
+    else
+      MixerOutput::discardPacket(data);
 #endif
   }
 
@@ -1117,6 +1141,7 @@ extern "C"
         return false;
       }
 
+      MixerOutput::discardPackets();
       dartMixerOutputDataCallback.store(callback, std::memory_order_release);
       mixerCallbackGeneration = registration.generation();
     }
@@ -2139,7 +2164,9 @@ extern "C"
   FFI_PLUGIN_EXPORT void soloudTestInvokeMixerOutput()
   {
     unsigned char scratch[4] = {0, 0, 0, 0};
-    dispatchMixerOutputToDart(scratch, sizeof(scratch));
+    auto *token = MixerOutput::copyPacket(scratch, sizeof(scratch),
+                                           MixerOutput::instance().captureId());
+    dispatchMixerOutputToDart(token, sizeof(scratch));
   }
 
   /// True while a Dart callable registered at the current generation may run.

@@ -104,6 +104,21 @@ PlayerErrors startMixerCapture(
   ),
 );
 
+/// Claim an immutable capture packet.
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(
+    ffi.Pointer<ffi.UnsignedChar>,
+    ffi.Pointer<ffi.UnsignedInt>,
+  )
+>()
+external ffi.Pointer<ffi.UnsignedChar> takeMixerOutputPacket(
+  ffi.Pointer<ffi.UnsignedChar> token,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+);
+
+@ffi.Native<ffi.UnsignedInt Function()>()
+external int getMixerCaptureId();
+
 /// Stop capturing the master mixer output.
 @ffi.Native<ffi.Void Function()>()
 external void stopMixerCapture();
