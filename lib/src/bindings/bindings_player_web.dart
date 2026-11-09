@@ -198,7 +198,9 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
               'VOICE ENDED EVENT handle: '
               '${(message['value'] as num).toInt()}\n',
         );
-        voiceEndedEventController.add((message['value'] as num).toInt());
+        voiceEndedEventController.add(
+          (message['value'] as num).toInt().toUnsigned(32),
+        );
       case 'mixerOutputData':
         final token = (message['offset'] as num).toInt();
         final length = (message['length'] as num).toInt();
@@ -744,7 +746,9 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
       // change it on the C++ side as well.
       globalThis.setProperty(
         'dartOnBufferingCallback_$hash'.toJS,
-        onBuffering.toJS,
+        ((bool buffering, int handle, double time) {
+          onBuffering(buffering, handle.toUnsigned(32), time);
+        }).toJS,
       );
     }
 
@@ -800,7 +804,9 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     if (onBuffering != null) {
       globalThis.setProperty(
         'dartOnBufferingCallback_$hash'.toJS,
-        onBuffering.toJS,
+        ((bool buffering, int handle, double time) {
+          onBuffering(buffering, handle.toUnsigned(32), time);
+        }).toJS,
       );
     }
 
@@ -1036,7 +1042,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
       final result = wasmSpeechText(textPtr, handlePtr);
       return (
         error: PlayerErrors.values[result],
-        handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32')),
+        handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32').toUnsigned(32)),
       );
     } finally {
       wasmFree(textPtr);
@@ -1105,7 +1111,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1146,7 +1152,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1226,7 +1232,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1880,7 +1886,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1931,7 +1937,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1984,7 +1990,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -2225,7 +2231,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
     final ret = (
       error: PlayerErrors.values[result],
-      handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32')),
+      handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32').toUnsigned(32)),
     );
     wasmFree(handlePtr);
 

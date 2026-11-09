@@ -49,7 +49,7 @@ static void onBufferingMainThread(int isBuffering, int handle, double time,
       {
         var functionName = "dartOnBufferingCallback_" + $3;
         if (typeof window[functionName] === "function") {
-          window[functionName]($0 == 1 ? true : false, $1, $2);
+          window[functionName]($0 == 1 ? true : false, $1 >>> 0, $2);
         }
       },
       isBuffering, handle, time, soundHash);
@@ -1356,7 +1356,7 @@ void PullBufferStream::callOnBufferingCallback(bool isBuffering,
         var functionName = "dartOnBufferingCallback_" + $3;
         if (typeof window[functionName] === "function") {
           var buffering = $0 == 1 ? true : false;
-          window[functionName](buffering, $1, $2);
+          window[functionName](buffering, $1 >>> 0, $2);
         }
       },
       isBuffering, handle, time, mParent->soundHash);
