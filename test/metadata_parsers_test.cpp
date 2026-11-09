@@ -526,6 +526,32 @@ static void runFlacSeekAfterSplitHeader() {
            output.size(), reference.size());
 }
 
+// A stream can end inside its metadata: a truncated file. Once the data has
+// ended, the decoder must report that nothing more is coming, or a drain loop
+// that waits on hasPendingData() never finishes.
+static void runFlacTruncatedHeaderEnd() {
+    const Bytes file = flacWithPadding();
+    EXPECT(file.size() > 65582, "FLAC fixture must include padding and frames");
+    if (file.size() <= 65582) return;
+    for (bool initialized : {false, true}) {
+        FlacDecoderWrapper decoder;
+        if (initialized) EXPECT(decoder.initializeDecoder(44100, 1), "FLAC preinit");
+        int rate = 44100, channels = 1;
+        Bytes chunk(file.begin(), file.begin() + 62);
+        auto result = decoder.decode(chunk, &rate, &channels);
+        EXPECT(result.first.empty(), "a partial header produces no samples");
+        decoder.setDataEnded();
+        for (int i = 0; i < 8 && decoder.hasPendingData(); ++i) {
+            chunk.clear();
+            result = decoder.decode(chunk, &rate, &channels);
+            EXPECT(result.first.empty(), "a truncated header produces no samples");
+        }
+        EXPECT(!decoder.hasPendingData(),
+               "a stream that ended inside its metadata must finish draining "
+               "(preinitialized=%d)", initialized);
+    }
+}
+
 static void runM4aLargeWrap() {
     // An extended-size child at offset 8 must not wrap its 64-bit end.
     const Bytes file = {0,0,0,8, 'f','r','e','e',
@@ -547,6 +573,8 @@ int main(int argc, char **argv) {
         isolated("flac-partial-final-header", "a split final FLAC metadata block", runFlacPartialFinalHeader);
     if (want("flac-seek-split-header"))
         isolated("flac-seek-split-header", "a seek after a split FLAC header", runFlacSeekAfterSplitHeader);
+    if (want("flac-truncated-header-end"))
+        isolated("flac-truncated-header-end", "data that ends inside the FLAC metadata", runFlacTruncatedHeaderEnd);
     if (want("m4a-nested"))
         isolated("m4a-nested", "4 MiB of nested boxes on a 1 MiB stack", runM4aNested);
     if (want("m4a-large-wrap"))

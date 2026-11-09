@@ -171,6 +171,16 @@ std::pair<std::vector<float>, DecoderError> FlacDecoderWrapper::decode(std::vect
         }
         else
         {
+            if (m_dataEnded)
+            {
+                // No later delivery can complete this metadata. Leaving it
+                // pending would keep a native buffer stream's drain worker
+                // alive forever, retrying the same unusable bytes.
+                m_audioData.clear();
+                m_read_pos = 0;
+                m_drained = true;
+                return {{}, DecoderError::CodecError};
+            }
             // StreamDecoder may already have initialized the codec. Keep the
             // input intact until the complete header can be cached for seeks.
             return {{}, DecoderError::NoError};
