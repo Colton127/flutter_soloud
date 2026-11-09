@@ -18,6 +18,22 @@
 
 namespace SoLoud {
 
+namespace {
+/// Holds SoLoud's audio mutex for a scope.
+class AudioMutexLock {
+public:
+  explicit AudioMutexLock(Soloud &aSoloud) : mSoloud(aSoloud) {
+    mSoloud.lockAudioMutex_internal();
+  }
+  ~AudioMutexLock() { mSoloud.unlockAudioMutex_internal(); }
+  AudioMutexLock(const AudioMutexLock &) = delete;
+  AudioMutexLock &operator=(const AudioMutexLock &) = delete;
+
+private:
+  Soloud &mSoloud;
+};
+} // namespace
+
 #ifdef MA_ENABLE_AUDIO_WORKLETS
 // Main-thread entry points for the stream event callbacks. On the
 // multi-threaded (AudioWorklet) build the callbacks can fire from the
@@ -166,6 +182,7 @@ unsigned int PullBufferStreamInstance::getAudio(float *aBuffer,
   mReadScratch.resize(samplesToRead);
   const size_t readSamples =
       mParent->mCircularBuffer.read(mReadScratch.data(), samplesToRead);
+  SOLOUD_TEST_BARRIER(pullSamplesRead);
   const size_t readFrames = readSamples / mChannels;
   if (readFrames > 0) {
     for (unsigned int ch = 0; ch < mChannels; ++ch) {
@@ -517,6 +534,14 @@ PlayerErrors PullBufferStream::setPullBufferStream(
 
 void PullBufferStream::resetPullBufferStream() {
   {
+    // The mixer reads the circular buffer and counts what it read with only
+    // the audio mutex held (getAudio() must not wait for a delivery that is
+    // decoding under the decode mutex). Holding the audio mutex keeps a reset
+    // from landing between that read and its count, which would leave the
+    // reset stream claiming samples it does not have. The mixer's lock order
+    // is audio mutex, then decode mutex, and nothing holding the decode mutex
+    // waits for the audio mutex (see its declaration).
+    AudioMutexLock audioLock(mThePlayer->soloud);
     // Held so the mixer, which decodes and drains under it, never finds the
     // decoder or the buffers replaced mid-use.
     std::lock_guard<std::mutex> lock(mDecodeMutex);

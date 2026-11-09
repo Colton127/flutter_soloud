@@ -28,6 +28,9 @@
 //     lands after the seek, as the data at the target;
 //   * a reset while the mixer is parked mid-decode does not finish until the
 //     mixer is released, and the stream takes data from the start again;
+//   * a reset while the mixer is parked between taking samples out of the
+//     circular buffer and counting them (pullSamplesRead) waits for it too,
+//     and leaves an empty stream with an empty buffered range;
 //   * the duration and metadata callbacks, which the web's Dart receives
 //     synchronously and may answer by calling back into the stream, are made
 //     with the decode mutex released: a callback that reads the stream's
@@ -51,8 +54,8 @@
 //   ./test/run_pull_stream_race_test.sh --asan     (AddressSanitizer)
 //   ./test/run_pull_stream_race_test.sh --tsan     (ThreadSanitizer)
 //
-// A scenario name after the flag (seek, rewind, reset, callbacks or stress)
-// runs only that scenario.
+// A scenario name after the flag (seek, rewind, reset, read-reset, callbacks
+// or stress) runs only that scenario.
 
 #include "bindings.h"
 #include "device_lifecycle_test_hooks.h"
@@ -504,6 +507,38 @@ void resetWaitsForTheMixerDecoding()
     expectNothingLeft(what);
 }
 
+// Reset must also exclude consumption, after decoding has released its lock.
+// Park a read between removing samples and accounting for them; an empty
+// reset stream must not inherit that old read's counter increment.
+void resetWaitsForTheMixerReading()
+{
+    const char *what = "reset during the mixer's circular read";
+    const auto hash = createStream(what, PCM_F32LE, pcmBytes(1), 64u << 20);
+    const auto voice = playStream(what, hash, false);
+    soloud_test::armBarrier(DeviceBarrier::pullSamplesRead);
+    const std::vector<float> pcm(kSampleRate * kChannels, 0.125f);
+    EXPECT(addPullBufferDataStream(hash, reinterpret_cast<const unsigned char *>(pcm.data()),
+               pcm.size() * sizeof(float), 0) == noError, "read/reset: feed PCM");
+    if (!waitBarrierReachedFor(DeviceBarrier::pullSamplesRead, kProgressMs))
+        endRun("mixer never reached its circular read");
+    PlayerErrors result = unknownError;
+    BackgroundCall resetter([&] { result = resetPullBufferStream(hash); });
+    EXPECT(!resetter.finishedWithin(kParkMs),
+           "read/reset: reset must not finish between the circular read and its accounting");
+    soloud_test::releaseBarrier(DeviceBarrier::pullSamplesRead);
+    resetter.join();
+    // Wait for the parked mix to finish without delivering any new data.
+    getEngineTime();
+    double start = -1, end = -1;
+    EXPECT(result == noError && getPullBufferTimeRange(hash, &start, &end) == noError,
+           "read/reset: reset and range query should succeed");
+    EXPECT(start == 0 && end == 0,
+           "read/reset: empty reset range must be [0,0], got [%.9f,%.9f]", start, end);
+    disposeSound(hash);
+    expectNothingLeft(what);
+    (void)voice;
+}
+
 /// Set on the thread a test delivers from, so the callbacks below re-enter
 /// the stream only there (see callbacksCanReenterTheStream()).
 thread_local bool tReentrantDelivery = false;
@@ -823,7 +858,7 @@ int main(int argc, char **argv)
 
     const char *only = argc > 1 ? argv[1] : nullptr;
     const char *const kScenarios[] = {"seek", "rewind", "reset",
-                                       "callbacks", "stress"};
+                                       "callbacks", "stress", "read-reset"};
     if (only != nullptr)
     {
         bool known = false;
@@ -833,7 +868,7 @@ int main(int argc, char **argv)
         {
             std::fprintf(stderr,
                          "Unknown scenario '%s': use seek, rewind, reset, "
-                         "callbacks or stress.\n",
+                         "callbacks, read-reset or stress.\n",
                          only);
             return 2;
         }
@@ -859,6 +894,8 @@ int main(int argc, char **argv)
         seekKeepsADeliveryOut(10.0);
     if (wanted("rewind"))
         seekKeepsADeliveryOut(0.0);
+    if (wanted("read-reset"))
+        resetWaitsForTheMixerReading();
     if (wanted("reset"))
         resetWaitsForTheMixerDecoding();
     if (wanted("callbacks"))
