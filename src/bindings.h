@@ -130,6 +130,12 @@ extern "C"
       int notificationThresholdBytes, int chunkPCMFrames,
       unsigned int *captureId);
 
+  /// Admit a native capture and publish its callable in the same transaction.
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureForEngine(
+      int format, int sampleRate, int channels, int bufferSizeBytes,
+      int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId,
+      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId);
+
   /// Stop capturing the master mixer output.
   FFI_PLUGIN_EXPORT void stopMixerCapture();
   /// Stop and return owned pending chunks followed by the tail, atomically

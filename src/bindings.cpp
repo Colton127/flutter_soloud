@@ -936,11 +936,14 @@ extern "C"
 
   // Mixer output capture exports.
 
-  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCapture(
+  static void dispatchMixerOutputToDart(uint8_t *data, size_t length);
+
+  static PlayerErrors startMixerCaptureInternal(
       int format, int sampleRate, int channels,
       int bufferSizeBytes,
       int notificationThresholdBytes,
-      int chunkPCMFrames, unsigned int *captureId)
+      int chunkPCMFrames, unsigned int *captureId,
+      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId)
   {
     if (captureId != nullptr) *captureId = 0;
     MixerOutputFormat outputFormat = static_cast<MixerOutputFormat>(format);
@@ -983,16 +986,64 @@ extern "C"
     if (engine_shutdown_requested.load(std::memory_order_acquire))
       return backendNotInited;
 
-    const PlayerErrors result = MixerOutput::instance().start(
+    // Admission is serialized with every start and stop. Check it before
+    // touching the callback: a refused client must leave its owner alone.
+    auto &capture = MixerOutput::instance();
+    if (capture.isRunning()) return playerAlreadyInited;
+    const bool publish = callback != nullptr;
+    if (publish) {
+      {
+        // The gate is a leaf: validate and publish, then release it before
+        // encoder initialization, thread creation or other capture work.
+        // Retirement also releases the gate before taking the lifecycle lock.
+        dart_callbacks::Registration registration;
+        if ((ownerEngineId != kNoEngineId && !registration.isOwnedBy(ownerEngineId)) ||
+            registration.generation() == dart_callbacks::kNoGeneration)
+          return backendNotInited;
+        MixerOutput::discardPackets();
+        dartMixerOutputDataCallback.store(callback, std::memory_order_release);
+        mixerCallbackGeneration = registration.generation();
+      }
+      capture.setDataCallback(dispatchMixerOutputToDart);
+    }
+    const PlayerErrors result = capture.start(
         outputFormat, sr, ch,
         static_cast<size_t>(bufferSizeBytes),
         static_cast<size_t>(notificationThresholdBytes),
         chunkPCMFrames);
+    if (result != noError && publish) {
+      // Nothing is running after a failed start. Do not retain a callable
+      // belonging to an isolate that may return as soon as it sees the error.
+      dart_callbacks::Registration registration;
+      dartMixerOutputDataCallback.store(nullptr, std::memory_order_release);
+      mixerCallbackGeneration = dart_callbacks::kNoGeneration;
+    }
     // Publish the id before releasing the lifecycle lock. A separate query
     // could observe a replacement capture started by another isolate.
     if (result == noError && captureId != nullptr)
       *captureId = MixerOutput::instance().captureId();
     return result;
+  }
+
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCapture(
+      int format, int sampleRate, int channels, int bufferSizeBytes,
+      int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId)
+  {
+    return startMixerCaptureInternal(format, sampleRate, channels, bufferSizeBytes,
+        notificationThresholdBytes, chunkPCMFrames, captureId, nullptr, kNoEngineId);
+  }
+
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureForEngine(
+      int format, int sampleRate, int channels, int bufferSizeBytes,
+      int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId,
+      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId)
+  {
+    if (callback == nullptr) {
+      if (captureId != nullptr) *captureId = 0;
+      return invalidParameter;
+    }
+    return startMixerCaptureInternal(format, sampleRate, channels, bufferSizeBytes,
+        notificationThresholdBytes, chunkPCMFrames, captureId, callback, ownerEngineId);
   }
 
   // A queued listener receives a token, never a borrowed ring pointer. Taking

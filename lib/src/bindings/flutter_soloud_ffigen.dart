@@ -117,6 +117,58 @@ PlayerErrors startMixerCapture(
   ),
 );
 
+/// Admit a native capture and publish its callable in the same transaction.
+@ffi.Native<
+  ffi.UnsignedInt Function(
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Pointer<ffi.UnsignedInt>,
+    ffi.Pointer<ffi.NativeFunction<dartMixerOutputDataCallback_tFunction>>,
+    ffi.Int64,
+  )
+>(symbol: 'startMixerCaptureForEngine')
+external int _startMixerCaptureForEngine(
+  int format,
+  int sampleRate,
+  int channels,
+  int bufferSizeBytes,
+  int notificationThresholdBytes,
+  int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+  ffi.Pointer<ffi.NativeFunction<dartMixerOutputDataCallback_tFunction>>
+  callback,
+  int ownerEngineId,
+);
+
+PlayerErrors startMixerCaptureForEngine(
+  int format,
+  int sampleRate,
+  int channels,
+  int bufferSizeBytes,
+  int notificationThresholdBytes,
+  int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+  ffi.Pointer<ffi.NativeFunction<dartMixerOutputDataCallback_tFunction>>
+  callback,
+  int ownerEngineId,
+) => PlayerErrors.fromValue(
+  _startMixerCaptureForEngine(
+    format,
+    sampleRate,
+    channels,
+    bufferSizeBytes,
+    notificationThresholdBytes,
+    chunkPCMFrames,
+    captureId,
+    callback,
+    ownerEngineId,
+  ),
+);
+
 /// Claim an immutable capture packet.
 @ffi.Native<
   ffi.Pointer<ffi.UnsignedChar> Function(

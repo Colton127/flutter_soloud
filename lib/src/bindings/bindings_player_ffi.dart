@@ -323,10 +323,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       nativeStateChangedCallable!.nativeFunction,
       currentEngineId,
     );
-    native.setMixerOutputCallbackForEngine(
-      nativeMixerOutputDataCallable!.nativeFunction,
-      currentEngineId,
-    );
     native.setVisualizationCallbackForEngine(
       nativeVisualizationCallable!.nativeFunction,
       currentEngineId,
@@ -349,28 +345,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         ffi.NativeCallable<
           native.dartMixerOutputDataCallback_tFunction
         >.listener(_mixerOutputDataCallback);
-    // Called from whichever isolate owns the capture, including a worker one
-    // via `SoLoudIsolate.startMixerOutputStream()`. On a worker,
-    // [currentEngineId] is the no-engine sentinel and native code joins this
-    // callable to whatever registration is live.
-    //
-    // A refusal means there is no live registration to join: the engine was
-    // never initialized, has been deinitialized, or its FlutterEngine is being
-    // destroyed. Publishing anyway would arm a callable belonging to an isolate
-    // that is going away, so the capture simply produces nothing -- worth a
-    // line in the log, since the stream stays silent rather than throwing.
-    final published = native.setMixerOutputCallbackForEngine(
-      nativeMixerOutputDataCallable!.nativeFunction,
-      currentEngineId,
-    );
-    if (!published) {
-      _log.warning(
-        'The mixer output callback was refused: no live engine callback '
-        'registration to join. The capture stream will not receive chunks. '
-        'Initialize the engine before starting a mixer output capture, and '
-        'stop the capture before deinitializing it.',
-      );
-    }
+    // Preparation is isolate-local. Only an admitted native start publishes
+    // this callable, so a refused or abandoned attempt cannot redirect output.
   }
 
   late final ffi.NativeFinalizer _isolateFinalizer = ffi.NativeFinalizer(
@@ -394,9 +370,10 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     int notificationThresholdBytes,
     int chunkPCMFrames,
   ) {
+    registerMixerOutputCallback();
     final id = calloc<ffi.UnsignedInt>();
     try {
-      final ret = native.startMixerCapture(
+      final ret = native.startMixerCaptureForEngine(
         format.value,
         sampleRate,
         channels,
@@ -404,6 +381,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         notificationThresholdBytes,
         chunkPCMFrames,
         id,
+        nativeMixerOutputDataCallable!.nativeFunction,
+        currentEngineId,
       );
       if (ret == native.PlayerErrors.noError) {
         _mixerCaptureId = id.value;
