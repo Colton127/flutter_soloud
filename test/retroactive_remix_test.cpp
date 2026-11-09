@@ -272,6 +272,45 @@ void testChordJournalReplay()
     EXPECT(sumA > 1.0, "A lost after B's rollback (sumA %f)", sumA);
 }
 
+// Two retroactive plays at the same playhead: the second rollback restores the
+// checkpoint from before the first birth and replays that birth from the
+// journal. The replayed voice must get resample buffers again and keep
+// consuming its source, so it still sounds after B's short pulse.
+void testChordAtTheSamePlayhead()
+{
+    Rig rig;
+    PulseSource a(4096, 0.5f);
+    PulseSource b(64, 0.5f);
+
+    rig.topUp();
+    rig.discard(2048);
+    const SoLoud::handle ha = rig.engine.play(a);  // onset at ring frame 2048
+    const SoLoud::handle hb = rig.engine.play(b);  // same playhead, same onset
+    EXPECT(ha != 0 && hb != 0, "plays failed");
+
+    std::vector<float> buf = rig.readAll();  // starts at ring frame 2048
+    const unsigned int frames = (unsigned int)(buf.size() / 2);
+    EXPECT(frames >= 1024, "window too small: %u", frames);
+
+    double sumEarly = 0;
+    for (unsigned int i = 0; i < 64; ++i)
+        sumEarly += std::fabs(buf[i * 2]);
+    // Frames 128..1024: A alone. If the replayed birth lost its resample
+    // buffers, A stops consuming its source and this region is silent.
+    double sumA = 0;
+    for (unsigned int i = 128; i < 1024 && i < frames; ++i)
+        sumA += std::fabs(buf[i * 2]);
+    EXPECT(sumEarly > 1.0, "nothing audible at the shared onset (%f)", sumEarly);
+    EXPECT(sumA > 1.0, "A lost after B's rollback at the same playhead (sumA %f)",
+           sumA);
+    // A plus B for the first 64 frames, A alone afterwards: about twice A's
+    // per-frame level at the onset.
+    if (sumA > 1.0)
+        EXPECT(sumEarly / 64.0 > 1.5 * (sumA / 896.0),
+               "B missing at the shared onset (early %f, A %f)", sumEarly / 64.0,
+               sumA / 896.0);
+}
+
 // The device callback tops the ring up and copies its unread frames out, on its
 // own thread, while control threads start voices that land in that unread
 // window and re-mix it. The top-up's ring write, the device's ring read, and
@@ -725,6 +764,7 @@ int main(int argc, char **argv)
 
     run("insertion", testRetroactivePlayInsertion);
     run("chord", testChordJournalReplay);
+    run("chord-same-playhead", testChordAtTheSamePlayhead);
     run("scheduled", testScheduledInWindow);
     run("fallback", testFallbackNonRestorable);
     run("ended", testEndedReconciliation);

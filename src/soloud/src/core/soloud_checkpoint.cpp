@@ -794,6 +794,12 @@ namespace SoLoud
 				// Pristine resampler state: the birth snapshot predates any
 				// pool block assignment; the next calcActiveVoices_internal
 				// re-assigns and zeroes the blocks.
+				// ###### flutter_soloud local patch (replayed resampler ownership) ######
+				// Restore preserves blocks for voices born after the checkpoint.
+				// Release that ownership too, or mapping sees an owner with null
+				// pointers and never gives this replayed birth its buffers back.
+				for (k = 0; k < mMaxActiveVoices; k++)
+					if (mResampleDataOwner[k] == v) mResampleDataOwner[k] = NULL;
 				v->mResampleData[0] = NULL;
 				v->mResampleData[1] = NULL;
 				v->mSrcOffset = 0;
