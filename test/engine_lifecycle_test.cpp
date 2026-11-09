@@ -845,7 +845,68 @@ void testTeardownDuringActiveMixerCapture()
     resetGlobalState();
 }
 
+/// The capture ring is fed the mixer's own output: interleaved, at the
+/// engine's channel count and sample rate. MixerOutput has no channel mixer
+/// and no resampler, so a capture asking for another channel count would read
+/// the device buffer with the wrong frame size (past its end, for more
+/// channels), and one at another sample rate would be labelled with a rate
+/// its samples are not at. Such a capture must be refused; the engine's own
+/// format, given explicitly or as -1, still starts.
+void testCaptureRefusesAFormatTheMixDoesNotProduce()
+{
+    std::printf("capture refuses a channel count or rate the mix does not produce\n");
+    resetGlobalState();
 
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
+           "the owner should publish its mixer callable");
+
+    struct Case
+    {
+        int sampleRate;
+        int channels;
+        const char *what;
+    };
+    const Case refused[] = {
+        {44100, 8, "more channels than the engine mixes"},
+        {44100, 1, "fewer channels than the engine mixes"},
+        {22050, 2, "another sample rate than the engine's"},
+    };
+    for (const Case &c : refused)
+    {
+        const PlayerErrors error = startMixerCapture(
+            MIXER_OUTPUT_PCM_F32LE, c.sampleRate, c.channels,
+            /*bufferSizeBytes=*/256 * 1024,
+            /*notificationThresholdBytes=*/4096, /*chunkPCMFrames=*/-1);
+        EXPECT(error != noError,
+               "a capture with %s (%d Hz, %d channels) should be refused",
+               c.what, c.sampleRate, c.channels);
+        if (error == noError)
+        {
+            // Let the device feed it, so AddressSanitizer sees what it reads.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            stopMixerCapture();
+        }
+        EXPECT(isMixerCaptureRunning() == 0,
+               "no capture should be left running (%s)", c.what);
+    }
+
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 256 * 1024,
+                             4096, -1) == noError,
+           "a capture in the engine's own format should start");
+    stopMixerCapture();
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, -1, -1, 256 * 1024,
+                             4096, -1) == noError,
+           "a capture following the engine's format (-1) should start");
+    stopMixerCapture();
+
+    resetGlobalState();
+}
 
 /// Zero is a valid filter parameter value (a wet mix of 0, say). Reading it
 /// back for a sound's voice and for a bus must succeed and return it, like
@@ -2642,6 +2703,7 @@ int main()
     testMixerCallbackPublicationIsOwnerScoped();
     testStaleWorkerMixerCallbackCannotBeRevived();
     testTeardownDuringActiveMixerCapture();
+    testCaptureRefusesAFormatTheMixDoesNotProduce();
     testZeroFilterParameterReadsBack();
     testStaleVoiceEndedEventSparesTheNewSession();
     testRetirementWhileVisualizationsDispatch();

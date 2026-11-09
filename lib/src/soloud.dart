@@ -1651,10 +1651,9 @@ interface class SoLoud {
   ///
   /// [format] the desired output format. PCM formats are supported on all
   /// platforms. Compressed formats (Opus, Vorbis, FLAC, WAV) are available when
-  /// the plugin is built with Xiph libraries. The default is PCM F32LE and
-  /// it is the only format that doesn't require conversion (when [sampleRate]
-  /// and [channels] are set to -1) on the native side, so it is
-  /// the most efficient and preferred on mobile.
+  /// the plugin is built with Xiph libraries. The default, PCM F32LE, avoids
+  /// sample-format conversion. All formats use the engine sample rate and
+  /// channel count.
   ///
   /// **WAV caveat:** When [format] is [MixerOutputFormat.wav], the stream emits
   /// a 44-byte header followed by PCM chunks incrementally, just like the other
@@ -1663,9 +1662,11 @@ interface class SoLoud {
   /// [stopMixerOutputStream] and overwrite the first 44 bytes of the saved file
   /// with the returned header.
   ///
-  /// [sampleRate] the sample rate. Use -1 to follow the engine sample rate.
+  /// [sampleRate] must match the engine sample rate. Use -1 to follow it.
+  /// Capture does not resample; another rate is rejected.
   ///
-  /// [channels] the channel count. Use -1 to follow the engine channels.
+  /// [channels] must match the engine channel count. Use -1 to follow it.
+  /// Capture does not remix channels; another count is rejected.
   ///
   /// [bufferSizeBytes] total size of the circular capture buffer.
   ///

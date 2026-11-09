@@ -115,8 +115,8 @@ namespace
   /// a disposed engine.
   ///
   /// Lock ordering: `init_deinit_mutex -> mixer_lifecycle_mutex`. Never the
-  /// reverse — startMixerCapture() releases init_deinit_mutex before taking
-  /// this. Neither is ever held while acquiring the Dart callback gate, which
+  /// reverse — startMixerCapture() retains a PlayerPin and never acquires
+  /// init_deinit_mutex. Neither is held while acquiring the Dart callback gate, which
   /// stays a leaf.
   std::mutex mixer_lifecycle_mutex;
 
@@ -939,21 +939,24 @@ extern "C"
   {
     MixerOutputFormat outputFormat = static_cast<MixerOutputFormat>(format);
 
+    if (engine_shutdown_requested.load(std::memory_order_acquire))
+      return backendNotInited;
+    // Retain the pin through publication too: otherwise teardown/re-init
+    // could replace the engine between format validation and capture start.
+    // This does not wait for init_deinit_mutex, which teardown may hold while
+    // waiting for device work.
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
+      return backendNotInited;
     int sr = sampleRate;
     int ch = channels;
-    if (sr <= 0 || ch <= 0)
     {
-      // Scoped deliberately: init_deinit_mutex must be released before
-      // mixer_lifecycle_mutex is taken, or this inverts the order that
-      // disposeLocked() uses and the two deadlock.
-      std::lock_guard<std::mutex> guard(init_deinit_mutex);
-      if (player.get() != nullptr && player.get()->isInited())
-      {
-        if (sr <= 0)
-          sr = static_cast<int>(player.get()->soloud.getBackendSamplerate());
-        if (ch <= 0)
-          ch = static_cast<int>(player.get()->soloud.getBackendChannels());
-      }
+      const int engineRate = static_cast<int>(pin.get()->soloud.getBackendSamplerate());
+      const int engineChannels = static_cast<int>(pin.get()->soloud.getBackendChannels());
+      if ((sr > 0 && sr != engineRate) || (ch > 0 && ch != engineChannels))
+        return invalidParameter;
+      sr = engineRate;
+      ch = engineChannels;
     }
 
     if (sr <= 0)

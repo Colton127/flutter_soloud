@@ -114,8 +114,8 @@ extern "C"
   /// Start capturing the master mixer output.
   ///
   /// [format] the output format from the MixerOutputFormat enum.
-  /// [sampleRate] desired sample rate, or <=0 to use the engine sample rate.
-  /// [channels] desired channel count, or <=0 to use the engine channel count.
+  /// [sampleRate] engine sample rate, or <=0 to follow it; other rates are refused.
+  /// [channels] engine channel count, or <=0 to follow it; other counts are refused.
   /// [bufferSizeBytes] size of the circular buffer in bytes.
   /// [notificationThresholdBytes] number of available bytes before a callback
   /// is fired.
