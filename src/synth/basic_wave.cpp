@@ -43,7 +43,11 @@ unsigned int BasicwaveInstance::getAudio(float *aBuffer, unsigned int aSamplesTo
 {
     unsigned int i;
     double d = 1.0 / mSamplerate;
-    double targetFrequency = mParent->mFreq;
+    double targetFrequency = mParent->mFreq.load();
+    const bool superwave = mParent->mSuperwave.load();
+    const int waveform = mParent->mWaveform.load();
+    const double detune = mParent->mSuperwaveDetune.load();
+    const double scale = mParent->mSuperwaveScale.load();
 
     // Number of steps for smoothing frequency
     const unsigned int smoothingSteps = aSamplesToRead / 3;
@@ -51,7 +55,7 @@ unsigned int BasicwaveInstance::getAudio(float *aBuffer, unsigned int aSamplesTo
     // Calculate the smoothing factor dynamically
     const double smoothingFactor = smoothingSteps > 0 ? (1.0 / smoothingSteps) : 1.0;
 
-    if (!mParent->mSuperwave)
+    if (!superwave)
     {
         for (i = 0; i < aSamplesToRead; i++)
         {
@@ -69,7 +73,7 @@ unsigned int BasicwaveInstance::getAudio(float *aBuffer, unsigned int aSamplesTo
                 mPhase -= 1.0;
 
             aBuffer[i] = SoLoud::Misc::generateWaveform(
-                             mParent->mWaveform,
+                             waveform,
                              mPhase) *
                          mParent->mADSR.val(mT, 10000000000000.0);
 
@@ -95,14 +99,14 @@ unsigned int BasicwaveInstance::getAudio(float *aBuffer, unsigned int aSamplesTo
 
             // Generate the primary waveform
             aBuffer[i] = SoLoud::Misc::generateWaveform(
-                            mParent->mWaveform, mPhase) *
+                            waveform, mPhase) *
                         mParent->mADSR.val(mT, 10000000000000.0);
 
             // Generate additional harmonics
             for (int j = 0; j < 3; j++)
             {
                 // Calculate the harmonic frequency
-                double harmonicFrequency = mCurrentFrequency * (2.0 + j * mParent->mSuperwaveDetune);
+                double harmonicFrequency = mCurrentFrequency * (2.0 + j * detune);
 
                 // Calculate the harmonic phase increment
                 double harmonicPhaseIncrement = harmonicFrequency * d;
@@ -114,8 +118,8 @@ unsigned int BasicwaveInstance::getAudio(float *aBuffer, unsigned int aSamplesTo
 
                 // Generate the harmonic waveform
                 aBuffer[i] += SoLoud::Misc::generateWaveform(
-                                mParent->mWaveform, mHarmonicPhases[j]) *
-                            mParent->mADSR.val(mT, 10000000000000.0) * mParent->mSuperwaveScale;
+                                waveform, mHarmonicPhases[j]) *
+                            mParent->mADSR.val(mT, 10000000000000.0) * scale;
             }
 
             // Increment the time for ADSR

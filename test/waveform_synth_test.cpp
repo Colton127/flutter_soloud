@@ -12,6 +12,11 @@
 //           bit pattern, so a harmonic phase the constructor leaves
 //           uninitialized turns every generated sample into NaN.
 //
+//   race    The setWaveform*() calls change a waveform that is playing while
+//           the audio thread renders it. The parameters the mixer reads must
+//           not be written unsynchronized; run under ThreadSanitizer
+//           (--tsan), which reports the setters racing
+//           BasicwaveInstance::getAudio().
 //
 // `params` and `race` open the default output device through a Player (the
 // waveform plays at a volume of 0.001); `phases` needs no engine.
@@ -80,9 +85,9 @@ void testLoadWaveformKeepsScaleAndDetune() {
         if (wave == nullptr)
             continue;
         EXPECT(wave->mSuperwaveScale == static_cast<double>(c.scale),
-               "scale should be %f, got %f", c.scale, wave->mSuperwaveScale);
+               "scale should be %f, got %f", c.scale, wave->mSuperwaveScale.load());
         EXPECT(wave->mSuperwaveDetune == static_cast<double>(c.detune),
-               "detune should be %f, got %f", c.detune, wave->mSuperwaveDetune);
+               "detune should be %f, got %f", c.detune, wave->mSuperwaveDetune.load());
         EXPECT(wave->mSuperwave == c.superWave, "superWave should be %d",
                static_cast<int>(c.superWave));
     }
@@ -130,6 +135,48 @@ void testSuperwaveHarmonicsStartAtADefinedPhase() {
     instance->~BasicwaveInstance();
 }
 
+// ---- race -------------------------------------------------------------------
+
+void testSettersWhileTheWaveformPlays() {
+    std::printf("race: setWaveform*() while the waveform plays\n");
+
+    Player player;
+    if (player.init(44100, 512, 2) != noError) {
+        EXPECT(false, "the player should initialize");
+        return;
+    }
+
+    unsigned int hash = 0;
+    EXPECT(player.loadWaveform(SoLoud::Soloud::WAVE_SIN, true, 0.5f, 0.1f, hash) ==
+               noError,
+           "loadWaveform should succeed");
+    unsigned int handle = 0;
+    EXPECT(player.play(hash, handle, 0, 0.001f) == noError && handle != 0,
+           "the waveform should play");
+
+    // Let the device start rendering it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    unsigned int changes = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const float f = static_cast<float>(changes % 100);
+        player.setWaveformFreq(hash, 220.0f + f);
+        player.setWaveformScale(hash, 0.01f * f);
+        player.setWaveformDetune(hash, 0.001f * f);
+        player.setWaveformSuperwave(hash, (changes & 1) != 0);
+        player.setWaveform(hash, static_cast<int>(changes % 4));
+        ++changes;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    std::printf("  %u rounds of parameter changes\n", changes);
+    // A low bound: a sanitizer reporting a race stalls the loop for a while.
+    EXPECT(changes > 20, "too few parameter changes: %u", changes);
+    EXPECT(player.isValidHandle(handle), "the waveform should still be playing");
+
+    player.dispose();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -142,6 +189,8 @@ int main(int argc, char **argv) {
         testLoadWaveformKeepsScaleAndDetune();
     if (wanted("phases"))
         testSuperwaveHarmonicsStartAtADefinedPhase();
+    if (wanted("race"))
+        testSettersWhileTheWaveformPlays();
 
     if (gFailures == 0)
         std::printf("\nAll %d assertions passed.\n", gAssertions);
