@@ -204,6 +204,7 @@ external int wasmStartMixerCapture(
   int bufferSizeBytes,
   int notificationThresholdBytes,
   int chunkPCMFrames,
+  int captureIdPtr,
 );
 
 @JS('Module_soloud._stopMixerCapture')
@@ -260,6 +261,7 @@ external void wasmListPlaybackDevices(
   int deviceIdPtr,
   int isDefaultPtr,
   int nDevicePtr,
+  int capacity,
 );
 
 @JS('Module_soloud._freeListPlaybackDevices')
@@ -646,6 +648,7 @@ external int wasmGetFilterParamNames(
   int filterType,
   int paramsCountPtr,
   int namesPtr,
+  int capacity,
 );
 
 @JS('Module_soloud._addFilter')
@@ -903,3 +906,15 @@ jsDecodeAudioDataWeb(Uint8List bytes) async {
     return null;
   }
 }
+
+@JS('Module_soloud._takeMixerOutputPacket')
+external int wasmTakeMixerOutputPacket(int token, int captureIdPtr);
+
+@JS('Module_soloud._getMixerCaptureId')
+external int wasmGetMixerCaptureId();
+
+@JS('Module_soloud._drainMixerCapturePackets')
+external int wasmDrainMixerCapturePackets(int captureId, int lengthPtr);
+
+@JS('Module_soloud._stopMixerCaptureAndDrain')
+external int wasmStopMixerCaptureAndDrain(int captureId, int lengthPtr);

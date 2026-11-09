@@ -33,6 +33,10 @@ class MixerOutputStreamManager {
 
   /// The broadcast stream of captured mixer output data.
   StreamController<Uint8List>? _streamController;
+  StreamController<Uint8List>? _dispatchingController;
+
+  /// Whether this manager owns a Dart stream, even if native capture stopped.
+  bool get hasStream => _streamController != null;
 
   /// Captures the master mixer output as a [Stream] of [Uint8List] chunks.
   ///
@@ -63,7 +67,19 @@ class MixerOutputStreamManager {
     }
 
     if (_streamController != null) {
-      return _streamController!.stream;
+      if (bindings.isCurrentMixerOutputCapture()) {
+        return _streamController!.stream;
+      }
+      // An engine teardown can stop a worker isolate's native capture without
+      // closing its Dart stream. Finalize that stream before starting again.
+      stop();
+    }
+
+    // Refuse a foreign capture before publishing callbacks for this isolate.
+    if (bindings.isMixerOutputCaptureRunning(probeOwner: true)) {
+      throw SoLoudCppException.fromPlayerError(
+        PlayerErrors.playerAlreadyInited,
+      );
     }
 
     // The controller must be synchronous: [stop] flushes the captured tail
@@ -74,7 +90,7 @@ class MixerOutputStreamManager {
 
     // Ensure the mixer output callback is registered in this isolate so that
     // [bindings.mixerOutputChunkEvents] receives the copied chunks. On FFI
-    // this creates a native callable for the current isolate; on web it is a
+    // this prepares a VM port for the current isolate; on web it is a
     // no-op because the worker plumbing is already shared. Calling this before
     // [startMixerOutputCapture] is safe and idempotent.
     bindings.registerMixerOutputCallback();
@@ -101,62 +117,51 @@ class MixerOutputStreamManager {
 
   void _emitChunk(Uint8List chunk) {
     final controller = _streamController;
-    if (controller == null || controller.isClosed) {
+    if (controller != null) {
+      _emitTo(controller, chunk);
+    }
+  }
+
+  void _emitTo(StreamController<Uint8List> controller, Uint8List chunk) {
+    if (controller.isClosed || chunk.isEmpty) {
       return;
     }
-
-    if (chunk.isEmpty) {
-      return;
+    final previous = _dispatchingController;
+    _dispatchingController = controller;
+    try {
+      controller.add(chunk);
+    } finally {
+      _dispatchingController = previous;
     }
-
-    controller.add(chunk);
   }
 
   /// Stops the mixer output capture stream and releases associated resources.
   void stop() {
+    final controller = _streamController;
+    if (controller == null) {
+      return;
+    }
+    // Detach the old stream before calling listeners. A new start, including
+    // one inside a listener, must own a different controller and subscription.
+    _streamController = null;
     _subscription?.cancel();
     _subscription = null;
-    bindings.stopMixerOutputCapture();
-
-    // Flush any captured data that did not reach the notification threshold.
-    // The native side keeps the buffer alive after stopping so we can copy the
-    // tail synchronously and avoid losing compressed-format headers.
-    _flushRemaining();
-
-    _streamController?.close();
-    _streamController = null;
-  }
-
-  void _flushRemaining() {
-    final controller = _streamController;
-    if (controller == null || controller.isClosed) {
-      return;
+    bindings.stopMixerOutputCapture(onlyOwned: true);
+    final tail = bindings.takeStoppedMixerOutputPackets();
+    void finalize() {
+      _emitTo(controller, tail);
+      controller.close();
     }
 
-    final available = bindings.getMixerOutputAvailableBytes();
-    if (available <= 0) {
-      return;
-    }
-
-    final bufferSize = bindings.getMixerOutputBufferSize();
-    final readOffset = bindings.getMixerOutputReadOffset();
-    final firstLength = available < bufferSize - readOffset
-        ? available
-        : bufferSize - readOffset;
-
-    if (firstLength > 0) {
-      final chunk = bindings.copyMixerOutputBuffer(readOffset, firstLength);
-      if (chunk.isNotEmpty) {
-        controller.add(chunk);
-      }
-    }
-
-    if (available > firstLength) {
-      final secondLength = available - firstLength;
-      final chunk = bindings.copyMixerOutputBuffer(0, secondLength);
-      if (chunk.isNotEmpty) {
-        controller.add(chunk);
-      }
+    if (identical(_dispatchingController, controller)) {
+      // A synchronous controller cannot add or close while firing an event.
+      // The snapshot already owns its bytes, so finalization can safely wait
+      // until that dispatch returns, even across deinit or a new capture.
+      scheduleMicrotask(finalize);
+    } else {
+      // Preserve synchronous tail delivery for callers that cancel their
+      // subscription immediately after a normal stop returns.
+      finalize();
     }
   }
 

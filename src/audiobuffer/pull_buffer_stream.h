@@ -189,7 +189,7 @@ private:
   void resetProbeState();
 
   /// Reset the decoder state for an out-of-buffer seek.
-  void resetDecoderForSeek(uint64_t targetSample);
+  void resetDecoderForSeek(uint64_t targetSample, uint64_t byteOffset);
 
   /// Current start/end of the decoded circular buffer in seconds.
   double getBufferStartTimeLocked() const;
@@ -247,7 +247,9 @@ private:
   /// Guards every non-atomic member above and below that the mixer and the
   /// other threads share: the decoder, the format, the offsets and counters,
   /// the pending seek, the duration probe and the buffers below. A delivery,
-  /// a reset and the Dart-thread getters take it. The mixer only try-locks
+  /// a reset and the Dart-thread getters take it; a reset takes the audio
+  /// mutex first, as the mixer holds it, because the mixer reads the circular
+  /// buffer and counts that read without this mutex. The mixer only try-locks
   /// it while mixing, skipping that work when a delivery holds it, and
   /// blocks on it only to apply a seek or a rewind, which SoLoud runs with
   /// its audio mutex held. So nothing that holds it may wait for the audio

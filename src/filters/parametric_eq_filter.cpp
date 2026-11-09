@@ -28,6 +28,13 @@ ParametricEqInstance::ParametricEqInstance(ParametricEq *aParent) {
 
   initParams(ParametricEq::NUM_PARAMS);
 
+  // Dimensions belong to each voice, just like its FFT allocations. Resizing
+  // one instance must never change the indexing used by a sibling instance.
+  mSTFT_WINDOW_SIZE = mParent->mSTFT_WINDOW_SIZE;
+  mSTFT_WINDOW_HALF = mParent->mSTFT_WINDOW_HALF;
+  mSTFT_WINDOW_TWICE = mParent->mSTFT_WINDOW_TWICE;
+  mFFT_SCALE = mParent->mFFT_SCALE;
+
   // Initialize FFT setup and allocate buffers
   initFFTBuffers();
 
@@ -35,7 +42,7 @@ ParametricEqInstance::ParametricEqInstance(ParametricEq *aParent) {
   initBandParameters();
 
   mParam[0] = mParent->mWet;              // wet param (index 0)
-  mParam[1] = mParent->mSTFT_WINDOW_SIZE; // window size param (index 1)
+  mParam[1] = mSTFT_WINDOW_SIZE; // window size param (index 1)
   mParam[2] = mParent->mBands;            // band count param (index 2)
 }
 
@@ -73,7 +80,7 @@ void ParametricEqInstance::initBandParameters() {
 void ParametricEqInstance::initFFTBuffers() {
   // Safety check: ensure window size is valid
   // PFFFT requires power-of-2 sizes, minimum 16
-  if (mParent->mSTFT_WINDOW_SIZE < 16 || mParent->mSTFT_WINDOW_SIZE > 65536) {
+  if (mSTFT_WINDOW_SIZE < 16 || mSTFT_WINDOW_SIZE > 65536) {
     return; // Invalid window size, don't reallocate
   }
 
@@ -107,23 +114,23 @@ void ParametricEqInstance::initFFTBuffers() {
       mMixBuffer[i] = nullptr;
     }
     // Reset offsets
-    mInputOffset[i] = mParent->mSTFT_WINDOW_SIZE;
-    mMixOffset[i] = mParent->mSTFT_WINDOW_HALF;
+    mInputOffset[i] = mSTFT_WINDOW_SIZE;
+    mMixOffset[i] = mSTFT_WINDOW_HALF;
     mReadOffset[i] = 0;
   }
 
   // Initialize FFT setup for complex transforms
-  mFFTSetup = pffft_new_setup(mParent->mSTFT_WINDOW_SIZE, PFFFT_COMPLEX);
+  mFFTSetup = pffft_new_setup(mSTFT_WINDOW_SIZE, PFFFT_COMPLEX);
 
   // Allocate aligned buffers for FFT
-  mFFTBuffer = (float *)pffft_aligned_malloc(mParent->mSTFT_WINDOW_TWICE *
+  mFFTBuffer = (float *)pffft_aligned_malloc(mSTFT_WINDOW_TWICE *
                                              sizeof(float));
-  mFFTWork = (float *)pffft_aligned_malloc(mParent->mSTFT_WINDOW_TWICE *
+  mFFTWork = (float *)pffft_aligned_malloc(mSTFT_WINDOW_TWICE *
                                            sizeof(float));
-  mTemp = (float *)pffft_aligned_malloc(mParent->mSTFT_WINDOW_TWICE *
+  mTemp = (float *)pffft_aligned_malloc(mSTFT_WINDOW_TWICE *
                                         sizeof(float));
 
-  mParam[1] = mParent->mSTFT_WINDOW_SIZE; // Update window size param (index 1)
+  mParam[1] = mSTFT_WINDOW_SIZE; // Update window size param (index 1)
 }
 
 ParametricEqInstance::~ParametricEqInstance() {
@@ -176,13 +183,13 @@ void ParametricEqInstance::setFilterParameter(unsigned int aAttributeId,
     break;
 
   case 1: // STFT_WINDOW_SIZE
-    if (mParent->mSTFT_WINDOW_SIZE == (int)aValue)
+    if (mSTFT_WINDOW_SIZE == (int)aValue)
       return;
     mParam[1] = (int)aValue;
-    mParent->mSTFT_WINDOW_SIZE = (int)aValue;
-    mParent->mSTFT_WINDOW_HALF = mParent->mSTFT_WINDOW_SIZE >> 1;
-    mParent->mSTFT_WINDOW_TWICE = mParent->mSTFT_WINDOW_SIZE << 1;
-    mParent->mFFT_SCALE = 1.0f / (float)mParent->mSTFT_WINDOW_SIZE;
+    mSTFT_WINDOW_SIZE = (int)aValue;
+    mSTFT_WINDOW_HALF = mSTFT_WINDOW_SIZE >> 1;
+    mSTFT_WINDOW_TWICE = mSTFT_WINDOW_SIZE << 1;
+    mFFT_SCALE = 1.0f / (float)mSTFT_WINDOW_SIZE;
     initFFTBuffers();
     break;
 
@@ -236,8 +243,8 @@ void ParametricEqInstance::filterChannel(float *aBuffer, unsigned int aSamples,
     return;
   }
 
-  if (mParent->mSTFT_WINDOW_TWICE <= 0 ||
-      mParent->mSTFT_WINDOW_TWICE > 131072) {
+  if (mSTFT_WINDOW_TWICE <= 0 ||
+      mSTFT_WINDOW_TWICE > 131072) {
     return;
   }
 
@@ -249,8 +256,8 @@ void ParametricEqInstance::filterChannel(float *aBuffer, unsigned int aSamples,
   // Lazy initialization of buffers for this channel
   if (mInputBuffer[aChannel] == nullptr) {
     mInputBuffer[aChannel] =
-        new float[mParent->mSTFT_WINDOW_TWICE](); // () initializes to zero
-    mMixBuffer[aChannel] = new float[mParent->mSTFT_WINDOW_TWICE]();
+        new float[mSTFT_WINDOW_TWICE](); // () initializes to zero
+    mMixBuffer[aChannel] = new float[mSTFT_WINDOW_TWICE]();
   }
 
   unsigned int ofs = 0;
@@ -260,27 +267,27 @@ void ParametricEqInstance::filterChannel(float *aBuffer, unsigned int aSamples,
   unsigned int readofs = mReadOffset[aChannel];
 
   while (ofs < aSamples) {
-    int samples = mParent->mSTFT_WINDOW_HALF -
-                  (inputofs & (mParent->mSTFT_WINDOW_HALF - 1));
+    int samples = mSTFT_WINDOW_HALF -
+                  (inputofs & (mSTFT_WINDOW_HALF - 1));
     if (ofs + samples > aSamples)
       samples = aSamples - ofs;
     for (int i = 0; i < samples; i++) {
-      mInputBuffer[aChannel][chofs + ((inputofs + mParent->mSTFT_WINDOW_HALF) &
-                                      (mParent->mSTFT_WINDOW_TWICE - 1))] =
+      mInputBuffer[aChannel][chofs + ((inputofs + mSTFT_WINDOW_HALF) &
+                                      (mSTFT_WINDOW_TWICE - 1))] =
           aBuffer[ofs + i];
-      mMixBuffer[aChannel][chofs + ((inputofs + mParent->mSTFT_WINDOW_HALF) &
-                                    (mParent->mSTFT_WINDOW_TWICE - 1))] = 0;
+      mMixBuffer[aChannel][chofs + ((inputofs + mSTFT_WINDOW_HALF) &
+                                    (mSTFT_WINDOW_TWICE - 1))] = 0;
       inputofs++;
     }
 
-    if ((inputofs & (mParent->mSTFT_WINDOW_HALF - 1)) == 0) {
+    if ((inputofs & (mSTFT_WINDOW_HALF - 1)) == 0) {
       // Copy input to FFT buffer (interleaved real/imag format)
-      for (int i = 0; i < mParent->mSTFT_WINDOW_SIZE; i++) {
+      for (int i = 0; i < mSTFT_WINDOW_SIZE; i++) {
         float sample =
             mInputBuffer[aChannel]
-                        [chofs + ((inputofs + mParent->mSTFT_WINDOW_TWICE -
-                                   mParent->mSTFT_WINDOW_HALF + i) &
-                                  (mParent->mSTFT_WINDOW_TWICE - 1))];
+                        [chofs + ((inputofs + mSTFT_WINDOW_TWICE -
+                                   mSTFT_WINDOW_HALF + i) &
+                                  (mSTFT_WINDOW_TWICE - 1))];
         mFFTBuffer[i * 2] = sample;   // Real part
         mFFTBuffer[i * 2 + 1] = 0.0f; // Imaginary part
       }
@@ -290,7 +297,7 @@ void ParametricEqInstance::filterChannel(float *aBuffer, unsigned int aSamples,
                               PFFFT_FORWARD);
 
       // Apply EQ on the transformed complex bins (process all N complex bins)
-      fftFilterChannel(mTemp, mParent->mSTFT_WINDOW_SIZE, aSamplerate, aTime,
+      fftFilterChannel(mTemp, mSTFT_WINDOW_SIZE, aSamplerate, aTime,
                        aChannel, aChannels);
 
       // Inverse FFT (ordered output)
@@ -298,24 +305,24 @@ void ParametricEqInstance::filterChannel(float *aBuffer, unsigned int aSamples,
                               PFFFT_BACKWARD);
 
       // Apply scaling and Hann window for overlap-add
-      for (int i = 0; i < mParent->mSTFT_WINDOW_SIZE; i++) {
+      for (int i = 0; i < mSTFT_WINDOW_SIZE; i++) {
         float window =
             0.5f *
-            (1.0f - cosf((2.0f * M_PI * i) / mParent->mSTFT_WINDOW_SIZE));
-        float sample = mFFTBuffer[i * 2] * mParent->mFFT_SCALE *
+            (1.0f - cosf((2.0f * M_PI * i) / mSTFT_WINDOW_SIZE));
+        float sample = mFFTBuffer[i * 2] * mFFT_SCALE *
                        window; // Only use real part
         mMixBuffer[aChannel]
-                  [chofs + (mixofs & (mParent->mSTFT_WINDOW_TWICE - 1))] +=
+                  [chofs + (mixofs & (mSTFT_WINDOW_TWICE - 1))] +=
             sample;
         mixofs++;
       }
-      mixofs -= mParent->mSTFT_WINDOW_HALF;
+      mixofs -= mSTFT_WINDOW_HALF;
     }
 
     for (int i = 0; i < samples; i++) {
       aBuffer[ofs + i] =
           mMixBuffer[aChannel]
-                    [chofs + (readofs & (mParent->mSTFT_WINDOW_TWICE - 1))];
+                    [chofs + (readofs & (mSTFT_WINDOW_TWICE - 1))];
       readofs++;
     }
 

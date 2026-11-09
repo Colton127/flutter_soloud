@@ -20,6 +20,7 @@
 #include "soloud_audiosource.h"
 #include "soloud_checkpoint.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -165,7 +166,7 @@ void testBitExactRemix()
     EXPECT(engine.isRenderAheadEnabled(), "ring must be enabled");
 
     const unsigned int expectedPool =
-        (kRenderAhead + kQuantum - 1) / kQuantum + 2;
+        std::max(8u, (kRenderAhead + kQuantum - 1) / kQuantum + 4);
     EXPECT(engine.mCheckpointPool.size() == expectedPool,
            "pool size %zu != expected %u", engine.mCheckpointPool.size(),
            expectedPool);
@@ -265,14 +266,14 @@ void testFindAndRestoreEdgeCases()
     // overwritten.
     std::vector<float> out(kQuantum * 2);
     SoLoud::time firstTime = 0;
-    for (unsigned int q = 0; q < kQuanta; ++q) {
+    for (unsigned int q = 0; q <= engine.mCheckpointPool.size(); ++q) {
         engine.mix(out.data(), kQuantum);
         if (q == 0)
             firstTime = engine.getEngineTime();
     }
 
-    // A time before the oldest retained checkpoint yields -1 (the pool holds
-    // 6 of the 8 captured checkpoints, so the first one is long gone).
+    // More than a pool's worth of boundaries have been captured, so the
+    // first captured time must no longer be retained.
     EXPECT(engine.findCheckpointAtOrBefore_internal(firstTime) == -1,
            "find at an overwritten checkpoint time must return -1");
 

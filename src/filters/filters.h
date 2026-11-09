@@ -37,6 +37,9 @@ public:
 
   bool removeFilter(FilterType filterType);
 
+  /// Discard owners after every live instance has been detached by the caller.
+  void clearDetachedFilters() { filters.clear(); }
+
   std::vector<std::string> getFilterParamNames(FilterType filterType);
 
   /// If [handle]==0 the operation is done to global filters.
@@ -44,8 +47,8 @@ public:
                        int attributeId, float value);
 
   /// If [handle]==0 the operation is done to global filters.
-  float getFilterParams(SoLoud::handle handle, FilterType filterType,
-                        int attributeId);
+  bool getFilterParams(SoLoud::handle handle, FilterType filterType,
+                       int attributeId, float &value);
 
   /// If [handle]==0 the operation is done to global filters.
   void fadeFilterParameter(SoLoud::handle handle, FilterType filterType,

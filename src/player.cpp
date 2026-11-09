@@ -469,8 +469,8 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
     {
         // soloud.init() has already opened and started the device, so the
         // mixer is reading mPostClipScaler by the time this runs. The audio
-        // mutex does NOT order the two -- clip_internal() runs after
-        // unlockAudioMutex_internal() -- so the field is atomic instead; see
+        // mutex does not order the two: clipping holds it, but the setter
+        // does not acquire it. The field remains atomic instead; see
         // its declaration in soloud.h.
         soloud.setPostClipScaler(1.0f);
         mSampleRate = sampleRate;
@@ -660,9 +660,37 @@ PlayerErrors Player::setLinuxAudioBackend(LinuxAudioBackend backend)
 }
 
 // List available playback devices.
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+static std::atomic<int> testPlaybackDeviceCount{-1};
+static std::atomic<bool> testPlaybackDeviceShortNames{false};
+extern "C" FFI_PLUGIN_EXPORT void soloudTestSetPlaybackDeviceShortNames(int enabled) {
+    testPlaybackDeviceShortNames.store(enabled != 0);
+}
+extern "C" FFI_PLUGIN_EXPORT void soloudTestSetPlaybackDeviceCount(int count) {
+    testPlaybackDeviceCount.store(count);
+}
+#endif
+
 std::vector<PlaybackDevice> Player::listPlaybackDevices()
 {
     std::vector<PlaybackDevice> ret;
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+    const int fakeCount = testPlaybackDeviceCount.load();
+    if (fakeCount >= 0) {
+        for (int i = 0; i < fakeCount; ++i) {
+            PlaybackDevice device{};
+            device.name = "Test Output " + std::to_string(i);
+            if (testPlaybackDeviceShortNames.load()) {
+                static const char *const names[] = {"DAC", "HDMI", "USB-A", "\x01" "device", ""};
+                device.name = names[i % 5];
+            }
+            device.id = i;
+            device.isDefault = i == 0;
+            ret.push_back(device);
+        }
+        return ret;
+    }
+#endif
     // Enumerated by the backend so the list comes from the same audio backend
     // the engine opens devices on: the IDs below are only meaningful to that
     // backend, and `init()` / `changeDevice()` hand them straight to it.
@@ -910,7 +938,9 @@ Player::PendingSound Player::decodeMem(
     {
         newSound->sound = std::make_unique<SoLoud::WavStream>();
         newSound->soundType = TYPE_WAVSTREAM;
-        result = static_cast<SoLoud::WavStream *>(newSound->sound.get())->loadMem(mem, length, false, true);
+        result = static_cast<SoLoud::WavStream *>(newSound->sound.get())->loadMem(mem, length, true, true);
+        // The input belongs to the caller. The stream owns its encoded copy,
+        // including when parsing fails and a fallback still needs the input.
     }
 
     pending.error = fromSoLoudError(result);
@@ -1600,7 +1630,7 @@ PlayerErrors Player::loadWaveform(
         sounds.push_back(std::make_unique<ActiveSound>());
         sounds.back().get()->completeFileName = "";
         sounds.back().get()->soundHash = hash;
-        auto basicWave = std::make_unique<Basicwave>((SoLoud::Soloud::WAVEFORM)waveform, superWave, detune, scale);
+        auto basicWave = std::make_unique<Basicwave>((SoLoud::Soloud::WAVEFORM)waveform, superWave, scale, detune);
         basicWave->setSamplerate(mSampleRate);
         sounds.back().get()->sound = std::move(basicWave);
         sounds.back().get()->soundType = TYPE_SYNTH;
@@ -2790,6 +2820,19 @@ float Player::getApproximateVolume(unsigned int channel)
     return Analyzer::instance().getChannelPeak(static_cast<int>(channel));
 }
 
+// A voice can end while this thread holds sounds_mutex: its callback then
+// leaves the handle removal for the next outermost lock holder. Admission
+// and eviction must inspect the published voice state as well as the list,
+// otherwise an already-ended voice consumes a slot or hides the first voice
+// that can actually be evicted. The handle query never waits for the mix.
+static SoLoud::handle firstLiveHandle(SoLoud::Soloud &soloud, const ActiveSound &sound)
+{
+    for (const auto &entry : sound.handle)
+        if (soloud.isValidVoiceHandle(entry.handle))
+            return entry.handle;
+    return 0;
+}
+
 unsigned int Player::getActiveVoiceCount_internal()
 {
     std::lock_guard<SoundsMutex> lock(sounds_mutex);
@@ -2797,6 +2840,19 @@ unsigned int Player::getActiveVoiceCount_internal()
     for (auto &s : sounds)
     {
         count += s->handle.size();
+    }
+    return count;
+}
+
+unsigned int Player::getLiveVoiceCount_internal()
+{
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
+    unsigned int count = 0;
+    for (auto &s : sounds)
+    {
+        for (const auto &entry : s->handle)
+            if (soloud.isValidVoiceHandle(entry.handle))
+                ++count;
     }
     return count;
 }
@@ -2856,7 +2912,7 @@ PlayerErrors Player::play(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -2869,12 +2925,13 @@ PlayerErrors Player::play(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
             // Its idle evaluation is deferred to the release (see SoundsLock).
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -2985,7 +3042,7 @@ PlayerErrors Player::playClocked(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -2998,11 +3055,12 @@ PlayerErrors Player::playClocked(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -3116,7 +3174,7 @@ PlayerErrors Player::playScheduled(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -3129,11 +3187,12 @@ PlayerErrors Player::playScheduled(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -3500,6 +3559,10 @@ void Player::destroyAllSounds()
         {
             soloud.setGlobalFilter(i, nullptr);
         }
+
+        // The engine slots no longer refer to these filters. Remove their
+        // owners too, so the public filter list agrees with the audible state.
+        mFilters.clearDetachedFilters();
 
         // Move all sounds out to destroy them after releasing the lock
         soundsToDestroy = std::move(sounds);
@@ -3998,7 +4061,7 @@ PlayerErrors Player::play3d(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -4011,11 +4074,12 @@ PlayerErrors Player::play3d(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -4138,7 +4202,7 @@ PlayerErrors Player::play3dClocked(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -4151,11 +4215,12 @@ PlayerErrors Player::play3dClocked(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -4257,7 +4322,7 @@ PlayerErrors Player::play3dScheduled(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -4270,11 +4335,12 @@ PlayerErrors Player::play3dScheduled(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -4459,6 +4525,10 @@ void Player::set3dSourceDopplerFactor(
 
 unsigned int Player::createBus()
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     unsigned int id = ++busIdCounter;
     busMap.try_emplace(id, id, &soloud);
     return id;
@@ -4466,6 +4536,10 @@ unsigned int Player::createBus()
 
 void Player::destroyBus(unsigned int busId)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     busMap.erase(busId);
     evaluateAudioDeviceIdle();
 }
@@ -4473,6 +4547,10 @@ void Player::destroyBus(unsigned int busId)
 PlayerErrors Player::busPlayOnEngine(unsigned int busId, float volume,
                                      bool paused, unsigned int &handle)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     handle = 0;
 
     if (!mInited.load(std::memory_order_acquire))
@@ -4507,6 +4585,10 @@ PlayerErrors Player::busPlayOnEngine(unsigned int busId, float volume,
 
 int Player::busSetChannels(unsigned int busId, unsigned int channels)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return -1; // bus not found
@@ -4533,6 +4615,10 @@ PlayerErrors Player::busSetVisualizationEnabled(unsigned int busId,
                                                 VisualizationKind kind,
                                                 int channel)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return busIdNotFound;
@@ -4562,6 +4648,10 @@ PlayerErrors Player::busSetVisualizationEnabled(unsigned int busId,
 
 bool Player::busIsVisualizationEnabled(unsigned int busId)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return false;
@@ -4572,6 +4662,10 @@ bool Player::busIsVisualizationEnabled(unsigned int busId)
 float Player::busGetApproximateVolume(unsigned int busId,
                                       unsigned int channel)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end() || !it->second.analyzer)
         return 0.0f;
@@ -4580,6 +4674,10 @@ float Player::busGetApproximateVolume(unsigned int busId,
 
 void Player::busAnnexSound(unsigned int busId, unsigned int voiceHandle)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return;
@@ -4588,6 +4686,10 @@ void Player::busAnnexSound(unsigned int busId, unsigned int voiceHandle)
 
 unsigned int Player::busGetActiveVoiceCount(unsigned int busId)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return 0;
@@ -4601,4 +4703,13 @@ BusData *Player::findBusData(unsigned int busId)
     if (it == busMap.end())
         return nullptr;
     return &it->second;
+}
+
+PlayerErrors Player::useBusData(
+    unsigned int busId, const std::function<PlayerErrors(BusData &)> &use)
+{
+    SoundsLock lock(sounds_mutex, *this);
+    BusData *const bus = findBusData(busId);
+    if (bus == nullptr) return busIdNotFound;
+    return use(*bus);
 }

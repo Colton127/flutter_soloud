@@ -122,12 +122,23 @@ abstract class FlutterSoLoud {
   );
 
   /// Stop capturing the master mixer output.
+  ///
+  /// With [onlyOwned], a binding that has no capture of its own stops nothing,
+  /// so it cannot stop a capture another isolate started.
   @mustBeOverridden
-  void stopMixerOutputCapture();
+  void stopMixerOutputCapture({bool onlyOwned = false});
+
+  /// Copy and retire pending chunks from the capture just stopped.
+  @mustBeOverridden
+  Uint8List takeStoppedMixerOutputPackets();
 
   /// Whether mixer output capture is currently active.
   @mustBeOverridden
-  bool isMixerOutputCaptureRunning();
+  bool isMixerOutputCaptureRunning({bool probeOwner = false});
+
+  /// Whether the running native capture is the one this binding started.
+  @mustBeOverridden
+  bool isCurrentMixerOutputCapture();
 
   /// Total size of the native capture buffer in bytes.
   @mustBeOverridden

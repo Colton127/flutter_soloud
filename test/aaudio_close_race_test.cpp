@@ -43,6 +43,7 @@
 #include "backend/miniaudio/miniaudio.h"
 
 #include <aaudio/AAudio.h>
+#include <android/api-level.h>
 #include <dlfcn.h>
 
 #include <atomic>
@@ -61,6 +62,11 @@ namespace SoLoud
 	extern ma_context context;
 	void miniaudio_setLowLatency(bool aLowLatency);
 	ma_result miniaudio_listPlaybackDevices(std::vector<ma_device_info> &aDevices);
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+	unsigned int miniaudio_testEnumerationProbeCloses();
+	unsigned int miniaudio_testEnumerationProbeWaits();
+	int miniaudio_testEnumerationBackend();
+#endif
 }
 
 namespace
@@ -124,7 +130,16 @@ void reroute(int32_t deviceId, bool voiceCommunication)
 	AAudioStreamBuilder_setChannelCount(builder, 2);
 	AAudioStreamBuilder_setDeviceId(builder, deviceId);
 	if (voiceCommunication)
-		AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+	{
+		// The close checks also build for API 26, before usage selection was
+		// added. Resolve it at runtime so newer devices still exercise this
+		// callback path while an older device can run the pre-init probe check.
+		using SetUsage = void (*)(AAudioStreamBuilder *, aaudio_usage_t);
+		const auto setUsage = reinterpret_cast<SetUsage>(
+			dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setUsage"));
+		if (setUsage != nullptr)
+			setUsage(builder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+	}
 	AAudioStreamBuilder_setDataCallback(builder, silence, nullptr);
 	AAudioStreamBuilder_setErrorCallback(builder, ignoreError, nullptr);
 	AAudioStream *stream = nullptr;
@@ -157,6 +172,33 @@ int main(int argc, char **argv)
 	// the binder thread pool still runs in them. Keep it loaded, as zygote
 	// does.
 	dlopen("libaaudio.so", RTLD_NOW);
+
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+	// Before engine init the global context has no function table. Enumeration
+	// creates its own context, whose probe closes need the same protection.
+	// Count the intercepted closes even on newer SDKs, where probes should
+	// bypass the delay: both the coverage and the SDK policy are asserted.
+	const auto closesBefore = SoLoud::miniaudio_testEnumerationProbeCloses();
+	const auto waitsBefore = SoLoud::miniaudio_testEnumerationProbeWaits();
+	std::vector<ma_device_info> beforeInitDevices;
+	if (SoLoud::miniaudio_listPlaybackDevices(beforeInitDevices) != MA_SUCCESS) {
+		std::fprintf(stderr, "FAIL: pre-init enumeration failed\n");
+		return 1;
+	}
+	if (SoLoud::miniaudio_testEnumerationBackend() == ma_backend_aaudio) {
+		const auto probeCloses = SoLoud::miniaudio_testEnumerationProbeCloses() - closesBefore;
+		const auto probeWaits = SoLoud::miniaudio_testEnumerationProbeWaits() - waitsBefore;
+		const auto expectedWaits = android_get_device_api_level() <= 30 ? probeCloses : 0;
+		if (probeCloses == 0 || probeWaits != expectedWaits) {
+			std::fprintf(stderr, "FAIL: pre-init probes: %u protected closes, %u waits (expected %u)\n",
+				probeCloses, probeWaits, expectedWaits);
+			return 1;
+		}
+		std::printf("Pre-init probes: %u protected closes, %u waits\n", probeCloses, probeWaits);
+	} else {
+		std::printf("Pre-init AAudio check skipped: enumeration selected another backend\n");
+	}
+#endif
 
 	SoLoud::Soloud soloud;
 	if (soloud.init(SoLoud::Soloud::CLIP_ROUNDOFF, SoLoud::Soloud::MINIAUDIO,

@@ -31,6 +31,16 @@ import 'package:meta/meta.dart';
 /// Callback set in `setBufferStream` for the `onMetadata` closure.
 typedef OnMetadataCallbackTFunction = void Function(int metadataPtr);
 
+// Native exports consume UTF-8 C strings, not Dart UTF-16 code units.
+int _allocateUtf8(String value) {
+  final bytes = utf8.encode(value);
+  final ptr = wasmMalloc(bytes.length + 1);
+  wasmHeapU8.toDart
+    ..setAll(ptr, bytes)
+    ..[ptr + bytes.length] = 0;
+  return ptr;
+}
+
 /// JS/WASM bindings to SoLoud
 @internal
 class FlutterSoLoudWeb extends FlutterSoLoud {
@@ -48,10 +58,8 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   /// session (see engineGeneration in bindings.cpp).
   int _engineGeneration = 0;
 
-  /// Whether the current mixer output capture is using fixed-size PCM chunks.
-  /// When true, the native side advances the circular buffer read position
-  /// before invoking the callback, so Dart must not advance it again.
-  bool _mixerOutputChunkMode = false;
+  int? _mixerCaptureId;
+  Uint8List _stoppedMixerOutput = Uint8List(0);
 
   /// Serializes native engine lifecycle calls (initEngine / changeDevice /
   /// deinit / disposeAllSound).
@@ -191,40 +199,40 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
               'VOICE ENDED EVENT handle: '
               '${(message['value'] as num).toInt()}\n',
         );
-        voiceEndedEventController.add((message['value'] as num).toInt());
+        voiceEndedEventController.add(
+          (message['value'] as num).toInt().toUnsigned(32),
+        );
       case 'mixerOutputData':
-        final offset = (message['offset'] as num).toInt();
+        final token = (message['offset'] as num).toInt();
         final length = (message['length'] as num).toInt();
-        _log.finest(
-          () => 'MIXER OUTPUT DATA EVENT offset: $offset length: $length',
-        );
-        if (length <= 0) return;
-
-        // Copy the data out of the WASM memory buffer and advance the native
-        // read position so the circular buffer can reuse the memory. In fixed
-        // PCM chunk mode the native side already advances the read position,
-        // so Dart must not advance it again.
-        final heapU8 = wasmHeapU8;
-        final bytes = Uint8List.sublistView(
-          heapU8.toDart,
-          offset,
-          offset + length,
-        );
-        mixerOutputChunkController.add(Uint8List.fromList(bytes));
-        if (!_mixerOutputChunkMode) {
-          advanceMixerOutputReadPosition(length);
+        final idPtr = wasmMalloc(4);
+        final data = wasmTakeMixerOutputPacket(token, idPtr);
+        try {
+          if (data == 0 ||
+              wasmGetI32Value(idPtr, 'i32').toUnsigned(32) != _mixerCaptureId) {
+            return;
+          }
+          final bytes = Uint8List.sublistView(
+            wasmHeapU8.toDart,
+            data,
+            data + length,
+          );
+          mixerOutputChunkController.add(Uint8List.fromList(bytes));
+        } finally {
+          wasmFree(data);
+          wasmFree(idPtr);
         }
     }
   }
 
   /// If we will need to send messages to the native. Not used now.
   void sendMessageToWasmWorker(String message, int value) {
-    final messagePtr = wasmMalloc(message.length);
-    for (var i = 0; i < message.length; i++) {
-      wasmSetValue(messagePtr + i, message.codeUnits[i], 'i8');
+    final ptr = _allocateUtf8(message);
+    try {
+      wasmSendToWorker(ptr, value);
+    } finally {
+      wasmFree(ptr);
     }
-    wasmSendToWorker(messagePtr, value);
-    wasmFree(messagePtr);
   }
 
   @override
@@ -239,26 +247,64 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     int notificationThresholdBytes,
     int chunkPCMFrames,
   ) {
-    _mixerOutputChunkMode = format.isPcm && chunkPCMFrames > 0;
-    final ret = wasmStartMixerCapture(
-      format.value,
-      sampleRate,
-      channels,
-      bufferSizeBytes,
-      notificationThresholdBytes,
-      chunkPCMFrames,
-    );
-    return PlayerErrors.values[ret];
+    final idPtr = wasmMalloc(4);
+    try {
+      final ret = wasmStartMixerCapture(
+        format.value,
+        sampleRate,
+        channels,
+        bufferSizeBytes,
+        notificationThresholdBytes,
+        chunkPCMFrames,
+        idPtr,
+      );
+      if (ret == PlayerErrors.noError.index) {
+        _mixerCaptureId = wasmGetI32Value(idPtr, 'i32').toUnsigned(32);
+      }
+      return PlayerErrors.values[ret];
+    } finally {
+      wasmFree(idPtr);
+    }
   }
 
   @override
-  void stopMixerOutputCapture() {
-    _mixerOutputChunkMode = false;
-    wasmStopMixerCapture();
+  void stopMixerOutputCapture({bool onlyOwned = false}) {
+    final id = _mixerCaptureId;
+    _mixerCaptureId = null;
+    if (id == null) {
+      if (!onlyOwned) {
+        wasmStopMixerCapture();
+      }
+      return;
+    }
+    // Only a stop that drains a capture of its own replaces the snapshot: a
+    // lifecycle stop may already have saved output for the stream manager.
+    _stoppedMixerOutput = Uint8List(0);
+    final lengthPtr = wasmMalloc(4);
+    var ptr = 0;
+    try {
+      ptr = wasmStopMixerCaptureAndDrain(id, lengthPtr);
+      if (ptr != 0) {
+        final length = wasmGetI32Value(lengthPtr, 'i32').toUnsigned(32);
+        _stoppedMixerOutput = Uint8List.fromList(
+          Uint8List.sublistView(wasmHeapU8.toDart, ptr, ptr + length),
+        );
+      }
+    } finally {
+      wasmFree(ptr);
+      wasmFree(lengthPtr);
+    }
   }
 
   @override
-  bool isMixerOutputCaptureRunning() {
+  Uint8List takeStoppedMixerOutputPackets() {
+    final bytes = _stoppedMixerOutput;
+    _stoppedMixerOutput = Uint8List(0);
+    return bytes;
+  }
+
+  @override
+  bool isMixerOutputCaptureRunning({bool probeOwner = false}) {
     // A deinit can arrive while the WASM module is still instantiating
     // (init and deinit raced at startup): there is no capture running yet,
     // and the exports are not callable anyway.
@@ -266,6 +312,14 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
       return false;
     }
     return wasmIsMixerCaptureRunning() == 1;
+  }
+
+  @override
+  bool isCurrentMixerOutputCapture() {
+    final id = _mixerCaptureId;
+    return id != null &&
+        isMixerOutputCaptureRunning() &&
+        wasmGetMixerCaptureId().toUnsigned(32) == id;
   }
 
   @override
@@ -511,39 +565,31 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   List<PlaybackDevice> listPlaybackDevices() {
-    /// allocate 50 device strings
-    final namesPtr = wasmMalloc(50 * 255);
-    final deviceIdPtr = wasmMalloc(50 * 4);
-    final isDefaultPtr = wasmMalloc(50 * 4);
-    final nDevicesPtr = wasmMalloc(4); // 4 bytes for an int32
-
-    wasmListPlaybackDevices(namesPtr, deviceIdPtr, isDefaultPtr, nDevicesPtr);
-
-    final nDevices = wasmGetI32Value(nDevicesPtr, 'i32');
-    final devices = <PlaybackDevice>[];
-    for (var i = 0; i < nDevices; i++) {
-      final namePtr = wasmGetI32Value(namesPtr + i * 4, 'i32');
-      final name = wasmUtf8ToString(namePtr);
-      final deviceId = wasmGetI32Value(
-        wasmGetI32Value(deviceIdPtr + i * 4, 'i32'),
-        'i32',
-      );
-      final isDefault = wasmGetI32Value(
-        wasmGetI32Value(isDefaultPtr + i * 4, 'i32'),
-        'i32',
-      );
-
-      devices.add(PlaybackDevice(deviceId, isDefault == 1, name));
+    const capacity = 255;
+    final names = wasmMalloc(capacity * 4);
+    final ids = wasmMalloc(capacity * 4);
+    final defaults = wasmMalloc(capacity * 4);
+    final countPtr = wasmMalloc(4);
+    var count = 0;
+    try {
+      wasmListPlaybackDevices(names, ids, defaults, countPtr, capacity);
+      count = wasmGetI32Value(countPtr, 'i32');
+      return [
+        for (var i = 0; i < count; i++)
+          PlaybackDevice(
+            wasmGetI32Value(wasmGetI32Value(ids + i * 4, 'i32'), 'i32'),
+            wasmGetI32Value(wasmGetI32Value(defaults + i * 4, 'i32'), 'i32') ==
+                1,
+            wasmUtf8ToString(wasmGetI32Value(names + i * 4, 'i32')),
+          ),
+      ];
+    } finally {
+      wasmFreeListPlaybackDevices(names, ids, defaults, count);
+      wasmFree(names);
+      wasmFree(ids);
+      wasmFree(defaults);
+      wasmFree(countPtr);
     }
-
-    wasmFreeListPlaybackDevices(namesPtr, deviceIdPtr, isDefaultPtr, nDevices);
-
-    wasmFree(nDevicesPtr);
-    wasmFree(deviceIdPtr);
-    wasmFree(isDefaultPtr);
-    wasmFree(namesPtr);
-
-    return devices;
   }
 
   @override
@@ -631,16 +677,11 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   ) {
     final hashPtr = wasmMalloc(4); // 4 bytes for an int32
     final bytesPtr = wasmMalloc(buffer.length);
-    final pathPtr = wasmMalloc(uniqueName.length);
+    final pathPtr = _allocateUtf8(uniqueName);
 
     /// Copy the buffer into WASM memory using the HEAPU8 view.
     final heapU8 = wasmHeapU8;
     heapU8.toDart.setAll(bytesPtr, buffer);
-
-    /// Copy the path string into WASM memory.
-    for (var i = 0; i < uniqueName.length; i++) {
-      wasmSetValue(pathPtr + i, uniqueName.codeUnits[i], 'i8');
-    }
 
     final result = wasmLoadMem(
       pathPtr,
@@ -671,17 +712,12 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     final hashPtr = wasmMalloc(4); // 4 bytes for an int32
     final bytes1Ptr = wasmMalloc(bufferLeft.length);
     final bytes2Ptr = wasmMalloc(bufferRight.length);
-    final pathPtr = wasmMalloc(uniqueName.length);
+    final pathPtr = _allocateUtf8(uniqueName);
 
     /// Copy the buffers into WASM memory using the HEAPU8 view.
     final heapU8 = wasmHeapU8;
     heapU8.toDart.setAll(bytes1Ptr, bufferLeft);
     heapU8.toDart.setAll(bytes2Ptr, bufferRight);
-
-    /// Copy the path string into WASM memory.
-    for (var i = 0; i < uniqueName.length; i++) {
-      wasmSetValue(pathPtr + i, uniqueName.codeUnits[i], 'i8');
-    }
 
     final result = wasmJoinTwoSources(
       pathPtr,
@@ -747,7 +783,9 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
       // change it on the C++ side as well.
       globalThis.setProperty(
         'dartOnBufferingCallback_$hash'.toJS,
-        onBuffering.toJS,
+        ((bool buffering, int handle, double time) {
+          onBuffering(buffering, handle.toUnsigned(32), time);
+        }).toJS,
       );
     }
 
@@ -803,7 +841,9 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     if (onBuffering != null) {
       globalThis.setProperty(
         'dartOnBufferingCallback_$hash'.toJS,
-        onBuffering.toJS,
+        ((bool buffering, int handle, double time) {
+          onBuffering(buffering, handle.toUnsigned(32), time);
+        }).toJS,
       );
     }
 
@@ -1032,19 +1072,19 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   ({PlayerErrors error, SoundHandle handle}) speechText(String textToSpeech) {
-    final handlePtr = wasmMalloc(4); // 4 bytes for an int32
-    final textToSpeechPtr = wasmMalloc(textToSpeech.length);
-    final result = wasmSpeechText(textToSpeechPtr, handlePtr);
-
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
-    final ret = (
-      error: PlayerErrors.values[result],
-      handle: SoundHandle(newHandle),
-    );
-    wasmFree(textToSpeechPtr);
-    wasmFree(handlePtr);
-
-    return ret;
+    final handlePtr = wasmMalloc(4);
+    var textPtr = 0;
+    try {
+      textPtr = _allocateUtf8(textToSpeech);
+      final result = wasmSpeechText(textPtr, handlePtr);
+      return (
+        error: PlayerErrors.values[result],
+        handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32').toUnsigned(32)),
+      );
+    } finally {
+      wasmFree(textPtr);
+      wasmFree(handlePtr);
+    }
   }
 
   @override
@@ -1108,7 +1148,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1149,7 +1189,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1229,7 +1269,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1736,29 +1776,44 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   ({PlayerErrors error, List<String> names}) getFilterParamNames(
     FilterType filterType,
   ) {
-    final paramsCountPtr = wasmMalloc(4); // 4 bytes for an int32
-    final namesPtr = wasmMalloc(30 * 20); // list of 30 String with 20 chars
-    final e = wasmGetFilterParamNames(
-      filterType.index,
-      paramsCountPtr,
-      namesPtr,
-    );
-
-    final pNames = <String>[];
-    var offsetPtr = 0;
-    final paramsCount = wasmGetI32Value(paramsCountPtr, 'i32');
-    for (var i = 0; i < paramsCount; i++) {
-      final namePtr = wasmGetI32Value(namesPtr + offsetPtr, 'i32');
-      final name = wasmUtf8ToString(namePtr);
-      offsetPtr += name.length;
-
-      pNames.add(name);
+    final countPtr = wasmMalloc(4);
+    var namesPtr = 0;
+    var capacity = 0;
+    try {
+      var error = wasmGetFilterParamNames(filterType.index, countPtr, 0, 0);
+      if (error != PlayerErrors.noError.index) {
+        return (error: PlayerErrors.values[error], names: <String>[]);
+      }
+      capacity = wasmGetI32Value(countPtr, 'i32');
+      namesPtr = wasmMalloc(capacity * 4);
+      for (var i = 0; i < capacity; i++) {
+        wasmSetValue(namesPtr + i * 4, 0, 'i32');
+      }
+      error = wasmGetFilterParamNames(
+        filterType.index,
+        countPtr,
+        namesPtr,
+        capacity,
+      );
+      final result = <String>[];
+      if (error == PlayerErrors.noError.index) {
+        final count = wasmGetI32Value(countPtr, 'i32');
+        for (var i = 0; i < count; i++) {
+          result.add(
+            wasmUtf8ToString(wasmGetI32Value(namesPtr + i * 4, 'i32')),
+          );
+        }
+      }
+      return (error: PlayerErrors.values[error], names: result);
+    } finally {
+      if (namesPtr != 0) {
+        for (var i = 0; i < capacity; i++) {
+          wasmFree(wasmGetI32Value(namesPtr + i * 4, 'i32'));
+        }
+        wasmFree(namesPtr);
+      }
+      wasmFree(countPtr);
     }
-
-    final ret = (error: PlayerErrors.values[e], names: pNames);
-    wasmFree(namesPtr);
-    wasmFree(paramsCountPtr);
-    return ret;
   }
 
   @override
@@ -1868,7 +1923,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1919,7 +1974,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -1972,7 +2027,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
 
     /// "*" means unsigned int 32
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
+    final newHandle = wasmGetI32Value(handlePtr, 'i32').toUnsigned(32);
     final ret = (
       error: PlayerErrors.values[result],
       newHandle: SoundHandle(newHandle),
@@ -2141,41 +2196,39 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     bool average = false,
   }) {
     final bufferPtr = wasmMalloc(buffer.length);
-
-    /// Copy the buffer into WASM memory using the HEAPU8 view.
-    final heapU8 = wasmHeapU8;
-    heapU8.toDart.setAll(bufferPtr, buffer);
-
-    final samplesPtr = wasmMalloc(numSamplesNeeded * 4);
-    final error = wasmReadSamplesFromMem(
-      bufferPtr,
-      buffer.length,
-      startTime,
-      endTime,
-      numSamplesNeeded,
-      average,
-      samplesPtr,
-    );
-
-    // Create a view of the WASM memory using JSFloat32Array first
-    final jsHeapF32 = wasmHeapF32;
-    // Convert the TypedArray view to a Dart Float32List
-    final samples = Float32List.sublistView(
-      jsHeapF32.toDart,
-      samplesPtr ~/ 4, // divide by 4 because Float32 is 4 bytes
-      (samplesPtr ~/ 4) + numSamplesNeeded,
-    );
-
-    wasmFree(samplesPtr);
-    wasmFree(bufferPtr);
-
-    if (ReadSamplesErrors.fromValue(error) !=
-        ReadSamplesErrors.readSamplesNoError) {
-      throw SoLoudCppException.fromReadSampleError(
-        ReadSamplesErrors.fromValue(error),
+    var samplesPtr = 0;
+    try {
+      wasmHeapU8.toDart.setAll(bufferPtr, buffer);
+      samplesPtr = wasmMalloc(numSamplesNeeded * 4);
+      final error = wasmReadSamplesFromMem(
+        bufferPtr,
+        buffer.length,
+        startTime,
+        endTime,
+        numSamplesNeeded,
+        average,
+        samplesPtr,
       );
+      if (ReadSamplesErrors.fromValue(error) !=
+          ReadSamplesErrors.readSamplesNoError) {
+        throw SoLoudCppException.fromReadSampleError(
+          ReadSamplesErrors.fromValue(error),
+        );
+      }
+      // Neither a JS typed-array conversion nor sublistView owns WASM bytes.
+      // Copy before releasing allocations or allowing the next call to
+      // reuse them.
+      return Float32List.fromList(
+        Float32List.sublistView(
+          wasmHeapF32.toDart,
+          samplesPtr ~/ 4,
+          samplesPtr ~/ 4 + numSamplesNeeded,
+        ),
+      );
+    } finally {
+      wasmFree(samplesPtr);
+      wasmFree(bufferPtr);
     }
-    return samples;
   }
 
   /////////////////////////////////////////
@@ -2215,7 +2268,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     );
     final ret = (
       error: PlayerErrors.values[result],
-      handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32')),
+      handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32').toUnsigned(32)),
     );
     wasmFree(handlePtr);
 

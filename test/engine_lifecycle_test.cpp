@@ -57,6 +57,7 @@
 #include "audiobuffer/metadata_ffi.h"
 #include "device_lifecycle_test_hooks.h"
 #include "enums.h"
+#include "filters/parametric_eq_filter.h"
 #include "native_stream/native_stream_source.h"
 
 #include <atomic>
@@ -95,9 +96,21 @@ extern "C"
     enum PlayerErrors startMixerCapture(int format, int sampleRate, int channels,
                                         int bufferSizeBytes,
                                         int notificationThresholdBytes,
-                                        int chunkPCMFrames);
+                                        int chunkPCMFrames,
+                                        unsigned int *captureId = nullptr);
     void stopMixerCapture();
+    unsigned int getMixerCaptureId();
     int isMixerCaptureRunning();
+    enum PlayerErrors isFilterActive(unsigned int, unsigned int,
+                                     enum FilterType, int *);
+    enum PlayerErrors addFilter(unsigned int soundHash, unsigned int busId,
+                                enum FilterType filterType);
+    enum PlayerErrors setFilterParams(unsigned int handle, unsigned int busId,
+                                      enum FilterType filterType,
+                                      int attributeId, float value);
+    enum PlayerErrors getFilterParams(unsigned int handle, unsigned int busId,
+                                      enum FilterType filterType,
+                                      int attributeId, float *filterValue);
     bool setVisualizationCallbackForEngine(dartVisualizationCallback_t callback,
                                            int64_t owner_engine_id);
     void visualizationPacketDone(float *packet);
@@ -168,6 +181,9 @@ extern "C"
     int soloudTestRefusedPlayerPins();
     int soloudTestSoundIsLoaded(unsigned int hash);
     int soloudTestVoiceIsValid(unsigned int handle);
+    int soloudTestSoundHandleCount(unsigned int hash);
+    void soloudTestRunVoiceEndedBody(unsigned int handle, unsigned int generation);
+    unsigned int soloudTestEngineGeneration();
 }
 
 namespace SoLoud
@@ -242,7 +258,15 @@ void onStateChanged(enum PlayerStateEvents *state)
     ++gStateChangedCalls;
 }
 
-void onMixerOutput(unsigned char *, uint64_t) { ++gMixerOutputCalls; }
+extern "C" unsigned char *takeMixerOutputPacket(unsigned char *, unsigned int *);
+extern "C" void nativeFree(void *);
+
+void onMixerOutput(unsigned char *token, uint64_t) {
+    unsigned int captureId = 0;
+    auto *bytes = takeMixerOutputPacket(token, &captureId);
+    nativeFree(bytes);
+    ++gMixerOutputCalls;
+}
 
 // Stand-in for the Dart event loop a NativeCallable.listener posts to. The
 // visualization callable only queues its packet; this thread reports it done,
@@ -830,6 +854,247 @@ void testTeardownDuringActiveMixerCapture()
     EXPECT(dispatched && dispatchesDuringRace > 0,
            "the notification thread must dispatch while the callback is being "
            "republished, or this scenario tests nothing");
+
+    resetGlobalState();
+}
+
+/// The capture ring is fed the mixer's own output: interleaved, at the
+/// engine's channel count and sample rate. MixerOutput has no channel mixer
+/// and no resampler, so a capture asking for another channel count would read
+/// the device buffer with the wrong frame size (past its end, for more
+/// channels), and one at another sample rate would be labelled with a rate
+/// its samples are not at. Such a capture must be refused; the engine's own
+/// format, given explicitly or as -1, still starts.
+void testCaptureRefusesAFormatTheMixDoesNotProduce()
+{
+    std::printf("capture refuses a channel count or rate the mix does not produce\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(setMixerOutputCallbackForEngine(onMixerOutput, kEngineA),
+           "the owner should publish its mixer callable");
+
+    struct Case
+    {
+        int sampleRate;
+        int channels;
+        const char *what;
+    };
+    const Case refused[] = {
+        {44100, 8, "more channels than the engine mixes"},
+        {44100, 1, "fewer channels than the engine mixes"},
+        {22050, 2, "another sample rate than the engine's"},
+    };
+    for (const Case &c : refused)
+    {
+        unsigned int refusedId = 123;
+        const PlayerErrors error = startMixerCapture(
+            MIXER_OUTPUT_PCM_F32LE, c.sampleRate, c.channels,
+            /*bufferSizeBytes=*/256 * 1024,
+            /*notificationThresholdBytes=*/4096, /*chunkPCMFrames=*/-1, &refusedId);
+        EXPECT(refusedId == 0, "a refused start must clear its id output");
+        EXPECT(error != noError,
+               "a capture with %s (%d Hz, %d channels) should be refused",
+               c.what, c.sampleRate, c.channels);
+        if (error == noError)
+        {
+            // Let the device feed it, so AddressSanitizer sees what it reads.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            stopMixerCapture();
+        }
+        EXPECT(isMixerCaptureRunning() == 0,
+               "no capture should be left running (%s)", c.what);
+    }
+
+    unsigned int firstId = 0;
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 256 * 1024,
+                             4096, -1, &firstId) == noError,
+           "a capture in the engine's own format should start");
+    EXPECT(firstId != 0 && firstId == getMixerCaptureId(), "start returns its capture id");
+    stopMixerCapture();
+    unsigned int secondId = 0;
+    EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, -1, -1, 256 * 1024,
+                             4096, -1, &secondId) == noError,
+           "a capture following the engine's format (-1) should start");
+    EXPECT(secondId != 0 && secondId != firstId && secondId == getMixerCaptureId(),
+           "a replacement start returns a different id");
+    stopMixerCapture();
+
+    resetGlobalState();
+}
+
+/// disposeAllSound() detaches every global filter from the engine. The
+/// global filter list must forget them too: otherwise the filter is reported
+/// active while nothing applies it, and adding it again is refused.
+void testDisposeAllSoundsClearsGlobalFilters()
+{
+    resetGlobalState();
+    if (!initEngineAs(kEngineA)) {
+        EXPECT(false, "global dispose filter test init");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(addFilter(0, 0, EchoFilter) == noError, "add global filter before dispose");
+    int index = -1;
+    EXPECT(isFilterActive(0, 0, EchoFilter, &index) == noError && index == 0,
+           "global filter active before dispose");
+    disposeAllSound();
+    EXPECT(isFilterActive(0, 0, EchoFilter, &index) == noError && index == -1,
+           "disposed global filter must be absent, index %d", index);
+    EXPECT(addFilter(0, 0, EchoFilter) == noError,
+           "global filter can be added after disposing all sounds");
+    resetGlobalState();
+}
+
+/// Zero is a valid filter parameter value (a wet mix of 0, say). Reading it
+/// back for a sound's voice and for a bus must succeed and return it, like
+/// any other value; only a missing filter is an error.
+void testZeroFilterParameterReadsBack()
+{
+    std::printf("a zero-valued filter parameter reads back\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+
+    unsigned int hash = 0;
+    EXPECT(loadWaveform(0, false, 0.25f, 1.0f, &hash) == noError,
+           "the waveform should load");
+    EXPECT(addFilter(hash, 0, EchoFilter) == noError,
+           "the sound filter should be added");
+    unsigned int handle = 0;
+    EXPECT(play(hash, 0, 0.0f, 0.0f, false, true, 0.0, 0.0, 0, 0, 1.0f,
+                &handle) == noError &&
+               handle != 0,
+           "the waveform should play");
+
+    float value = -1.0f;
+    EXPECT(setFilterParams(handle, 0, EchoFilter, 0, 0.0f) == noError,
+           "setting the voice's wet to 0 should succeed");
+    PlayerErrors error = getFilterParams(handle, 0, EchoFilter, 0, &value);
+    EXPECT(error == noError, "reading the voice's wet back failed: error %d",
+           static_cast<int>(error));
+    EXPECT(value == 0.0f, "the voice's wet should read back as 0, got %f",
+           value);
+
+    const unsigned int busId = createBus();
+    unsigned int busHandle = 0;
+    EXPECT(busPlayOnEngine(busId, 1.0f, false, &busHandle) == noError,
+           "the bus should play");
+    EXPECT(addFilter(0, busId, EchoFilter) == noError,
+           "the bus filter should be added");
+    value = -1.0f;
+    EXPECT(setFilterParams(0, busId, EchoFilter, 0, 0.0f) == noError,
+           "setting the bus's wet to 0 should succeed");
+    error = getFilterParams(0, busId, EchoFilter, 0, &value);
+    EXPECT(error == noError, "reading the bus's wet back failed: error %d",
+           static_cast<int>(error));
+    EXPECT(value == 0.0f, "the bus's wet should read back as 0, got %f",
+           value);
+
+    // A filter that was never added is still reported as missing.
+    error = getFilterParams(handle, 0, LofiFilter, 0, &value);
+    EXPECT(error == filterNotFound,
+           "a missing filter should be filterNotFound, got %d",
+           static_cast<int>(error));
+
+    // Frequency values can legitimately equal the old missing-filter sentinel.
+    EXPECT(addFilter(hash, 0, ParametricEQFilter) == noError, "add voice EQ");
+    EXPECT(setFilterParams(handle, 0, ParametricEQFilter,
+                           ParametricEq::BAND_FREQ_OFFSET, 9999.0f) == noError,
+           "set voice EQ frequency");
+    error = getFilterParams(handle, 0, ParametricEQFilter,
+                            ParametricEq::BAND_FREQ_OFFSET, &value);
+    EXPECT(error == noError && value == 9999.0f,
+           "voice frequency 9999 must exist, error %d value %f", int(error), value);
+    EXPECT(addFilter(0, busId, ParametricEQFilter) == noError, "add bus EQ");
+    EXPECT(setFilterParams(0, busId, ParametricEQFilter,
+                           ParametricEq::BAND_FREQ_OFFSET, 9999.0f) == noError,
+           "set bus EQ frequency");
+    error = getFilterParams(0, busId, ParametricEQFilter,
+                            ParametricEq::BAND_FREQ_OFFSET, &value);
+    EXPECT(error == noError && value == 9999.0f,
+           "bus frequency 9999 must exist, error %d value %f", int(error), value);
+    error = getFilterParams(0, busId, LofiFilter, 0, &value);
+    EXPECT(error == filterNotFound, "missing bus filter status");
+    error = getFilterParams(0, 0, LofiFilter, 0, &value);
+    EXPECT(error == filterNotFound, "missing global filter status");
+    EXPECT(addFilter(0, 0, ParametricEQFilter) == noError, "add global EQ");
+    EXPECT(setFilterParams(0, 0, ParametricEQFilter,
+                           ParametricEq::BAND_FREQ_OFFSET, 9999.0f) == noError,
+           "set global EQ frequency");
+    error = getFilterParams(0, 0, ParametricEQFilter,
+                            ParametricEq::BAND_FREQ_OFFSET, &value);
+    EXPECT(error == noError && value == 9999.0f, "global frequency 9999 must exist");
+
+    resetGlobalState();
+}
+
+/// On the web (AudioWorklet build) a voice-ended event is posted to the main
+/// thread tagged with the engine session generation of the voice, and its body
+/// runs there later. When the engine was disposed and initialized again in
+/// between, the new SoLoud starts its handle sequence over, so the late event
+/// can name a handle that now belongs to a voice of the new session. The late
+/// event must leave that voice registered.
+void testStaleVoiceEndedEventSparesTheNewSession()
+{
+    std::printf("a stale voice-ended event spares the new session's voice\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    unsigned int oldHash = 0;
+    unsigned int oldHandle = 0;
+    EXPECT(loadWaveform(0, false, 0.25f, 1.0f, &oldHash) == noError,
+           "the waveform should load");
+    EXPECT(play(oldHash, 0, 0.0f, 0.0f, false, true, 0.0, 0.0, 0, 0, 1.0f,
+                &oldHandle) == noError,
+           "the waveform should play");
+    const unsigned int oldGeneration = soloudTestEngineGeneration();
+
+    dispose();
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize again");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    unsigned int newHash = 0;
+    unsigned int newHandle = 0;
+    EXPECT(loadWaveform(0, false, 0.25f, 1.0f, &newHash) == noError,
+           "the waveform should load in the new session");
+    EXPECT(play(newHash, 0, 0.0f, 0.0f, false, true, 0.0, 0.0, 0, 0, 1.0f,
+                &newHandle) == noError,
+           "the waveform should play in the new session");
+    EXPECT(soloudTestEngineGeneration() != oldGeneration,
+           "the new session should have a new generation");
+    EXPECT(newHandle == oldHandle,
+           "the new session should reuse the handle number (%u vs %u), or "
+           "this scenario tests nothing",
+           newHandle, oldHandle);
+    EXPECT(soloudTestSoundHandleCount(newHash) == 1,
+           "the new voice should be registered");
+
+    // The old session's voice-ended event arrives now.
+    soloudTestRunVoiceEndedBody(oldHandle, oldGeneration);
+
+    EXPECT(soloudTestSoundHandleCount(newHash) == 1,
+           "a stale voice-ended event unregistered the new session's voice");
+    EXPECT(soloudTestVoiceIsValid(newHandle) == 1,
+           "the new voice should still be playing");
 
     resetGlobalState();
 }
@@ -2510,6 +2775,10 @@ int main()
     testMixerCallbackPublicationIsOwnerScoped();
     testStaleWorkerMixerCallbackCannotBeRevived();
     testTeardownDuringActiveMixerCapture();
+    testCaptureRefusesAFormatTheMixDoesNotProduce();
+    testZeroFilterParameterReadsBack();
+    testDisposeAllSoundsClearsGlobalFilters();
+    testStaleVoiceEndedEventSparesTheNewSession();
     testRetirementWhileVisualizationsDispatch();
     testRetirementSparesWhatANewerRegistrationStarted();
     testVisualizationSendsOnePacketAtATime();

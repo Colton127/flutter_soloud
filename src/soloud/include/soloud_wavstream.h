@@ -31,10 +31,9 @@ freely, subject to the following restrictions:
 #include "soloud.h"
 
 // ###### flutter_soloud local patch (bounded wavstream seek) ######
-// Wall-clock cap, in microseconds, on the pending seek work one
-// WavStreamInstance::getAudio() call does, on top of its frame budget (see
-// the bounded-seek notes in soloud_wavstream.cpp). getAudio() runs once per
-// SAMPLE_GRANULARITY (512) source frames of playback, so this bounds the CPU
+// Wall-clock cap, in microseconds, on a WavStreamInstance's pending seek work,
+// on top of its frame budget (see soloud_wavstream.cpp). Reads in short loops
+// share the cap within one SAMPLE_GRANULARITY (512) source block, bounding the CPU
 // one seeking voice takes to about cap / (512 frames' duration): 0.5 ms per
 // 11.6 ms at 44.1 kHz, ~4% of real time, however slow the CPU. Not applied
 // on the web, where only the frame budget is (the clock may not be usable on
@@ -64,6 +63,11 @@ namespace SoLoud
 	// changed; 0 leaves only the frame budget. Read by the audio thread at
 	// each getAudio() with seek work pending.
 	extern std::atomic<unsigned int> gWavStreamSeekCallCapUs;
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+	// Test-only accounting of actual forward decoding, across all reads in a
+	// mix block. A per-getAudio timer cannot catch short loops multiplying it.
+	extern std::atomic<unsigned long long> gWavStreamSeekDecodedFrames;
+#endif
 
 	class WavStreamInstance : public AudioSourceInstance
 	{
@@ -109,7 +113,18 @@ namespace SoLoud
 		// seek() itself did.
 		std::chrono::steady_clock::time_point mSeekClockStart;
 		bool mSeekClockFromSeek;
-		// Does up to one call's budget of the pending seek work. True when it
+		// ###### flutter_soloud local patch (seek budget across short reads) ######
+		// A bounded loop can split one 512-frame source read into hundreds
+		// of tiny getAudio() calls. They share a budget and deadline until
+		// that source block is filled, or the mixer starts another quantum.
+		unsigned int mSeekBudgetOutputLeft;
+		long long mSeekBudgetLeft;
+		bool mSeekBudgetInMixer;
+		double mSeekBudgetMixTime;
+		bool mSeekBudgetHasDeadline;
+		bool mSeekBudgetWorked;
+		std::chrono::steady_clock::time_point mSeekBudgetDeadline;
+		// Does up to the remaining budget of the pending seek work. True when it
 		// is all done (or ran into the end).
 		bool advanceSeek_internal();
 		unsigned int seekSkipBudget_internal() const;

@@ -17,8 +17,8 @@
 # skip.
 #
 # Pass --asan to build under AddressSanitizer, or --tsan to build under
-# ThreadSanitizer. A scenario name after it (seek, rewind, reset, callbacks or
-# stress) runs only that scenario.
+# ThreadSanitizer. A scenario name after it (seek, rewind, reset, read-reset,
+# replay, range, callbacks or stress) runs only that scenario.
 
 set -e
 
@@ -61,7 +61,7 @@ else
 fi
 
 c++ -std=c++17 -O2 -w -pthread "${SANITIZER[@]}" \
-    -DWITH_MINIAUDIO \
+    -DWITH_MINIAUDIO -DWITH_NULL \
     -DNO_XIPH_LIBS \
     -DSOLOUD_LIFECYCLE_TEST_HOOKS \
     -I src/soloud/include \
@@ -98,6 +98,7 @@ c++ -std=c++17 -O2 -w -pthread "${SANITIZER[@]}" \
     src/soloud/src/audiosource/vizsn/*.cpp \
     src/soloud/src/audiosource/wav/*.cpp \
     src/soloud/src/backend/miniaudio/soloud_miniaudio.cpp \
+    src/soloud/src/backend/null/soloud_null.cpp \
     "${PLATFORM_LIBS[@]}" \
     -ldl -lm
 

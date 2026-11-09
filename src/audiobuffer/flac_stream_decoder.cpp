@@ -1,6 +1,7 @@
 #if !defined(NO_XIPH_LIBS)
 
 #include "flac_stream_decoder.h"
+#include "metadata_bounds.h"
 #include "../soloud_common.h"
 #include <cstring> // For memcpy
 
@@ -32,7 +33,7 @@ namespace
         size_t pos = 4;
         while (true)
         {
-            if (pos + 4 > data.size())
+            if (!metadataHasBytes(data.size(), pos, 4))
                 return 0; // need more data
 
             const unsigned char blockType = data[pos];
@@ -41,6 +42,10 @@ namespace
                 (static_cast<size_t>(data[pos + 2]) << 8) |
                 static_cast<size_t>(data[pos + 3]);
 
+            // A delivery can end anywhere inside metadata. Do not cache a
+            // declared header range until every payload byte has arrived.
+            if (!metadataHasBytes(data.size(), pos + 4, blockSize))
+                return 0;
             pos += 4 + blockSize;
 
             if (blockType & 0x80)
@@ -164,9 +169,20 @@ std::pair<std::vector<float>, DecoderError> FlacDecoderWrapper::decode(std::vect
             mHeader.assign(m_audioData.begin(), m_audioData.begin() + headerLen);
             SOLOUD_DEBUG_LOG("[FlacDecoderWrapper] captured %zu header bytes\n", headerLen);
         }
-        else if (m_pFlacDecoder == nullptr)
+        else
         {
-            // Need the full header before we can initialize the decoder.
+            if (m_dataEnded)
+            {
+                // No later delivery can complete this metadata. Leaving it
+                // pending would keep a native buffer stream's drain worker
+                // alive forever, retrying the same unusable bytes.
+                m_audioData.clear();
+                m_read_pos = 0;
+                m_drained = true;
+                return {{}, DecoderError::CodecError};
+            }
+            // StreamDecoder may already have initialized the codec. Keep the
+            // input intact until the complete header can be cached for seeks.
             return {{}, DecoderError::NoError};
         }
     }

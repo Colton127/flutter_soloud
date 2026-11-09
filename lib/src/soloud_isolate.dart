@@ -70,6 +70,15 @@ class SoLoudIsolate {
   /// can be called from a non-main isolate. The engine must have been
   /// initialized in the main isolate before calling this method.
   ///
+  /// [sampleRate] and [channels] must match the engine, or be -1 to follow
+  /// its format. Capture does not resample or remix channels.
+  ///
+  /// Engine teardown in another isolate cannot close this isolate's stream.
+  /// Stop it here before the engine is deinitialized to keep all final audio.
+  /// After the engine is initialized again, a new start closes the old stream
+  /// and opens a new capture. While another isolate's capture runs, a start
+  /// here throws and leaves that capture alone.
+  ///
   /// See [SoLoud.startMixerOutputStream] for parameter details.
   @experimental
   Stream<Uint8List> startMixerOutputStream({

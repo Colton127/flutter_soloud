@@ -697,6 +697,79 @@ void testLooping(Source &source) {
     }
 }
 
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+// A loop shorter than one source read makes the core ask for many small
+// reads in one block. Silence while seeking must share one decode allowance
+// across those reads, rather than refreshing it for each tiny request.
+void testShortLoopBudget(Source &source) {
+    std::printf("short loop regions share the source block's seek budget\n");
+    SeekCap cap(0); // Frame count is deterministic, including under sanitizers.
+    unsigned int target = audibleTarget(source, source.frames / 10 * 9);
+    Reference reference(source);
+    reference.want(target, kBlock + 128);
+    reference.want(40000, 2 * kBlock + 128);
+    reference.decode();
+    // A nonzero first frame distinguishes the landing from pending silence,
+    // even for the one-frame region.
+    for (unsigned int i = 0; i < kBlock; ++i) {
+        bool nonzero = false;
+        for (unsigned int c = 0; c < source.channels; ++c)
+            nonzero |= reference.at(target, c) != 0;
+        if (nonzero) break;
+        ++target;
+    }
+    for (unsigned int region : {1u, 16u, 128u}) {
+        Rig rig(source);
+        const auto h = rig.play();
+        rig.soloud.setLooping(h, true);
+        // Exact frame endpoints also permit a one-frame region: the
+        // half-frame time helpers otherwise name the same time for it.
+        rig.soloud.lockAudioMutex_internal();
+        const auto slot = rig.soloud.getVoiceFromHandle_internal(h);
+        rig.soloud.mVoice[slot]->mLoopStartFrame = target;
+        rig.soloud.mVoice[slot]->mLoopEndFrame = target + region;
+        rig.soloud.unlockAudioMutex_internal();
+        rig.soloud.seek(h, seekTime(source, target));
+        SoLoud::gWavStreamSeekDecodedFrames.store(0);
+        rig.mix();
+        const auto decoded = SoLoud::gWavStreamSeekDecodedFrames.load();
+        EXPECT(decoded <= kMp3Budget,
+               "short loop %u: decoded %llu seek frames in one block (budget %u)",
+               region, decoded, kMp3Budget);
+        EXPECT(rig.soloud.isValidVoiceHandle(h), "short loop %u: voice must remain alive", region);
+        unsigned int blocks = 0;
+        while (rig.silent() && blocks++ < maxSilentCalls(target))
+            rig.mix();
+        EXPECT(!rig.silent(), "short loop %u: pending seek must eventually land", region);
+        bool exact = true;
+        for (unsigned int i = 0; i < region; ++i)
+            exact &= rig.matches(reference, i, target + i);
+        EXPECT(exact, "short loop %u: first pass must be sample exact", region);
+    }
+    // A normal region permits at most one restart in a source block. Entering
+    // it near its end must retain the old allowance for that restart, rather
+    // than spend it on the initial seek and introduce silence into the loop.
+    for (unsigned int region : {kBlock, 2 * kBlock}) {
+        const unsigned int start = 40000;
+        const unsigned int from = start + region - 100;
+        Rig rig(source);
+        const auto h = rig.play();
+        rig.soloud.setLooping(h, true);
+        rig.soloud.lockAudioMutex_internal();
+        const auto slot = rig.soloud.getVoiceFromHandle_internal(h);
+        rig.soloud.mVoice[slot]->mLoopStartFrame = start;
+        rig.soloud.mVoice[slot]->mLoopEndFrame = start + region;
+        rig.soloud.unlockAudioMutex_internal();
+        rig.soloud.seek(h, seekTime(source, from));
+        rig.mix();
+        bool exact = true;
+        for (unsigned int i = 0; i < kBlock; ++i)
+            exact &= rig.matches(reference, i, i < 100 ? from + i : start + i - 100);
+        EXPECT(exact, "normal loop %u: partial first pass must not add silence", region);
+    }
+}
+#endif
+
 // A mixer thread, seeks and play/stop from this one (for ThreadSanitizer).
 void testThreaded(Source &source) {
     std::printf("%s, %s: mixer thread, seeks from another thread\n", source.name.c_str(), tableName(Mp3Table::None));
@@ -799,6 +872,37 @@ void testFrameBudgetOnly(Source &source, unsigned int target) {
 }
 
 // Other formats whose seeks decode: FLAC, Opus, ADPCM WAV.
+void testUnknownLengthLoopContinuity(Source &source) {
+    SeekCap cap(0);
+    constexpr unsigned int start = 20000;
+    constexpr unsigned int from = start + kBlock - 100;
+    Reference reference(source);
+    reference.want(start, 2 * kBlock);
+    reference.decode();
+    // Ogg permits an unknown sample count. The explicit region still tells
+    // the source that this is a normal full-block loop, rather than a short
+    // region whose repeated seeks must share one allowance.
+    const auto knownLength = source.stream.mSampleCount;
+    source.stream.mSampleCount = 0;
+    {
+        Rig rig(source);
+        const auto h = rig.play();
+        rig.soloud.setLooping(h, true);
+        rig.soloud.lockAudioMutex_internal();
+        const auto slot = rig.soloud.getVoiceFromHandle_internal(h);
+        rig.soloud.mVoice[slot]->mLoopStartFrame = start;
+        rig.soloud.mVoice[slot]->mLoopEndFrame = start + kBlock;
+        rig.soloud.unlockAudioMutex_internal();
+        rig.soloud.seek(h, seekTime(source, from));
+        rig.mix();
+        bool exact = true;
+        for (unsigned int i = 0; i < kBlock; ++i)
+            exact &= rig.matches(reference, i, i < 100 ? from + i : start + i - 100);
+        EXPECT(exact, "unknown Ogg length: normal loop must not add silence");
+    }
+    source.stream.mSampleCount = knownLength;
+}
+
 void testOtherFormat(const std::string &path) {
     Source source;
     const std::string name = path.substr(path.find_last_of('/') + 1);
@@ -821,6 +925,8 @@ void testOtherFormat(const std::string &path) {
         checkInstanceSeek(source, ref, std::min(source.frames - kBlock, t + 20 * kBlock), t, what);
     }
     testSmallCap(source, "small cap", {targets[1]});
+    if (source.stream.mFiletype == SoLoud::WAVSTREAM_OGG)
+        testUnknownLengthLoopContinuity(source);
 }
 
 }  // namespace
@@ -859,6 +965,9 @@ int main(int argc, char **argv) {
         longMp3.setMp3Table(Mp3Table::None);
         testSeekWhilePending(longMp3);
         testLooping(longMp3);
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        testShortLoopBudget(longMp3);
+#endif
         testThreaded(longMp3);
         testFrameBudgetOnly(longMp3, audibleTarget(longMp3, longMp3.frames / 3));
     }

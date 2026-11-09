@@ -10,6 +10,7 @@
 // definitions rather than being repeated by hand in Java, Objective-C++ and
 // Dart.
 #include "engine_lifecycle.h"
+#include "mixeroutput/dart_port.h"
 #include "mixeroutput/mixer_output.h"
 #include "mixeroutput/wav_output_encoder.h"
 #include "player.h"
@@ -115,8 +116,8 @@ namespace
   /// a disposed engine.
   ///
   /// Lock ordering: `init_deinit_mutex -> mixer_lifecycle_mutex`. Never the
-  /// reverse — startMixerCapture() releases init_deinit_mutex before taking
-  /// this. Neither is ever held while acquiring the Dart callback gate, which
+  /// reverse — startMixerCapture() retains a PlayerPin and never acquires
+  /// init_deinit_mutex. Neither is held while acquiring the Dart callback gate, which
   /// stays a leaf.
   std::mutex mixer_lifecycle_mutex;
 
@@ -408,6 +409,9 @@ extern "C"
   std::atomic<dartFileLoadedCallback_t> dartFileLoadedCallback{nullptr};
   std::atomic<dartStateChangedCallback_t> dartStateChangedCallback{nullptr};
   std::atomic<dartMixerOutputDataCallback_t> dartMixerOutputDataCallback{nullptr};
+  std::atomic<mixer_output_port::PostInteger> mixerPostInteger{nullptr};
+  std::atomic<int64_t> mixerOutputPort{0};
+  std::atomic<uint64_t> orphanedMixerCapture{UINT64_MAX};
   std::atomic<dartVisualizationCallback_t> dartVisualizationCallback{nullptr};
 
   /// Monotonic engine session counter, bumped every time the native player
@@ -535,7 +539,7 @@ extern "C"
   static void postMixerOutputToEventWorker(int offset, int length,
                                            int captureId)
   {
-    EM_ASM(
+    const int posted = EM_ASM_INT(
         {
           if (Module_soloud.wasmWorker)
           {
@@ -545,14 +549,17 @@ extern "C"
               length : $1,
               captureId : $2,
             });
+            return 1;
           }
+          return 0;
         },
         offset, length, captureId);
+    if (!posted) MixerOutput::discardPacket(reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(static_cast<uint32_t>(offset))));
   }
 
   /// Notify the web worker that new mixer output data is available.
-  /// [offset] byte offset into the mixer output circular buffer.
-  /// [length] number of contiguous valid bytes.
+  /// [offset] opaque immutable-packet token, passed without dereferencing it.
+  /// [length] number of bytes in the owned packet.
   /// [captureId] identifies the active capture session so the Dart side
   /// can discard stale notifications.
   static void sendMixerOutputToWorker(size_t offset, size_t length,
@@ -587,6 +594,11 @@ extern "C"
   /// on the thread that produced the event.
   static void voiceEndedBody(unsigned int *handle, unsigned int generation)
   {
+    // A worklet notification can outlive the engine that posted it. Handles
+    // restart with a new Player, so reject the old session before touching
+    // native bookkeeping, as well as before notifying Dart.
+    if (generation != engineGeneration.load(std::memory_order_acquire))
+      return;
     if (player != nullptr)
     {
       player->removeHandle(*handle);
@@ -762,6 +774,7 @@ extern "C"
                                    std::memory_order_release);
     // Claiming here retires every earlier registration, this engine's included,
     // and every source that recorded an earlier generation.
+    MixerOutput::discardPackets();
     globalCallbackGeneration = registration.claim(owner_engine_id);
   }
 
@@ -776,9 +789,12 @@ extern "C"
     dartFileLoadedCallback.store(nullptr, std::memory_order_release);
     dartStateChangedCallback.store(nullptr, std::memory_order_release);
     dartMixerOutputDataCallback.store(nullptr, std::memory_order_release);
+    mixerOutputPort.store(0, std::memory_order_release);
+    mixerPostInteger.store(nullptr, std::memory_order_release);
     dartVisualizationCallback.store(nullptr, std::memory_order_release);
     // The packets in flight went to the callable just retired.
     Analyzer::abandonDartDispatches();
+    MixerOutput::discardPackets();
     globalCallbackGeneration = dart_callbacks::kNoGeneration;
     mixerCallbackGeneration = dart_callbacks::kNoGeneration;
     visualizationCallbackGeneration = dart_callbacks::kNoGeneration;
@@ -926,29 +942,37 @@ extern "C"
 
   // Mixer output capture exports.
 
-  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCapture(
+  static void dispatchMixerOutputToDart(uint8_t *data, size_t length);
+
+  static PlayerErrors startMixerCaptureInternal(
       int format, int sampleRate, int channels,
       int bufferSizeBytes,
       int notificationThresholdBytes,
-      int chunkPCMFrames)
+      int chunkPCMFrames, unsigned int *captureId,
+      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId,
+      mixer_output_port::PostInteger post = nullptr, int64_t port = 0)
   {
+    if (captureId != nullptr) *captureId = 0;
     MixerOutputFormat outputFormat = static_cast<MixerOutputFormat>(format);
 
+    if (engine_shutdown_requested.load(std::memory_order_acquire))
+      return backendNotInited;
+    // Retain the pin through publication too: otherwise teardown/re-init
+    // could replace the engine between format validation and capture start.
+    // This does not wait for init_deinit_mutex, which teardown may hold while
+    // waiting for device work.
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
+      return backendNotInited;
     int sr = sampleRate;
     int ch = channels;
-    if (sr <= 0 || ch <= 0)
     {
-      // Scoped deliberately: init_deinit_mutex must be released before
-      // mixer_lifecycle_mutex is taken, or this inverts the order that
-      // disposeLocked() uses and the two deadlock.
-      std::lock_guard<std::mutex> guard(init_deinit_mutex);
-      if (player.get() != nullptr && player.get()->isInited())
-      {
-        if (sr <= 0)
-          sr = static_cast<int>(player.get()->soloud.getBackendSamplerate());
-        if (ch <= 0)
-          ch = static_cast<int>(player.get()->soloud.getBackendChannels());
-      }
+      const int engineRate = static_cast<int>(pin.get()->soloud.getBackendSamplerate());
+      const int engineChannels = static_cast<int>(pin.get()->soloud.getBackendChannels());
+      if ((sr > 0 && sr != engineRate) || (ch > 0 && ch != engineChannels))
+        return invalidParameter;
+      sr = engineRate;
+      ch = engineChannels;
     }
 
     if (sr <= 0)
@@ -969,19 +993,110 @@ extern "C"
     if (engine_shutdown_requested.load(std::memory_order_acquire))
       return backendNotInited;
 
-    return MixerOutput::instance().start(
+    // Admission is serialized with every start and stop. Check it before
+    // touching the callback: a refused client must leave its owner alone.
+    auto &capture = MixerOutput::instance();
+    // A closed worker port cannot run any cleanup of its own. Reap its
+    // capture here, on the next caller's thread, never by joining the
+    // notification thread from inside that thread's failed post.
+    if (capture.isRunning() &&
+        orphanedMixerCapture.load(std::memory_order_acquire) == capture.captureId())
+      capture.stop();
+    if (capture.isRunning()) return playerAlreadyInited;
+    const bool publish = callback != nullptr || post != nullptr;
+    if (publish) {
+      {
+        // The gate is a leaf: validate and publish, then release it before
+        // encoder initialization, thread creation or other capture work.
+        // Retirement also releases the gate before taking the lifecycle lock.
+        dart_callbacks::Registration registration;
+        if ((ownerEngineId != kNoEngineId && !registration.isOwnedBy(ownerEngineId)) ||
+            registration.generation() == dart_callbacks::kNoGeneration)
+          return backendNotInited;
+        MixerOutput::discardPackets();
+        dartMixerOutputDataCallback.store(callback, std::memory_order_release);
+        mixerPostInteger.store(post, std::memory_order_release);
+        mixerOutputPort.store(port, std::memory_order_release);
+        orphanedMixerCapture.store(UINT64_MAX, std::memory_order_release);
+        mixerCallbackGeneration = registration.generation();
+      }
+      capture.setDataCallback(dispatchMixerOutputToDart);
+    }
+    const PlayerErrors result = capture.start(
         outputFormat, sr, ch,
         static_cast<size_t>(bufferSizeBytes),
         static_cast<size_t>(notificationThresholdBytes),
         chunkPCMFrames);
+    if (result != noError && publish) {
+      // Nothing is running after a failed start. Do not retain a callable
+      // belonging to an isolate that may return as soon as it sees the error.
+      dart_callbacks::Registration registration;
+      dartMixerOutputDataCallback.store(nullptr, std::memory_order_release);
+      mixerPostInteger.store(nullptr, std::memory_order_release);
+      mixerOutputPort.store(0, std::memory_order_release);
+      mixerCallbackGeneration = dart_callbacks::kNoGeneration;
+    }
+    // Publish the id before releasing the lifecycle lock. A separate query
+    // could observe a replacement capture started by another isolate.
+    if (result == noError && captureId != nullptr)
+      *captureId = MixerOutput::instance().captureId();
+    return result;
   }
 
-  FFI_PLUGIN_EXPORT void stopMixerCapture()
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCapture(
+      int format, int sampleRate, int channels, int bufferSizeBytes,
+      int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId)
+  {
+    return startMixerCaptureInternal(format, sampleRate, channels, bufferSizeBytes,
+        notificationThresholdBytes, chunkPCMFrames, captureId, nullptr, kNoEngineId);
+  }
+
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureOnPort(
+      int format, int sampleRate, int channels, int bufferSizeBytes,
+      int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId,
+      void *apiData, int64_t port, int64_t ownerEngineId)
+  {
+    if (captureId != nullptr) *captureId = 0;
+    const auto post = mixer_output_port::resolve(apiData);
+    if (post == nullptr || port <= 0) return invalidParameter;
+    return startMixerCaptureInternal(format, sampleRate, channels, bufferSizeBytes,
+        notificationThresholdBytes, chunkPCMFrames, captureId, nullptr,
+        ownerEngineId, post, port);
+  }
+
+  // A queued listener receives a token, never a borrowed ring pointer. Taking
+  // it removes its immutable allocation from native ownership. Retirement
+  // frees tokens a closed listener can no longer claim; a late take is inert.
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacket(
+      unsigned char *token, unsigned int *captureId)
+  {
+    return MixerOutput::takePacket(token, *captureId);
+  }
+
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacketWithLength(
+      unsigned char *token, unsigned int *captureId, size_t *length)
+  {
+    return MixerOutput::takePacket(token, *captureId, length);
+  }
+
+  FFI_PLUGIN_EXPORT unsigned int getMixerCaptureId()
+  {
+    return MixerOutput::instance().captureId();
+  }
+
+  FFI_PLUGIN_EXPORT unsigned char *drainMixerCapturePackets(
+      unsigned int captureId, size_t *length)
+  {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
+    return MixerOutput::takeStoppedPackets(captureId, *length);
+  }
+
+  // The caller serializes capture lifecycle changes for the whole operation.
+  static void stopMixerCaptureLocked()
   {
     // Serialized against engine teardown's own stop, and against another
     // isolate's: MixerOutput::stop() joins both worker threads and resets the
     // encoder and queue, none of which survives being run twice at once.
-    std::lock_guard<std::mutex> mixerGuard(mixer_lifecycle_mutex);
 #ifdef __EMSCRIPTEN__
     // On the multi-threaded (AudioWorklet) build the audio callback runs on
     // the worklet rendering thread and encodes inline in onAudioData().
@@ -1006,9 +1121,69 @@ extern "C"
     MixerOutput::instance().stop();
   }
 
+  FFI_PLUGIN_EXPORT void stopMixerCapture()
+  {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
+    stopMixerCaptureLocked();
+  }
+
+  FFI_PLUGIN_EXPORT unsigned char *stopMixerCaptureAndDrain(
+      unsigned int captureId, size_t *length)
+  {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
+    auto &capture = MixerOutput::instance();
+    *length = 0;
+    // A superseded client must not stop a newer capture.
+    if (capture.captureId() != captureId)
+      return MixerOutput::takeStoppedPackets(captureId, *length);
+    stopMixerCaptureLocked();
+    size_t packetLength = 0, tailLength = 0;
+    auto *packets = MixerOutput::takeStoppedPackets(captureId, packetLength);
+    auto *tail = capture.copyStoppedTail(tailLength);
+    if (packetLength == 0) { free(packets); *length = tailLength; return tail; }
+    if (tailLength == 0) { free(tail); *length = packetLength; return packets; }
+    unsigned char *result = nullptr;
+    if (tailLength <= SIZE_MAX - packetLength)
+      result = static_cast<unsigned char *>(malloc(packetLength + tailLength));
+    if (result != nullptr) {
+      memcpy(result, packets, packetLength);
+      memcpy(result + packetLength, tail, tailLength);
+      *length = packetLength + tailLength;
+    }
+    free(packets);
+    free(tail);
+    return result;
+  }
+
+  static int mixerCaptureRunning(bool probeOwner)
+  {
+    auto &capture = MixerOutput::instance();
+    if (!capture.isRunning()) return 0;
+#ifndef __EMSCRIPTEN__
+    const dart_callbacks::InvocationPass pass;
+    const int64_t port = mixerOutputPort.load(std::memory_order_acquire);
+    if (port != 0 && probeOwner) {
+      if (!pass.isLive(mixerCallbackGeneration)) return 0;
+      const auto post = mixerPostInteger.load(std::memory_order_acquire);
+      // A zero probe is ignored by Dart. It also detects an exited worker
+      // when the device is idle and no audio packet can discover the closure.
+      if (post == nullptr || !post(port, 0)) {
+        orphanedMixerCapture.store(capture.captureId(), std::memory_order_release);
+        return 0;
+      }
+    }
+#endif
+    return orphanedMixerCapture.load(std::memory_order_acquire) != capture.captureId();
+  }
+
   FFI_PLUGIN_EXPORT int isMixerCaptureRunning()
   {
-    return MixerOutput::instance().isRunning() ? 1 : 0;
+    return mixerCaptureRunning(false);
+  }
+
+  FFI_PLUGIN_EXPORT int isMixerCaptureRunningForStart()
+  {
+    return mixerCaptureRunning(true);
   }
 
   FFI_PLUGIN_EXPORT unsigned char *getMixerCaptureBufferPointer()
@@ -1040,6 +1215,7 @@ extern "C"
 
   FFI_PLUGIN_EXPORT unsigned char *getMixerOutputWavHeader()
   {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
     const auto &header = MixerOutput::instance().getWavHeader();
     if (header.empty())
     {
@@ -1069,19 +1245,30 @@ extern "C"
     sendMixerOutputToWorker(offset, length,
                             MixerOutput::instance().captureId());
 #else
-    // Held across the call so a retirement cannot return — and the owning
-    // isolate cannot go away — while this trampoline is running. Checked
-    // against the generation *this callable* was published at, not the one
-    // currently live: those differ whenever the mixer callable outlives the
-    // registration it joined.
+    // Snapshot the registered delivery mode under the engine callback gate.
+    // A VM port remains safe even if its worker exits during the post; it
+    // rejects the message instead of invoking an isolate-owned trampoline.
     const dart_callbacks::InvocationPass pass;
     if (!pass.isLive(mixerCallbackGeneration))
+    {
+      MixerOutput::discardPacket(data);
       return;
+    }
+    const int64_t port = mixerOutputPort.load(std::memory_order_acquire);
+    if (port != 0) {
+      if (!mixer_output_port::send(
+              mixerPostInteger.load(std::memory_order_acquire), port, data))
+        orphanedMixerCapture.store(MixerOutput::instance().captureId(),
+                                   std::memory_order_release);
+      return;
+    }
     auto cb = dartMixerOutputDataCallback.load(std::memory_order_acquire);
     if (cb != nullptr)
     {
       cb(data, static_cast<uint64_t>(length));
     }
+    else
+      MixerOutput::discardPacket(data);
 #endif
   }
 
@@ -1109,8 +1296,12 @@ extern "C"
         return false;
       }
 
+      MixerOutput::discardPackets();
       dartMixerOutputDataCallback.store(callback, std::memory_order_release);
       mixerCallbackGeneration = registration.generation();
+      mixerOutputPort.store(0, std::memory_order_release);
+      mixerPostInteger.store(nullptr, std::memory_order_release);
+      orphanedMixerCapture.store(UINT64_MAX, std::memory_order_release);
     }
 
     MixerOutput::instance().setDataCallback(dispatchMixerOutputToDart);
@@ -1604,7 +1795,7 @@ extern "C"
 
   /// List playback devices.
   FFI_PLUGIN_EXPORT void listPlaybackDevices(char **devicesName, int **deviceId,
-                                             int **isDefault, int *n_devices)
+                                             int **isDefault, int *n_devices, int capacity)
   {
     // Deliberately not routed through the global `player`: `dispose()` now runs
     // on a worker isolate, so reading that `unique_ptr` here would race with it
@@ -1612,14 +1803,16 @@ extern "C"
     // directly instead of guarding with the lifecycle mutex — taking that lock
     // would stall this (UI-thread) call for the whole of an in-flight
     // `initEngine()`, which is the very block this release removes.
+    *n_devices = 0;
+    if (capacity <= 0) return;
     std::vector<PlaybackDevice> d = Player::listPlaybackDevices();
 
     int numDevices = 0;
-    for (int i = 0; i < (int)d.size(); i++)
+    for (int i = 0; i < (int)d.size() && numDevices < capacity; i++)
     {
-      /// Check the length first: the character scan below reads the first 5
-      /// bytes, which is only in bounds once the name is known to be longer.
-      if (d[i].name.size() <= 5)
+      // Short printable names are valid devices too. Scan only the bytes
+      // present so the terminating NUL is never mistaken for a control byte.
+      if (d[i].name.empty())
         continue;
 
       bool hasSpecialChar = false;
@@ -1629,7 +1822,7 @@ extern "C"
       /// real devices and should be ignored. Doesn't happen on my Linux
       /// anymore (maybe was a bug on audio drivers?), but worth checking
       /// to be sure.
-      for (int n = 0; n < 5; n++)
+      for (size_t n = 0; n < 5 && n < d[i].name.size(); n++)
       {
         if (d[i].name[n] < 0x20 && d[i].name[n] >= 0)
           hasSpecialChar = true;
@@ -2131,7 +2324,9 @@ extern "C"
   FFI_PLUGIN_EXPORT void soloudTestInvokeMixerOutput()
   {
     unsigned char scratch[4] = {0, 0, 0, 0};
-    dispatchMixerOutputToDart(scratch, sizeof(scratch));
+    auto *token = MixerOutput::copyPacket(scratch, sizeof(scratch),
+                                           MixerOutput::instance().captureId());
+    dispatchMixerOutputToDart(token, sizeof(scratch));
   }
 
   /// True while a Dart callable registered at the current generation may run.
@@ -2192,6 +2387,58 @@ extern "C"
     if (pin.get() == nullptr)
       return -1;
     return pin.get()->getSoundHandleCount(hash);
+  }
+
+  /// Mix [frames] frames into [output] the way the device callback does:
+  /// through the render-ahead ring when it is enabled, else directly. A test
+  /// on the null backend drives sample progress with it.
+  FFI_PLUGIN_EXPORT void soloudTestMixPlayerFrames(float *output,
+                                                  unsigned int frames)
+  {
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
+      return;
+    auto &engine = pin.get()->soloud;
+    if (engine.isRenderAheadEnabled() && engine.mRenderRing.isInited())
+    {
+      engine.renderRingTopUp_internal();
+      const unsigned int read = engine.mRenderRing.read(output, frames);
+      if (read < frames)
+        memset(output + read * engine.getBackendChannels(), 0,
+               (frames - read) * engine.getBackendChannels() * sizeof(float));
+    }
+    else
+    {
+      engine.mix(output, frames);
+    }
+  }
+
+  FFI_PLUGIN_EXPORT float soloudTestVoiceSampleRate(unsigned int handle)
+  {
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited()) return 0;
+    auto &engine = pin.get()->soloud;
+    engine.lockAudioMutex_internal();
+    const int index = engine.getVoiceFromHandle_internal(handle);
+    const float rate = index < 0 ? 0 : engine.mVoice[index]->mBaseSamplerate;
+    engine.unlockAudioMutex_internal();
+    return rate;
+  }
+
+  /// Run the voice-ended body for [handle], tagged with the engine session
+  /// [generation], the way the web AudioWorklet build runs it on the main
+  /// browser thread some time after the voice ended (voiceEndedForwardToMain).
+  FFI_PLUGIN_EXPORT void soloudTestRunVoiceEndedBody(unsigned int handle,
+                                                     unsigned int generation)
+  {
+    voiceEndedBody(&handle, generation);
+  }
+
+  /// The current engine session generation (getEngineGeneration() is only
+  /// exported on the web).
+  FFI_PLUGIN_EXPORT unsigned int soloudTestEngineGeneration()
+  {
+    return engineGeneration.load(std::memory_order_acquire);
   }
 #endif
 
@@ -3833,10 +4080,11 @@ extern "C"
       }
       else
       {
-        auto *busData = pin.get()->findBusData(busId);
-        if (busData == nullptr)
-          return busIdNotFound;
-        *index = busData->filters.isFilterActive(filterType);
+        return pin.get()->useBusData(busId, [&](BusData &bus)
+        {
+          *index = bus.filters.isFilterActive(filterType);
+          return noError;
+        });
       }
     }
 
@@ -3849,21 +4097,33 @@ extern "C"
   /// Returns [PlayerErrors.noError] if no errors and the list of param names.
   FFI_PLUGIN_EXPORT enum PlayerErrors
   getFilterParamNames(enum FilterType filterType, int *paramsCount,
-                      char **names)
+                      char **names, int capacity)
   {
-    const PlayerPin pin(PlayerPinKind::operation);
+    if (paramsCount == nullptr || capacity < 0)
+      return invalidParameter;
     *paramsCount = 0;
+    const PlayerPin pin(PlayerPinKind::operation);
     if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    std::vector<std::string> pNames =
-        pin.get()->mFilters.getFilterParamNames(filterType);
+    const auto pNames = pin.get()->mFilters.getFilterParamNames(filterType);
     *paramsCount = static_cast<int>(pNames.size());
-    *names = (char *)malloc(sizeof(char *) * *paramsCount);
-    // printf("C  paramsCount: %p  **names: %p\n", paramsCount, names);
-    for (int i = 0; i < *paramsCount; i++)
+    // A null array queries the required capacity. Never write even the first
+    // pointer until the caller has provided space for the entire result.
+    if (names == nullptr)
+      return capacity == 0 ? noError : invalidParameter;
+    if (capacity < *paramsCount)
+      return invalidParameter;
+    for (int i = 0; i < *paramsCount; ++i)
     {
       names[i] = strdup(pNames[i].c_str());
-      printf("C  i: %d  names[i]: %s  names[i]: %p\n", i, names[i], names[i]);
+      if (names[i] == nullptr)
+      {
+        for (int j = 0; j < i; ++j) {
+          free(names[j]);
+          names[j] = nullptr;
+        }
+        return outOfMemory;
+      }
     }
     return noError;
   }
@@ -3894,11 +4154,11 @@ extern "C"
     }
     else
     {
-      auto *busFilters = pin.get()->findBusData(busId);
-      if (busFilters == nullptr)
-        return busIdNotFound;
-      return busFilters->filters.addFilter(filterType);
-    }
+      return pin.get()->useBusData(busId, [&](BusData &bus)
+        {
+          return bus.filters.addFilter(filterType);
+        });
+      }
     return PlayerErrors::noError;
   }
 
@@ -3935,11 +4195,12 @@ extern "C"
       }
       else
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
-          return busIdNotFound;
-        if (!busFilters->filters.removeFilter(filterType))
-          return filterNotFound;
+        return pin.get()->useBusData(busId, [&](BusData &bus)
+        {
+          if (!bus.filters.removeFilter(filterType))
+            return filterNotFound;
+          return noError;
+        });
       }
     }
 
@@ -3976,15 +4237,11 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
-          return busIdNotFound;
-        }
-        else
-        {
-          busFilters->filters.setFilterParams(handle > 0 ? handle : busFilters->handle, filterType, attributeId, value);
-        }
+          bus.filters.setFilterParams(handle > 0 ? handle : bus.handle, filterType, attributeId, value);
+          return noError;
+        });
       }
       else if (handle > 0)
       {
@@ -4006,8 +4263,8 @@ extern "C"
   /// filter.
   /// [busId] the bus to check the filter.
   /// If both [handle] and [busId] are =0 this function searches in the global filters.
-  /// [filterType] filter to modify a param. Returns the value of param or
-  /// 9999.0 if the filter is not found.
+  /// [filterType] filter to read a param from. A missing filter is reported
+  /// through filterNotFound, independently of its parameter values.
   FFI_PLUGIN_EXPORT enum PlayerErrors getFilterParams(unsigned int handle,
                                                       unsigned int busId,
                                                       enum FilterType filterType,
@@ -4018,50 +4275,25 @@ extern "C"
     *filterValue = 9999.0f;
     if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    /// If [handle] == 0 get the parameter from global filters else from
-    /// the sound which owns [handle].
+    const auto read = [&](Filters &filters, unsigned int voice) -> PlayerErrors
+    {
+      if (!filters.getFilterParams(voice, filterType, attributeId, *filterValue))
+        return filterNotFound;
+      return std::isfinite(*filterValue) ? noError : filterParameterGetError;
+    };
     if (handle == 0 && busId == 0)
+      return read(pin.get()->mFilters, 0);
+    if (busId > 0)
     {
-      *filterValue =
-          pin.get()->mFilters.getFilterParams(handle, filterType, attributeId);
-      return noError;
+      return pin.get()->useBusData(busId, [&](BusData &bus)
+      {
+        return read(bus.filters, handle > 0 ? handle : bus.handle);
+      });
     }
-    else
+    return pin.get()->useSoundByHandle(handle, [&](ActiveSound &sound)
     {
-      if (busId > 0)
-      {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
-        {
-          return busIdNotFound;
-        }
-        else
-        {
-          *filterValue =
-              busFilters->filters.getFilterParams(handle > 0 ? handle : busFilters->handle, filterType, attributeId);
-          if (!(isnormal(*filterValue) || isnan(*filterValue)))
-            return filterParameterGetError;
-          if (*filterValue == 9999.0f)
-            return filterNotFound;
-          return noError;
-        }
-      }
-      else
-      {
-        return pin.get()->useSoundByHandle(
-            handle, [&](ActiveSound &s)
-            {
-              *filterValue =
-                  s.filters->getFilterParams(handle, filterType, attributeId);
-              if (!(isnormal(*filterValue) || isnan(*filterValue)))
-                return filterParameterGetError;
-              if (*filterValue == 9999.0f)
-                return filterNotFound;
-              return noError;
-            });
-      }
-    }
-    return PlayerErrors::noError;
+      return read(*sound.filters, handle);
+    });
   }
 
   /// Fades a parameter of a filter.
@@ -4091,17 +4323,13 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
-          return busIdNotFound;
-        }
-        else
-        {
-          busFilters->filters.fadeFilterParameter(handle > 0 ? handle : busFilters->handle,
-                                                  filterType, attributeId, to,
-                                                  time);
-        }
+          bus.filters.fadeFilterParameter(handle > 0 ? handle : bus.handle,
+              filterType, attributeId, to,
+              time);
+          return noError;
+        });
       }
       else
       {
@@ -4145,17 +4373,13 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
-          return busIdNotFound;
-        }
-        else
-        {
-          busFilters->filters.oscillateFilterParameter(handle > 0 ? handle : busFilters->handle,
-                                                       filterType, attributeId,
-                                                       from, to, time);
-        }
+          bus.filters.oscillateFilterParameter(handle > 0 ? handle : bus.handle,
+              filterType, attributeId,
+              from, to, time);
+          return noError;
+        });
       }
       else
       {

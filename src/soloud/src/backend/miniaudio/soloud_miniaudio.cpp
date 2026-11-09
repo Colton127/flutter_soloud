@@ -554,6 +554,16 @@ namespace SoLoud
         return result;
     }
 
+    // ###### flutter_soloud local patch (enumeration close test hooks) ######
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+    static std::atomic<unsigned int> gEnumerationProbeCloses{0};
+    static std::atomic<unsigned int> gEnumerationProbeWaits{0};
+    static std::atomic<int> gEnumerationBackend{-1};
+    unsigned int miniaudio_testEnumerationProbeCloses() { return gEnumerationProbeCloses.load(); }
+    unsigned int miniaudio_testEnumerationProbeWaits() { return gEnumerationProbeWaits.load(); }
+    int miniaudio_testEnumerationBackend() { return gEnumerationBackend.load(); }
+#endif
+
     // Oboe's bounds on the wait before a close (kMinDelayBeforeCloseMillis,
     // kMaxDelayBeforeCloseMillis).
     constexpr ma_int64 kMinDelayBeforeCloseMs = 10;
@@ -576,8 +586,9 @@ namespace SoLoud
     ///
     /// miniaudio closes AAudio streams directly on every path: a device's
     /// uninit, the reroute job after a disconnect, and the streams it opens to
-    /// probe a device. Each goes through `context`'s AAudioStream_close, so
-    /// the wait is added there, in closeAAudioStream(), and miniaudio is
+    /// probe a device. Each goes through its context's AAudioStream_close, so
+    /// the wait is added there, in closeAAudioStream() for the engine and a
+    /// scoped close hook for temporary enumeration contexts. miniaudio is
     /// unchanged.
     ///
     /// As in Oboe, a device stream gets it on every SDK, and on SDK <= 27 (O_MR1)
@@ -590,28 +601,31 @@ namespace SoLoud
     /// Never called on an AAudio callback thread, where AAudio refuses stop
     /// and close: miniaudio closes streams only on application threads and on
     /// its job thread.
-    static void stopAndWaitBeforeClose(ma_AAudioStream *pStream)
+    // ###### flutter_soloud local patch (context-specific close functions) ######
+    // The temporary enumeration context can precede the global engine context,
+    // so every call uses the table belonging to the stream being closed.
+    static void stopAndWaitBeforeClose(ma_context *aContext, ma_AAudioStream *pStream)
     {
         bool requestStop = true;
         if (ma_android_sdk_version() <= 27)
         {
             const ma_aaudio_stream_state_t state =
                 ((MA_PFN_AAudioStream_getState)
-                     context.aaudio.AAudioStream_getState)(pStream);
+                     aContext->aaudio.AAudioStream_getState)(pStream);
             requestStop = state != MA_AAUDIO_STREAM_STATE_STOPPING &&
                           state != MA_AAUDIO_STREAM_STATE_STOPPED;
         }
         // The result is ignored, as in Oboe's close().
         if (requestStop)
             ((MA_PFN_AAudioStream_requestStop)
-                 context.aaudio.AAudioStream_requestStop)(pStream);
+                 aContext->aaudio.AAudioStream_requestStop)(pStream);
 
         const ma_int64 framesPerBurst =
             ((MA_PFN_AAudioStream_getFramesPerBurst)
-                 context.aaudio.AAudioStream_getFramesPerBurst)(pStream);
+                 aContext->aaudio.AAudioStream_getFramesPerBurst)(pStream);
         const ma_int64 sampleRate =
             ((MA_PFN_AAudioStream_getSampleRate)
-                 context.aaudio.AAudioStream_getSampleRate)(pStream);
+                 aContext->aaudio.AAudioStream_getSampleRate)(pStream);
         ma_int64 delayMs = kMinDelayBeforeCloseMs;
         if (framesPerBurst > 0 && sampleRate > 0)
             delayMs = std::clamp<ma_int64>(1 + framesPerBurst * 1000 / sampleRate,
@@ -635,9 +649,67 @@ namespace SoLoud
         // of gOpenDeviceStreams, so an error the stream reports while it is
         // stopped and waited out queues no reroute.
         if (deviceStream || ma_android_sdk_version() <= 30)
-            stopAndWaitBeforeClose(pStream);
+            stopAndWaitBeforeClose(&context, pStream);
         return gCloseAAudioStream(pStream);
     }
+
+    // ###### flutter_soloud local patch (enumeration probe close) ######
+    // Before engine init, enumeration uses a temporary context. Its streams
+    // never pass through the global context's close hook, and the global
+    // function table may still be empty. Keep a close-only hook scoped to
+    // that context, using its own function pointers. Enumeration opens and
+    // closes its probes synchronously on its caller, so thread-local state
+    // carries the context through AAudio's context-free close signature. No
+    // device or reroute hook is installed on this short-lived context.
+    struct EnumerationCloseContext
+    {
+        ma_context *context = nullptr;
+        MA_PFN_AAudioStream_close close = nullptr;
+    };
+    static thread_local EnumerationCloseContext tEnumerationClose;
+
+    static ma_aaudio_result_t closeEnumerationAAudioStream(ma_AAudioStream *pStream)
+    {
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        gEnumerationProbeCloses.fetch_add(1);
+#endif
+        if (ma_android_sdk_version() <= 30)
+        {
+            stopAndWaitBeforeClose(tEnumerationClose.context, pStream);
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+            gEnumerationProbeWaits.fetch_add(1);
+#endif
+        }
+        return tEnumerationClose.close(pStream);
+    }
+
+    class ScopedEnumerationAAudioClose
+    {
+    public:
+        explicit ScopedEnumerationAAudioClose(ma_context &aContext)
+            : mPrevious(tEnumerationClose)
+        {
+            if (aContext.backend != ma_backend_aaudio)
+                return;
+            mContext = &aContext;
+            mClose = (MA_PFN_AAudioStream_close)aContext.aaudio.AAudioStream_close;
+            tEnumerationClose = {mContext, mClose};
+            aContext.aaudio.AAudioStream_close = (ma_proc)closeEnumerationAAudioStream;
+        }
+        ~ScopedEnumerationAAudioClose()
+        {
+            if (mContext == nullptr)
+                return;
+            mContext->aaudio.AAudioStream_close = (ma_proc)mClose;
+            tEnumerationClose = mPrevious;
+        }
+        ScopedEnumerationAAudioClose(const ScopedEnumerationAAudioClose &) = delete;
+        ScopedEnumerationAAudioClose &operator=(const ScopedEnumerationAAudioClose &) = delete;
+    private:
+        EnumerationCloseContext mPrevious;
+        ma_context *mContext = nullptr;
+        MA_PFN_AAudioStream_close mClose = nullptr;
+    };
 
     static void setAAudioErrorCallback(ma_AAudioStreamBuilder *pBuilder,
                                        ma_AAudioStream_errorCallback callback,
@@ -741,7 +813,7 @@ namespace SoLoud
         {
             soloud_platform_log("miniaudio: closing an AAudio stream a failed "
                                 "device initialization left open\n");
-            stopAndWaitBeforeClose(pStream);
+            stopAndWaitBeforeClose(&context, pStream);
             gCloseAAudioStream(pStream);
         }
 #endif
@@ -1143,7 +1215,15 @@ namespace SoLoud
         ma_result result = init_platform_context(&enumerationContext);
         if (result != MA_SUCCESS)
             return result;
-        result = copy_playback_devices(&enumerationContext, aDevices);
+#if defined(MA_HAS_AAUDIO) && defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+        gEnumerationBackend.store(enumerationContext.backend);
+#endif
+        {
+#if defined(MA_HAS_AAUDIO)
+            const ScopedEnumerationAAudioClose closeHook(enumerationContext);
+#endif
+            result = copy_playback_devices(&enumerationContext, aDevices);
+        }
         ma_context_uninit(&enumerationContext);
         return result;
     }
@@ -1244,8 +1324,10 @@ namespace SoLoud
         {
             // Render-ahead ring path: the engine has already mixed
             // renderAheadFrames into its own ring; this callback only copies
-            // out and tops the ring back up. The ring read is lock-free SPSC,
-            // so the device never blocks behind the audio mutex.
+            // out and tops the ring back up.
+            // ###### flutter_soloud local patch (ring copy serialization) ######
+            // The read serializes only with bounded retroactive ring copies;
+            // decoding never holds that copy lock.
             soloud->renderRingTopUp_internal();
             unsigned int got =
                 soloud->mRenderRing.read((float *)pOutput, frameCount);

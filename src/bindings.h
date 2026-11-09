@@ -1,3 +1,4 @@
+#include <stddef.h>
 /// Declarations of every FFI_PLUGIN_EXPORT entry point defined in
 /// `src/bindings.cpp`. This header is the single source of truth for the
 /// native ABI: `src/bindings.cpp` includes it so the definitions are checked
@@ -114,23 +115,50 @@ extern "C"
   /// Start capturing the master mixer output.
   ///
   /// [format] the output format from the MixerOutputFormat enum.
-  /// [sampleRate] desired sample rate, or <=0 to use the engine sample rate.
-  /// [channels] desired channel count, or <=0 to use the engine channel count.
+  /// [sampleRate] engine sample rate, or <=0 to follow it; other rates are refused.
+  /// [channels] engine channel count, or <=0 to follow it; other counts are refused.
   /// [bufferSizeBytes] size of the circular buffer in bytes.
   /// [notificationThresholdBytes] number of available bytes before a callback
   /// is fired.
   /// [chunkPCMFrames] fixed PCM chunk size in frames, or 0 to disable chunk
   /// mode.
+  /// [captureId] receives this capture's id on success, or zero on failure.
+  /// A null pointer is allowed for native callers that do not need the id.
   /// Returns [PlayerErrors.noError] if success.
   FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCapture(
       int format, int sampleRate, int channels, int bufferSizeBytes,
-      int notificationThresholdBytes, int chunkPCMFrames);
+      int notificationThresholdBytes, int chunkPCMFrames,
+      unsigned int *captureId);
+
+  /// Start notifications through a VM native port, safe after isolate exit.
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureOnPort(
+      int format, int sampleRate, int channels, int bufferSizeBytes,
+      int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId,
+      void *apiData, int64_t port, int64_t ownerEngineId);
+  /// Claim a port notification's packet and obtain its owned byte length.
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacketWithLength(
+      unsigned char *token, unsigned int *captureId, size_t *length);
 
   /// Stop capturing the master mixer output.
   FFI_PLUGIN_EXPORT void stopMixerCapture();
+  /// Stop and return owned pending chunks followed by the tail, atomically
+  /// with respect to a restart. Free the returned bytes with nativeFree.
+  FFI_PLUGIN_EXPORT unsigned char *stopMixerCaptureAndDrain(
+      unsigned int captureId, size_t *length);
+
+  /// Claim an immutable capture packet; free the returned bytes with nativeFree.
+  /// Returns null for a retired or already claimed token.
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacket(
+      unsigned char *token, unsigned int *captureId);
+  FFI_PLUGIN_EXPORT unsigned int getMixerCaptureId();
+  /// Owned pending chunks from a stopped capture; free with nativeFree.
+  FFI_PLUGIN_EXPORT unsigned char *drainMixerCapturePackets(
+      unsigned int captureId, size_t *length);
 
   /// Returns 1 if mixer capture is running, 0 otherwise.
   FFI_PLUGIN_EXPORT int isMixerCaptureRunning();
+  /// Check port liveness before admitting a replacement for an exited worker.
+  FFI_PLUGIN_EXPORT int isMixerCaptureRunningForStart();
 
   /// Get the pointer to the circular capture buffer.
   FFI_PLUGIN_EXPORT unsigned char *getMixerCaptureBufferPointer();
@@ -246,10 +274,10 @@ extern "C"
   /// notification callback. This is intentionally absent from the public API.
   FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began);
 
-  /// List playback devices.
+  /// List at most capacity playback devices. n_devices is the number written.
   FFI_PLUGIN_EXPORT void listPlaybackDevices(char **devicesName,
                                              int **deviceId, int **isDefault,
-                                             int *n_devices);
+                                             int *n_devices, int capacity);
 
   /// Change the playback device.
   ///
@@ -1117,10 +1145,13 @@ extern "C"
   /// Get parameters names of the given filter.
   ///
   /// [filterType] filter to get param names.
+  /// Pass names=nullptr and capacity=0 to query the required pointer count.
+  /// The caller supplies that many slots and frees each string with nativeFree.
+  /// Insufficient capacity returns invalidParameter without writing names.
   /// Returns [PlayerErrors.noError] if no errors and the list of param names.
   FFI_PLUGIN_EXPORT enum PlayerErrors
   getFilterParamNames(enum FilterType filterType, int *paramsCount,
-                      char **names);
+                      char **names, int capacity);
 
   /// Add the filter [filterType] to [soundHash]. If [soundHash]==0 the
   /// filter is added to global filters.
@@ -1172,8 +1203,8 @@ extern "C"
   /// [busId] the bus to check the filter.
   /// If both [handle] and [busId] are =0 this function searches in the global
   /// filters.
-  /// [filterType] filter to modify a param. Returns the value of param or
-  /// 9999.0 if the filter is not found.
+  /// [filterType] filter to read a param from. A missing filter is reported
+  /// through filterNotFound, independently of its parameter values.
   FFI_PLUGIN_EXPORT enum PlayerErrors getFilterParams(
       unsigned int handle, unsigned int busId, enum FilterType filterType,
       int attributeId, float *filterValue);

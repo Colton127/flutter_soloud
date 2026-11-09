@@ -19,6 +19,20 @@
 // TODO: readSamplesFromBuffer as for waveform
 
 namespace SoLoud {
+namespace {
+class BufferStreamAudioLock {
+public:
+  explicit BufferStreamAudioLock(Soloud &soloud) : mSoloud(soloud) {
+    mSoloud.lockAudioMutex_internal();
+  }
+  ~BufferStreamAudioLock() { mSoloud.unlockAudioMutex_internal(); }
+  BufferStreamAudioLock(const BufferStreamAudioLock &) = delete;
+  BufferStreamAudioLock &operator=(const BufferStreamAudioLock &) = delete;
+private:
+  Soloud &mSoloud;
+};
+}
+
 std::mutex check_buffer_mutex;
 
 #ifdef MA_ENABLE_AUDIO_WORKLETS
@@ -57,7 +71,7 @@ static void bsOnBufferingMainThread(int isBuffering, int handle, double time,
         var functionName = "dartOnBufferingCallback_" + $3;
         if (typeof window[functionName] === "function") {
           var buffering = $0 == 1 ? true : false;
-          window[functionName](buffering, $1, $2); // Call it
+          window[functionName](buffering, $1 >>> 0, $2); // Call it
         } else {
           console.log("EM_ASM 'dartOnBufferingCallback_$hash' not found.");
         }
@@ -79,6 +93,7 @@ static void clearPlanarBuffer(float *buffer, unsigned int frames,
 BufferStreamInstance::BufferStreamInstance(BufferStream *aParent) {
   mParent = aParent;
   mOffset = 0;
+  mFormatGeneration = mParent != nullptr ? mParent->mFormatGeneration : 0;
   samplerateAlreadySet = false;
   if (mParent != nullptr && mParent->autoTypeSamplerate != 0.f) {
     mBaseSamplerate = mParent->autoTypeSamplerate;
@@ -95,6 +110,7 @@ class BufferStreamSourceStateSnapshot : public SoLoud::SourceStateSnapshot {
 public:
   unsigned int mOffset;
   bool samplerateAlreadySet;
+  uint64_t formatGeneration;
 };
 
 SoLoud::SourceStateSnapshot *BufferStreamInstance::captureSourceState() {
@@ -106,6 +122,7 @@ SoLoud::SourceStateSnapshot *BufferStreamInstance::captureSourceState() {
   auto *s = new BufferStreamSourceStateSnapshot();
   s->mOffset = mOffset;
   s->samplerateAlreadySet = samplerateAlreadySet;
+  s->formatGeneration = mFormatGeneration;
   return s;
 }
 
@@ -117,6 +134,7 @@ void BufferStreamInstance::restoreSourceState(
   }
   mOffset = s->mOffset;
   samplerateAlreadySet = s->samplerateAlreadySet;
+  mFormatGeneration = s->formatGeneration;
 }
 
 
@@ -135,13 +153,23 @@ unsigned int BufferStreamInstance::getAudio(float *aBuffer,
 
   std::lock_guard<std::recursive_mutex> lock(mParent->mBuffer.bufferMutex);
 
+  // Only resetting the live source invalidates an adopted format. The
+  // generation also survives in a voice snapshot, so restoring a checkpoint
+  // made before a reset cannot silently revive the old format latch.
+  if (mFormatGeneration != mParent->mFormatGeneration) {
+    mFormatGeneration = mParent->mFormatGeneration;
+    samplerateAlreadySet = false;
+  }
+
   // When using BufferType::AUTO, samplerate and channels are got from the
   // stream. Hence we need to update them regardless of how are set by
   // setBufferStream. But these parameters need to be set after the play
   // function is called and the instance of this class is created.
   if (!samplerateAlreadySet && mParent->autoTypeSamplerate != 0.f) {
     mBaseSamplerate = mParent->autoTypeSamplerate;
-    mSamplerate = mParent->autoTypeSamplerate;
+    // The effective rate includes both relative speed and doppler. Adopting
+    // a newly detected source format must preserve those voice settings.
+    mSamplerate = mBaseSamplerate * mOverallRelativePlaySpeed;
     mChannels = mParent->autoTypeChannels;
     samplerateAlreadySet = true;
   } else if (mChannels == 0 && mParent->mChannels > 0) {
@@ -401,15 +429,29 @@ PlayerErrors BufferStream::setBufferStream(
 void BufferStream::resetBuffer() {
   stopBackgroundDecode();
   buffer.clear();
-  mBuffer.clear();
-  mSampleCount = 0;
-  mBytesReceived = 0;
-  mUncompressedBytesReceived = 0;
-  mBytesConsumed = 0;
-  dataIsEnded = false;
-  mIsBuffering = true;
-  autoTypeChannels = 0;
-  autoTypeSamplerate = 0.f;
+  // The background worker has been joined before taking the buffer lock.
+  // The mixer reads the detected format under this same lock; clearing it
+  // outside the lock could expose a mixture of the old and reset fields.
+  {
+    // The caller holds sounds_mutex, so take the audio mutex before the
+    // buffer mutex. Only a source reset advances the format generation;
+    // ordinary seeks and loop rewinds retain their established rate.
+    auto &soloud = mThePlayer->soloud;
+    BufferStreamAudioLock audioLock(soloud);
+    {
+      std::lock_guard<std::recursive_mutex> lock(mBuffer.bufferMutex);
+      mBuffer.clear();
+      mSampleCount = 0;
+      mBytesReceived = 0;
+      mUncompressedBytesReceived = 0;
+      mBytesConsumed = 0;
+      dataIsEnded = false;
+      mIsBuffering = true;
+      autoTypeChannels = 0;
+      autoTypeSamplerate = 0.f;
+      ++mFormatGeneration;
+    }
+  }
   if (streamDecoder) {
     streamDecoder = std::make_unique<StreamDecoder>();
     streamDecoder->setBufferIcyMetaInt(mIcyMetaInt);
@@ -834,7 +876,7 @@ void BufferStream::callOnBufferingCallback(bool isBuffering,
           var functionName = "dartOnBufferingCallback_" + $3;
           if (typeof window[functionName] === "function") {
             var buffering = $0 == 1 ? true : false;
-            window[functionName](buffering, $1, $2); // Call it
+            window[functionName](buffering, $1 >>> 0, $2); // Call it
           } else {
             console.log("EM_ASM 'dartOnBufferingCallback_$hash' not found.");
           }

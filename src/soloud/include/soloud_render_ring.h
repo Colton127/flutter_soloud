@@ -6,8 +6,9 @@
 * Interleaved float32 ring sitting between the engine mixer and the output
 * device. The mixer (or a retroactive re-mix) is the single writer, always
 * serialized by the engine audio mutex; the miniaudio device callback is the
-* single reader and never blocks: positions are monotonic 64-bit frame
-* counters read through atomics, so the read side is lock-free SPSC.
+* single reader. Positions are monotonic 64-bit frame counters. Reads and
+* retroactive rewrites serialize their bounded copies, without holding the
+* copy lock during decoding or acquiring the engine audio mutex.
 *
 * Monotonic counters (never wrapped) remove the empty/full ambiguity; the
 * buffer index is `position % mCapacityFrames`. 64-bit frame positions wrap
@@ -20,9 +21,16 @@
 #include <atomic>
 #include <cstring>
 #include <vector>
+// ###### flutter_soloud local patch (ring copy serialization) ######
+#include <mutex>
 
 namespace SoLoud
 {
+	// ###### flutter_soloud local patch (observer latency test hook) ######
+#ifdef SOLOUD_RENDER_RING_TEST_HOOKS
+	void renderRingObserverAfterWriteLoad();
+#endif
+	// ###### flutter_soloud local patch end ######
 	class RenderRing
 	{
 	public:
@@ -77,6 +85,29 @@ namespace SoLoud
 			return (unsigned int)(w - r);
 		}
 
+		// ###### flutter_soloud local patch (coherent observer latency) ######
+		// An observer owns neither counter, so the writer can advance before the
+		// read load catches up. Retry if the write position changes around that
+		// load: an unchanged write position makes the sampled depth one the ring
+		// actually had, rather than a subtraction of unrelated counter values.
+		unsigned int availableToReadForObserver() const
+		{
+			unsigned long long w = mWritePos.load(std::memory_order_acquire);
+#ifdef SOLOUD_RENDER_RING_TEST_HOOKS
+			// Park only the first load; retries must be free to take a new snapshot.
+			renderRingObserverAfterWriteLoad();
+#endif
+			for (;;)
+			{
+				unsigned long long r = mReadPos.load(std::memory_order_acquire);
+				unsigned long long nextW = mWritePos.load(std::memory_order_acquire);
+				if (w == nextW)
+					return (unsigned int)(w - r);
+				w = nextW;
+			}
+		}
+		// ###### flutter_soloud local patch end ######
+
 		// Frames the writer may still append without overwriting unread data.
 		unsigned int availableToWrite() const
 		{
@@ -126,6 +157,19 @@ namespace SoLoud
 		// belong to the device and are never touched.
 		void rewrite(unsigned long long aPos, const float *aSrc, unsigned int aFrames)
 		{
+			// ###### flutter_soloud local patch (ring copy serialization) ######
+			// The device can advance while a quantum is being re-mixed. Never
+			// rewrite an in-progress read or a range it has already consumed.
+			std::lock_guard<std::mutex> lock(mCopyMutex);
+			const unsigned long long read = getReadPosition();
+			if (aPos < read)
+			{
+				const unsigned long long skip = read - aPos;
+				if (skip >= aFrames) return;
+				aSrc += (size_t)skip * mChannels;
+				aFrames -= (unsigned int)skip;
+				aPos = read;
+			}
 			unsigned int offset = (unsigned int)(aPos % mCapacityFrames);
 			unsigned int first = mCapacityFrames - offset;
 			if (first > aFrames)
@@ -151,6 +195,8 @@ namespace SoLoud
 		// actually read; the caller silence-fills any remainder (underrun).
 		unsigned int read(float *aDst, unsigned int aFrames)
 		{
+			// ###### flutter_soloud local patch (ring copy serialization) ######
+			std::lock_guard<std::mutex> lock(mCopyMutex);
 			unsigned int avail = availableToRead();
 			if (aFrames > avail)
 				aFrames = avail;
@@ -174,6 +220,8 @@ namespace SoLoud
 		}
 
 	private:
+		// ###### flutter_soloud local patch (ring copy serialization) ######
+		std::mutex mCopyMutex;
 		std::vector<float> mBuffer;
 		unsigned int mChannels;
 		unsigned int mCapacityFrames;

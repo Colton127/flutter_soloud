@@ -19,11 +19,29 @@
 #include "soloud.h"
 #include "soloud_audiosource.h"
 #include "soloud_render_ring.h"
+#include "soloud_checkpoint.h"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <vector>
+
+namespace {
+std::atomic<bool> gObserverArmed{false};
+std::atomic<bool> gObserverReached{false};
+std::atomic<bool> gObserverRelease{false};
+}
+
+namespace SoLoud {
+void renderRingObserverAfterWriteLoad()
+{
+    if (!gObserverArmed.exchange(false)) return;
+    gObserverReached.store(true);
+    while (!gObserverRelease.load()) std::this_thread::yield();
+}
+}
 
 namespace {
 
@@ -287,6 +305,89 @@ void testEngineFeatureOn()
     engine.deinit();
 }
 
+// A rewrite of a published unread window and a device copy can start
+// together. Larger copies make their overlap reliable under the race checker;
+// the output must still be one coherent version of the window.
+void testConcurrentReadAndRewrite()
+{
+    constexpr unsigned int frames = 1u << 20;
+    SoLoud::RenderRing ring;
+    ring.init(frames, 2);
+    std::vector<float> old(frames * 2, 0.0f);
+    std::vector<float> replacement(frames * 2, 1.0f);
+    std::vector<float> output(frames * 2, -1.0f);
+    EXPECT(ring.write(old.data(), frames) == frames, "concurrent prefill");
+    std::atomic<bool> starting{false};
+    std::thread writer([&] {
+        starting.store(true, std::memory_order_release);
+        ring.rewrite(0, replacement.data(), frames);
+    });
+    while (!starting.load(std::memory_order_acquire)) std::this_thread::yield();
+    EXPECT(ring.read(output.data(), frames) == frames, "concurrent device read");
+    writer.join();
+    const float version = output.front();
+    EXPECT((version == 0.0f || version == 1.0f) &&
+               std::all_of(output.begin(), output.end(),
+                           [version](float sample) { return sample == version; }),
+           "device read combined different rewrite versions");
+}
+
+void testLatencyObserverBoundsMovingCounters()
+{
+    SoLoud::Soloud engine;
+    engine.setRenderAheadConfig(kDevicePeriod, kRenderAhead);
+    const auto result = engine.init(SoLoud::Soloud::CLIP_ROUNDOFF,
+                                    SoLoud::Soloud::NULLDRIVER,
+                                    kSampleRate, kQuantum, 2);
+    EXPECT(result == SoLoud::SO_NO_ERROR, "observer init");
+    if (result != SoLoud::SO_NO_ERROR) return;
+    gObserverReached.store(false);
+    gObserverRelease.store(false);
+    gObserverArmed.store(true);
+    double latency = 0;
+    std::thread observer([&] { latency = engine.getOutputLatency(); });
+    while (!gObserverReached.load()) std::this_thread::yield();
+    engine.renderRingTopUp_internal();
+    std::vector<float> output(kDevicePeriod * 2);
+    const auto read = engine.mRenderRing.read(output.data(), kDevicePeriod);
+    const auto depth = engine.mRenderRing.getWritePosition() -
+                       engine.mRenderRing.getReadPosition();
+    const double expected = double(depth + kDevicePeriod) / kSampleRate;
+    gObserverRelease.store(true);
+    observer.join();
+    EXPECT(read == kDevicePeriod, "device advances beyond observer's old write position");
+    EXPECT(latency == expected,
+           "observer latency %.9f differs from coherent depth %.9f", latency, expected);
+    const double maximum = double(engine.mRenderRing.getCapacity() + kDevicePeriod) /
+                           kSampleRate;
+    EXPECT(latency >= 0 && latency <= maximum,
+           "observer latency %.6f exceeds physical maximum %.6f", latency, maximum);
+    engine.deinit();
+}
+
+void testEngineReinitializationResetsCheckpointFrames()
+{
+    SoLoud::Soloud engine;
+    engine.setRenderAheadConfig(kDevicePeriod, kRenderAhead);
+    for (int session = 0; session < 2; ++session) {
+        const auto result = engine.init(SoLoud::Soloud::CLIP_ROUNDOFF,
+                                        SoLoud::Soloud::NULLDRIVER,
+                                        kSampleRate, kQuantum, 2);
+        EXPECT(result == SoLoud::SO_NO_ERROR, "reinit: session %d init", session);
+        if (result != SoLoud::SO_NO_ERROR) return;
+        EXPECT(engine.mRenderRing.getWritePosition() == 0,
+               "reinit: new ring must start at zero");
+        EXPECT(!engine.mCheckpointPool.empty() &&
+                   engine.mCheckpointPool[0].mRingWritePosition ==
+                       engine.mRenderRing.getWritePosition(),
+               "reinit: first checkpoint must match the new ring write position");
+        engine.renderRingTopUp_internal();
+        EXPECT(engine.mRenderRing.getWritePosition() > 0,
+               "reinit: mix must advance the old frame clock before reuse");
+        engine.deinit();
+    }
+}
+
 } // namespace
 
 int main()
@@ -295,8 +396,11 @@ int main()
     testRingWraparound();
     testRingUnderrunAndClamp();
     testRingRewriteAndRewind();
+    testConcurrentReadAndRewrite();
     testEngineFeatureOff();
     testEngineFeatureOn();
+    testEngineReinitializationResetsCheckpointFrames();
+    testLatencyObserverBoundsMovingCounters();
 
     std::fprintf(stderr, "\n%d assertions, %d failures\n", gAssertions,
                  gFailures);

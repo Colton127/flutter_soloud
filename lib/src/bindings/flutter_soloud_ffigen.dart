@@ -73,9 +73,19 @@ external void retireDartCallbacksFinalizer(ffi.Pointer<ffi.Void> token);
 /// is fired.
 /// [chunkPCMFrames] fixed PCM chunk size in frames, or 0 to disable chunk
 /// mode.
+/// [captureId] receives this capture's id on success, or zero on failure.
+/// A null pointer is allowed for native callers that do not need the id.
 /// Returns [PlayerErrors.noError] if success.
 @ffi.Native<
-  ffi.UnsignedInt Function(ffi.Int, ffi.Int, ffi.Int, ffi.Int, ffi.Int, ffi.Int)
+  ffi.UnsignedInt Function(
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Pointer<ffi.UnsignedInt>,
+  )
 >(symbol: 'startMixerCapture')
 external int _startMixerCapture(
   int format,
@@ -84,6 +94,7 @@ external int _startMixerCapture(
   int bufferSizeBytes,
   int notificationThresholdBytes,
   int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
 );
 
 PlayerErrors startMixerCapture(
@@ -93,6 +104,7 @@ PlayerErrors startMixerCapture(
   int bufferSizeBytes,
   int notificationThresholdBytes,
   int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
 ) => PlayerErrors.fromValue(
   _startMixerCapture(
     format,
@@ -101,7 +113,112 @@ PlayerErrors startMixerCapture(
     bufferSizeBytes,
     notificationThresholdBytes,
     chunkPCMFrames,
+    captureId,
   ),
+);
+
+/// Check port liveness before admitting a replacement for an exited worker.
+@ffi.Native<ffi.Int Function()>(symbol: 'isMixerCaptureRunningForStart')
+external int isMixerCaptureRunningForStart();
+
+/// Start notifications through a VM native port, safe after isolate exit.
+@ffi.Native<
+  ffi.UnsignedInt Function(
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Pointer<ffi.UnsignedInt>,
+    ffi.Pointer<ffi.Void>,
+    ffi.Int64,
+    ffi.Int64,
+  )
+>(symbol: 'startMixerCaptureOnPort')
+external int _startMixerCaptureOnPort(
+  int format,
+  int sampleRate,
+  int channels,
+  int bufferSizeBytes,
+  int notificationThresholdBytes,
+  int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+  ffi.Pointer<ffi.Void> apiData,
+  int port,
+  int ownerEngineId,
+);
+
+PlayerErrors startMixerCaptureOnPort(
+  int format,
+  int sampleRate,
+  int channels,
+  int bufferSizeBytes,
+  int notificationThresholdBytes,
+  int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+  ffi.Pointer<ffi.Void> apiData,
+  int port,
+  int ownerEngineId,
+) => PlayerErrors.fromValue(
+  _startMixerCaptureOnPort(
+    format,
+    sampleRate,
+    channels,
+    bufferSizeBytes,
+    notificationThresholdBytes,
+    chunkPCMFrames,
+    captureId,
+    apiData,
+    port,
+    ownerEngineId,
+  ),
+);
+
+/// Claim a port notification's packet and obtain its owned byte length.
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(
+    ffi.Pointer<ffi.UnsignedChar>,
+    ffi.Pointer<ffi.UnsignedInt>,
+    ffi.Pointer<ffi.Size>,
+  )
+>(symbol: 'takeMixerOutputPacketWithLength')
+external ffi.Pointer<ffi.UnsignedChar> takeMixerOutputPacketWithLength(
+  ffi.Pointer<ffi.UnsignedChar> token,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+  ffi.Pointer<ffi.Size> length,
+);
+
+/// Claim an immutable capture packet.
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(
+    ffi.Pointer<ffi.UnsignedChar>,
+    ffi.Pointer<ffi.UnsignedInt>,
+  )
+>()
+external ffi.Pointer<ffi.UnsignedChar> takeMixerOutputPacket(
+  ffi.Pointer<ffi.UnsignedChar> token,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+);
+
+@ffi.Native<ffi.UnsignedInt Function()>()
+external int getMixerCaptureId();
+
+/// Owned pending chunks from a stopped capture; free with nativeFree.
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(ffi.UnsignedInt, ffi.Pointer<ffi.Size>)
+>()
+external ffi.Pointer<ffi.UnsignedChar> drainMixerCapturePackets(
+  int captureId,
+  ffi.Pointer<ffi.Size> length,
+);
+
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(ffi.UnsignedInt, ffi.Pointer<ffi.Size>)
+>()
+external ffi.Pointer<ffi.UnsignedChar> stopMixerCaptureAndDrain(
+  int captureId,
+  ffi.Pointer<ffi.Size> length,
 );
 
 /// Stop capturing the master mixer output.
@@ -299,6 +416,7 @@ external void debugTriggerAudioInterruption(int began);
     ffi.Pointer<ffi.Pointer<ffi.Int>>,
     ffi.Pointer<ffi.Pointer<ffi.Int>>,
     ffi.Pointer<ffi.Int>,
+    ffi.Int,
   )
 >()
 external void listPlaybackDevices(
@@ -306,6 +424,7 @@ external void listPlaybackDevices(
   ffi.Pointer<ffi.Pointer<ffi.Int>> deviceId,
   ffi.Pointer<ffi.Pointer<ffi.Int>> isDefault,
   ffi.Pointer<ffi.Int> n_devices,
+  int capacity,
 );
 
 /// Change the playback device.
@@ -1743,20 +1862,23 @@ PlayerErrors isFilterActive(
     ffi.UnsignedInt,
     ffi.Pointer<ffi.Int>,
     ffi.Pointer<ffi.Pointer<ffi.Char>>,
+    ffi.Int,
   )
 >(symbol: 'getFilterParamNames')
 external int _getFilterParamNames(
   int filterType,
   ffi.Pointer<ffi.Int> paramsCount,
   ffi.Pointer<ffi.Pointer<ffi.Char>> names,
+  int capacity,
 );
 
 PlayerErrors getFilterParamNames(
   FilterType filterType,
   ffi.Pointer<ffi.Int> paramsCount,
   ffi.Pointer<ffi.Pointer<ffi.Char>> names,
+  int capacity,
 ) => PlayerErrors.fromValue(
-  _getFilterParamNames(filterType.value, paramsCount, names),
+  _getFilterParamNames(filterType.value, paramsCount, names, capacity),
 );
 
 /// Add the filter [filterType] to [soundHash]. If [soundHash]==0 the
@@ -1840,8 +1962,8 @@ PlayerErrors setFilterParams(
 /// [busId] the bus to check the filter.
 /// If both [handle] and [busId] are =0 this function searches in the global
 /// filters.
-/// [filterType] filter to modify a param. Returns the value of param or
-/// 9999.0 if the filter is not found.
+/// [filterType] filter to read a param from. A missing filter is reported
+/// through filterNotFound, independently of its parameter values.
 @ffi.Native<
   ffi.UnsignedInt Function(
     ffi.UnsignedInt,

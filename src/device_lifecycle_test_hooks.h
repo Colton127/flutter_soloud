@@ -143,6 +143,14 @@ namespace soloud_test
     /// checks or uses the Player. A teardown started while an export is
     /// parked here must not dispose, destroy or replace that Player.
     playerOperationPinned,
+    /// After the mixer removed pull-stream samples from the circular buffer,
+    /// before it accounts for them. Reset must not split these two updates.
+    pullSamplesRead,
+    /// After native capture packet allocation, before the ring-copy lock.
+    /// Parking here must never prevent the device from writing another block.
+    mixerPacketStorageAllocated,
+    /// After the stopped ring was selected, before copying its tail.
+    mixerCaptureTailSelected,
     barrierCount
   };
 

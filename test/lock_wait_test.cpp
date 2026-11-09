@@ -34,8 +34,8 @@
 //   ./test/run_lock_wait_test.sh --asan     (AddressSanitizer)
 //   ./test/run_lock_wait_test.sh --tsan     (ThreadSanitizer)
 //
-// A scenario name after the flag (idle, ended, interruption or recount) runs
-// only that scenario.
+// A scenario name after the flag (idle, ended, admission, interruption or
+// recount) runs only that scenario.
 
 #include "bindings.h"
 #include "device_lifecycle_test_hooks.h"
@@ -454,6 +454,68 @@ void mixerDoesNotWaitForTheSoundsLock()
     expectNothingLeft(what);
 }
 
+// Admission sees live voices even when an ended handle has been deferred
+// during this very sounds-lock hold. Exercise every public play variant,
+// including eviction past a stale first handle and RELEASED streams.
+PlayerErrors admissionPlay(int variant, unsigned int hash, unsigned int *h)
+{
+    switch (variant) {
+    case 0: return play(hash, 0, 0.05f, 0, false, false, 0, 0, -1, -1, 1, h);
+    case 1: return playClocked(hash, 0, 0, 0.05f, 0, 1, false, 0, 0, -1, -1, h);
+    case 2: return playScheduled(hash, 0, 0, 0, 0.05f, 0, 1, false, 0, 0, -1, -1, h);
+    case 3: return play3dWithLoopPoints(hash, 0, 0, 0, 0, 0, 0, 0, 0.05f, false, false, 0, 0, -1, -1, 1, h);
+    case 4: return play3dClocked(hash, 0, 0, 0, 0, 0, 0, 0, 0, 0.05f, 1, false, 0, 0, -1, -1, h);
+    default: return play3dScheduled(hash, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.05f, 1, false, 0, 0, -1, -1, h);
+    }
+}
+
+void admissionIgnoresDeferredEnds()
+{
+    std::printf("admission and eviction with deferred ended handles\n");
+    const auto savedLimit = getMaxActiveVoiceCount();
+    for (int variant = 0; variant < 6; ++variant) {
+        for (int scenario = 0; scenario < 3; ++scenario) {
+            setMaxActiveVoiceCount(4);
+            unsigned int target = loadTestWaveform();
+            const unsigned int other = loadTestWaveform();
+            if (scenario == 2) {
+                disposeSound(target);
+                EXPECT(setBufferStream(&target, 1u << 20, /*RELEASED*/ 1, 0,
+                           44100, 2, PCM_F32LE, nullptr, nullptr) == noError,
+                       "admission: create RELEASED stream");
+            }
+            const unsigned int ending = playQuietly(scenario == 0 ? other : target);
+            const unsigned int live = scenario == 1 ? playQuietly(target) : 0;
+            const unsigned int unrelated = scenario == 1 ? playQuietly(other) : 0;
+            setMaxActiveVoiceCount(scenario == 1 ? 2 : 1);
+            soloud_test::armBarrier(DeviceBarrier::playSoundLookedUp);
+            unsigned int played = 0;
+            PlayerErrors result = unknownError;
+            BackgroundCall caller([&] { result = admissionPlay(variant, target, &played); });
+            if (!waitBarrierReachedFor(DeviceBarrier::playSoundLookedUp, kProgressMs))
+                endRun("admission play did not reach its lookup");
+            // The caller owns sounds_mutex, so this report is deferred.
+            stop(ending);
+            EXPECT(waitForVoiceEnded(ending, kProgressMs), "admission: end must be reported");
+            soloud_test::releaseBarrier(DeviceBarrier::playSoundLookedUp);
+            caller.join();
+            EXPECT(result == noError && played != 0,
+                   "admission variant %d scenario %d: expected success, error=%d handle=%u",
+                   variant, scenario, int(result), played);
+            if (scenario == 1) {
+                EXPECT(getIsValidVoiceHandle(live) == 0,
+                       "eviction variant %d: must stop the first live voice after the stale handle", variant);
+                EXPECT(getIsValidVoiceHandle(unrelated) != 0,
+                       "eviction variant %d: unrelated voice must survive", variant);
+            }
+            disposeSound(target);
+            disposeSound(other);
+        }
+    }
+    setMaxActiveVoiceCount(savedLimit);
+    expectNothingLeft("admission");
+}
+
 /// When an OS interruption ends and the idle timeout is finite, the handler
 /// restarts the device only if voices are active. Counting them waits for
 /// SoLoud's audio mutex: for the mixer's block, for a stream's seek inside
@@ -608,7 +670,7 @@ int main(int argc, char **argv)
 
     const char *only = argc > 1 ? argv[1] : nullptr;
     const char *const kScenarios[] = {"idle", "ended", "interruption",
-                                      "recount"};
+                                      "recount", "admission"};
     if (only != nullptr)
     {
         bool known = false;
@@ -618,7 +680,7 @@ int main(int argc, char **argv)
         {
             std::fprintf(stderr,
                          "Unknown scenario '%s': use idle, ended, "
-                         "interruption or recount.\n",
+                         "interruption, recount or admission.\n",
                          only);
             return 2;
         }
@@ -640,6 +702,8 @@ int main(int argc, char **argv)
         return std::getenv("SOLOUD_LIFECYCLE_TEST_ALLOW_NO_DEVICE") ? 0 : 1;
     }
 
+    if (wanted("admission"))
+        admissionIgnoresDeferredEnds();
     if (wanted("idle"))
         mixerDoesNotWaitForTheLifecycleLock();
     if (wanted("ended"))

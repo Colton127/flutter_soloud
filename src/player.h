@@ -790,6 +790,13 @@ public:
   /// total number of active voices.
   unsigned int getActiveVoiceCount_internal();
 
+  /// @brief Like getActiveVoiceCount_internal(), but counts only the handles
+  /// whose voice is still alive. A voice that ends while a thread holds
+  /// sounds_mutex leaves its handle in the list until the outermost lock
+  /// holder removes it; the play functions' voice-limit check uses this count
+  /// so such a handle does not take a slot.
+  unsigned int getLiveVoiceCount_internal();
+
   /// @brief Returns the number of concurrent sounds that are playing a specific
   /// audio source.
   int countAudioSource(unsigned int soundHash);
@@ -1130,7 +1137,11 @@ public:
   float busGetApproximateVolume(unsigned int busId, unsigned int channel);
   void busAnnexSound(unsigned int busId, unsigned int voiceHandle);
   unsigned int busGetActiveVoiceCount(unsigned int busId);
+  /// Raw lookup requires sounds_mutex to remain held through use.
   BusData *findBusData(unsigned int busId);
+  /// Pin a bus for an export, including any filter or audio-mutex operations.
+  PlayerErrors useBusData(
+      unsigned int busId, const std::function<PlayerErrors(BusData &)> &use);
 
 public:
   /// The type of sounds_mutex: a recursive mutex that, whenever a thread

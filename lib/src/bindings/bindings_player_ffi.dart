@@ -101,8 +101,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   nativeFileLoadedCallable;
   ffi.NativeCallable<native.dartStateChangedCallback_tFunction>?
   nativeStateChangedCallable;
-  ffi.NativeCallable<native.dartMixerOutputDataCallback_tFunction>?
-  nativeMixerOutputDataCallable;
+  RawReceivePort? _mixerOutputPort;
   ffi.NativeCallable<native.dartVisualizationCallback_tFunction>?
   nativeVisualizationCallable;
 
@@ -111,15 +110,12 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   /// Controller that fires whenever new mixer output data is available.
   ///
-  /// The event contains a pointer to the start of the contiguous unread
-  /// region and the number of valid bytes. The pointer remains valid until
-  /// the read position is advanced with [advanceMixerOutputReadPosition].
-  late final StreamController<({ffi.Pointer<ffi.Uint8> pointer, int length})>
-  mixerOutputDataAvailableController = StreamController.broadcast();
+  /// Each event owns its bytes and remains valid after capture stops.
+  late final StreamController<Uint8List> mixerOutputDataAvailableController =
+      StreamController.broadcast();
 
-  /// Stream of notifications that new mixer output data is available.
-  Stream<({ffi.Pointer<ffi.Uint8> pointer, int length})>
-  get mixerOutputDataAvailableEvents =>
+  /// Stream of owned mixer output chunks.
+  Stream<Uint8List> get mixerOutputDataAvailableEvents =>
       mixerOutputDataAvailableController.stream;
 
   final Map<int, _BufferStreamNativeCallbacks> _bufferStreamNativeCallables =
@@ -181,24 +177,37 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     stateChangedController.add(s);
   }
 
-  void _mixerOutputDataCallback(
-    ffi.Pointer<ffi.UnsignedChar> data,
-    int length,
-  ) {
-    if (mixerOutputDataAvailableController.hasListener) {
-      mixerOutputDataAvailableController.add((
-        pointer: data.cast<ffi.Uint8>(),
-        length: length,
-      ));
-    }
-    if (mixerOutputChunkController.hasListener) {
-      final bytes = data.cast<ffi.Uint8>().asTypedList(length);
-      mixerOutputChunkController.add(Uint8List.fromList(bytes));
-      // In fixed PCM chunk mode the native side advances the read position
-      // before invoking the callback, so Dart must not advance it again.
-      if (!_mixerOutputChunkMode) {
-        advanceMixerOutputReadPosition(length);
+  void _mixerOutputPortMessage(dynamic message) {
+    if (message is! int || message <= 0) return;
+    final data = ffi.Pointer<ffi.UnsignedChar>.fromAddress(message);
+    final length = calloc<ffi.Size>();
+    final captureId = calloc<ffi.UnsignedInt>();
+    final bytes = native.takeMixerOutputPacketWithLength(
+      data,
+      captureId,
+      length,
+    );
+    try {
+      if (bytes == ffi.nullptr || captureId.value != _mixerCaptureId) {
+        return;
       }
+      if (mixerOutputDataAvailableController.hasListener ||
+          mixerOutputChunkController.hasListener) {
+        final copy = Uint8List.fromList(
+          bytes.cast<ffi.Uint8>().asTypedList(length.value),
+        );
+        if (mixerOutputDataAvailableController.hasListener) {
+          mixerOutputDataAvailableController.add(copy);
+        }
+        if (mixerOutputChunkController.hasListener) {
+          mixerOutputChunkController.add(copy);
+        }
+      }
+    } finally {
+      nativeFree(bytes.cast<ffi.Void>());
+      calloc
+        ..free(captureId)
+        ..free(length);
     }
   }
 
@@ -278,8 +287,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     nativeFileLoadedCallable = null;
     nativeStateChangedCallable?.close();
     nativeStateChangedCallable = null;
-    nativeMixerOutputDataCallable?.close();
-    nativeMixerOutputDataCallable = null;
+    _mixerOutputPort?.close();
+    _mixerOutputPort = null;
     nativeVisualizationCallable?.close();
     nativeVisualizationCallable = null;
   }
@@ -304,10 +313,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         ffi.NativeCallable<native.dartStateChangedCallback_tFunction>.listener(
           _stateChangedCallback,
         );
-    nativeMixerOutputDataCallable ??=
-        ffi.NativeCallable<
-          native.dartMixerOutputDataCallback_tFunction
-        >.listener(_mixerOutputDataCallback);
     nativeVisualizationCallable ??=
         ffi.NativeCallable<native.dartVisualizationCallback_tFunction>.listener(
           _visualizationDataCallback,
@@ -317,10 +322,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       nativeVoiceEndedCallable!.nativeFunction,
       nativeFileLoadedCallable!.nativeFunction,
       nativeStateChangedCallable!.nativeFunction,
-      currentEngineId,
-    );
-    native.setMixerOutputCallbackForEngine(
-      nativeMixerOutputDataCallable!.nativeFunction,
       currentEngineId,
     );
     native.setVisualizationCallbackForEngine(
@@ -341,32 +342,9 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   void registerMixerOutputCallback() {
-    nativeMixerOutputDataCallable ??=
-        ffi.NativeCallable<
-          native.dartMixerOutputDataCallback_tFunction
-        >.listener(_mixerOutputDataCallback);
-    // Called from whichever isolate owns the capture, including a worker one
-    // via `SoLoudIsolate.startMixerOutputStream()`. On a worker,
-    // [currentEngineId] is the no-engine sentinel and native code joins this
-    // callable to whatever registration is live.
-    //
-    // A refusal means there is no live registration to join: the engine was
-    // never initialized, has been deinitialized, or its FlutterEngine is being
-    // destroyed. Publishing anyway would arm a callable belonging to an isolate
-    // that is going away, so the capture simply produces nothing -- worth a
-    // line in the log, since the stream stays silent rather than throwing.
-    final published = native.setMixerOutputCallbackForEngine(
-      nativeMixerOutputDataCallable!.nativeFunction,
-      currentEngineId,
-    );
-    if (!published) {
-      _log.warning(
-        'The mixer output callback was refused: no live engine callback '
-        'registration to join. The capture stream will not receive chunks. '
-        'Initialize the engine before starting a mixer output capture, and '
-        'stop the capture before deinitializing it.',
-      );
-    }
+    // Preparing a VM port is local to this isolate. Publication belongs to
+    // the admitted native start, and a closed port can safely reject posts.
+    _mixerOutputPort ??= RawReceivePort(_mixerOutputPortMessage);
   }
 
   late final ffi.NativeFinalizer _isolateFinalizer = ffi.NativeFinalizer(
@@ -378,10 +356,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   // Mixer output capture bindings
   // ////////////////////////////////////////////////
 
-  /// Whether the current mixer output capture is using fixed-size PCM chunks.
-  /// When true, the native side advances the circular buffer read position
-  /// before invoking the callback, so Dart must not advance it again.
-  bool _mixerOutputChunkMode = false;
+  int? _mixerCaptureId;
+  Uint8List _stoppedMixerOutput = Uint8List(0);
 
   @override
   PlayerErrors startMixerOutputCapture(
@@ -392,27 +368,86 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     int notificationThresholdBytes,
     int chunkPCMFrames,
   ) {
-    _mixerOutputChunkMode = format.isPcm && chunkPCMFrames > 0;
-    final ret = native.startMixerCapture(
-      format.value,
-      sampleRate,
-      channels,
-      bufferSizeBytes,
-      notificationThresholdBytes,
-      chunkPCMFrames,
-    );
-    return PlayerErrors.values[ret.value];
+    registerMixerOutputCallback();
+    final id = calloc<ffi.UnsignedInt>();
+    try {
+      final ret = native.startMixerCaptureOnPort(
+        format.value,
+        sampleRate,
+        channels,
+        bufferSizeBytes,
+        notificationThresholdBytes,
+        chunkPCMFrames,
+        id,
+        ffi.NativeApi.initializeApiDLData,
+        ffi.NativePort(_mixerOutputPort!.sendPort).nativePort,
+        currentEngineId,
+      );
+      if (ret == native.PlayerErrors.noError) {
+        _mixerCaptureId = id.value;
+      } else if (_mixerCaptureId == null) {
+        _mixerOutputPort?.close();
+        _mixerOutputPort = null;
+      }
+      return PlayerErrors.values[ret.value];
+    } finally {
+      calloc.free(id);
+    }
   }
 
   @override
-  void stopMixerOutputCapture() {
-    _mixerOutputChunkMode = false;
-    native.stopMixerCapture();
+  void stopMixerOutputCapture({bool onlyOwned = false}) {
+    final id = _mixerCaptureId;
+    _mixerCaptureId = null;
+    if (id == null) {
+      if (!onlyOwned) {
+        native.stopMixerCapture();
+      }
+      _mixerOutputPort?.close();
+      _mixerOutputPort = null;
+      return;
+    }
+    // Only a stop that drains a capture of its own replaces the snapshot: a
+    // lifecycle stop may already have saved output for the stream manager.
+    _stoppedMixerOutput = Uint8List(0);
+    final length = calloc<ffi.Size>();
+    var ptr = ffi.nullptr.cast<ffi.UnsignedChar>();
+    try {
+      ptr = native.stopMixerCaptureAndDrain(id, length);
+      if (ptr != ffi.nullptr) {
+        _stoppedMixerOutput = Uint8List.fromList(
+          ptr.cast<ffi.Uint8>().asTypedList(length.value),
+        );
+      }
+    } finally {
+      nativeFree(ptr.cast<ffi.Void>());
+      calloc.free(length);
+      _mixerOutputPort?.close();
+      _mixerOutputPort = null;
+    }
   }
 
   @override
-  bool isMixerOutputCaptureRunning() {
-    return native.isMixerCaptureRunning() != 0;
+  Uint8List takeStoppedMixerOutputPackets() {
+    final bytes = _stoppedMixerOutput;
+    _stoppedMixerOutput = Uint8List(0);
+    return bytes;
+  }
+
+  @override
+  bool isMixerOutputCaptureRunning({bool probeOwner = false}) {
+    return (probeOwner
+            ? native.isMixerCaptureRunningForStart()
+            : native.isMixerCaptureRunning()) !=
+        0;
+  }
+
+  @override
+  bool isCurrentMixerOutputCapture() {
+    final id = _mixerCaptureId;
+    return id != null &&
+        isMixerOutputCaptureRunning() &&
+        native.getMixerCaptureId() == id;
   }
 
   @override
@@ -576,54 +611,29 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   List<PlaybackDevice> listPlaybackDevices() {
-    final ret = <PlaybackDevice>[];
-    final ffi.Pointer<ffi.Pointer<ffi.Char>> deviceNames = calloc(
-      ffi.sizeOf<ffi.Pointer<ffi.Pointer<ffi.Char>>>() * 255,
-    );
-    final ffi.Pointer<ffi.Pointer<ffi.Int>> deviceIds = calloc(
-      ffi.sizeOf<ffi.Pointer<ffi.Pointer<ffi.Int>>>() * 50,
-    );
-    final ffi.Pointer<ffi.Pointer<ffi.Int>> deviceIsDefault = calloc(
-      ffi.sizeOf<ffi.Pointer<ffi.Pointer<ffi.Int>>>() * 50,
-    );
-    final ffi.Pointer<ffi.Int> nDevices = calloc();
-
-    native.listPlaybackDevices(
-      deviceNames,
-      deviceIds,
-      deviceIsDefault,
-      nDevices,
-    );
-
-    final ndev = nDevices.value;
-    for (var i = 0; i < ndev; i++) {
-      final s1 = (deviceNames + i).value;
-      final s = s1.cast<Utf8>().toDartString();
-      final id1 = (deviceIds + i).value;
-      final id = id1.value;
-      final n1 = (deviceIsDefault + i).value;
-      final n = n1.value;
-      ret.add(PlaybackDevice(id, n == 1, s));
+    const capacity = 255;
+    final names = calloc<ffi.Pointer<ffi.Char>>(capacity);
+    final ids = calloc<ffi.Pointer<ffi.Int>>(capacity);
+    final defaults = calloc<ffi.Pointer<ffi.Int>>(capacity);
+    final count = calloc<ffi.Int>();
+    try {
+      native.listPlaybackDevices(names, ids, defaults, count, capacity);
+      return [
+        for (var i = 0; i < count.value; i++)
+          PlaybackDevice(
+            ids[i].value,
+            defaults[i].value == 1,
+            names[i].cast<Utf8>().toDartString(),
+          ),
+      ];
+    } finally {
+      native.freeListPlaybackDevices(names, ids, defaults, count.value);
+      calloc
+        ..free(names)
+        ..free(ids)
+        ..free(defaults)
+        ..free(count);
     }
-
-    /// Free allocated memory is done in C.
-    /// This work on all platforms but not on win.
-    // for (int i = 0; i < ndev; i++) {
-    //   calloc.free(devices.elementAt(i).value.ref.name);
-    //   calloc.free(devices.elementAt(i).value);
-    // }
-    native.freeListPlaybackDevices(
-      deviceNames,
-      deviceIds,
-      deviceIsDefault,
-      ndev,
-    );
-
-    calloc
-      ..free(deviceNames)
-      ..free(deviceIds)
-      ..free(nDevices);
-    return ret;
   }
 
   void freeListPlaybackDevices(
@@ -723,28 +733,30 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     Uint8List buffer,
     LoadMode mode,
   ) {
-    final ffi.Pointer<ffi.UnsignedInt> hash = calloc(
-      ffi.sizeOf<ffi.UnsignedInt>(),
-    );
-    final ffi.Pointer<ffi.Uint8> bufferPtr = calloc(buffer.length);
-    for (var i = 0; i < buffer.length; i++) {
-      bufferPtr[i] = buffer[i];
+    final hash = calloc<ffi.UnsignedInt>();
+    var bytes = ffi.nullptr.cast<ffi.Uint8>();
+    var name = ffi.nullptr.cast<Utf8>();
+    try {
+      bytes = calloc<ffi.Uint8>(buffer.length);
+      bytes.asTypedList(buffer.length).setAll(0, buffer);
+      name = uniqueName.toNativeUtf8();
+      final error = native.loadMem(
+        name.cast<ffi.Char>(),
+        bytes.cast<ffi.UnsignedChar>(),
+        buffer.length,
+        mode == LoadMode.memory ? 1 : 0,
+        hash,
+      );
+      return (
+        error: PlayerErrors.values[error.value],
+        soundHash: SoundHash.fromValue(hash.value),
+      );
+    } finally {
+      malloc.free(name);
+      calloc
+        ..free(bytes)
+        ..free(hash);
     }
-
-    final ffi.Pointer<Utf8> cString = uniqueName.toNativeUtf8();
-    final e = native.loadMem(
-      cString.cast<ffi.Char>(),
-      bufferPtr.cast<ffi.UnsignedChar>(),
-      buffer.length,
-      mode == LoadMode.memory ? 1 : 0,
-      hash,
-    );
-    final soundHash = SoundHash.fromValue(hash.value);
-    final ret = (error: PlayerErrors.values[e.value], soundHash: soundHash);
-    calloc
-      ..free(hash)
-      ..free(cString);
-    return ret;
   }
 
   @override
@@ -1046,15 +1058,19 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   ({PlayerErrors error, SoundHandle handle}) speechText(String textToSpeech) {
-    final ffi.Pointer<ffi.UnsignedInt> handle = calloc();
-    final ffi.Pointer<Utf8> cString = textToSpeech.toNativeUtf8();
-    final e = native.speechText(cString.cast<ffi.Char>(), handle);
-    final ret = (
-      error: PlayerErrors.values[e.value],
-      handle: SoundHandle(handle.value),
-    );
-    calloc.free(handle);
-    return ret;
+    final handle = calloc<ffi.UnsignedInt>();
+    var text = ffi.nullptr.cast<Utf8>();
+    try {
+      text = textToSpeech.toNativeUtf8();
+      final error = native.speechText(text.cast<ffi.Char>(), handle);
+      return (
+        error: PlayerErrors.values[error.value],
+        handle: SoundHandle(handle.value),
+      );
+    } finally {
+      malloc.free(text);
+      calloc.free(handle);
+    }
   }
 
   @override
@@ -1658,38 +1674,33 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   ({PlayerErrors error, List<String> names}) getFilterParamNames(
     FilterType filterType,
   ) {
-    final ffi.Pointer<ffi.Int> paramsCount = calloc(ffi.sizeOf<ffi.Int>());
-    final ffi.Pointer<ffi.Pointer<ffi.Char>> names = calloc(
-      ffi.sizeOf<ffi.Char>() * 30,
-    );
-    _log.fine(
-      () =>
-          'PARAMS NAME paramsCount: ${paramsCount.address.toRadixString(16)}  '
-          'names: ${names.address.toRadixString(16)}',
-    );
-
-    final e = native.getFilterParamNames(
-      native.FilterType.fromValue(filterType.index),
-      paramsCount,
-      names,
-    );
-    final pNames = <String>[];
-    for (var i = 0; i < paramsCount.value; i++) {
-      _log.fine(
-        () =>
-            'PARAMS NAME $i ${names + i}   '
-            '${names[i].cast<Utf8>().toDartString()}    '
-            'names[i]: ${names[i].address.toRadixString(16)}',
-      );
-      pNames.add(names[i].cast<Utf8>().toDartString());
+    final count = calloc<ffi.Int>();
+    var names = ffi.nullptr.cast<ffi.Pointer<ffi.Char>>();
+    var capacity = 0;
+    try {
+      final type = native.FilterType.fromValue(filterType.index);
+      var error = native.getFilterParamNames(type, count, names, 0);
+      if (error != native.PlayerErrors.noError) {
+        return (error: PlayerErrors.values[error.value], names: <String>[]);
+      }
+      capacity = count.value;
+      names = calloc<ffi.Pointer<ffi.Char>>(capacity);
+      error = native.getFilterParamNames(type, count, names, capacity);
+      final result = <String>[];
+      if (error == native.PlayerErrors.noError) {
+        for (var i = 0; i < count.value; i++) {
+          result.add(names[i].cast<Utf8>().toDartString());
+        }
+      }
+      return (error: PlayerErrors.values[error.value], names: result);
+    } finally {
+      for (var i = 0; names != ffi.nullptr && i < capacity; i++) {
+        nativeFree(names[i].cast<ffi.Void>());
+      }
+      calloc
+        ..free(names)
+        ..free(count);
     }
-    final ret = (error: PlayerErrors.values[e.value], names: pNames);
-    calloc.free(paramsCount);
-    for (var i = 0; i < pNames.length; i++) {
-      calloc.free(names[i]);
-    }
-    calloc.free(names);
-    return ret;
   }
 
   @override
@@ -2058,29 +2069,34 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     double endTime = -1,
     bool average = false,
   }) {
-    final pSamples = calloc<ffi.Float>(
-      numSamplesNeeded * ffi.sizeOf<ffi.Float>(),
-    );
-    final error = native.readSamplesFromFile(
-      completeFileName.toNativeUtf8().cast<ffi.Char>(),
-      startTime,
-      endTime,
-      numSamplesNeeded,
-      average,
-      pSamples,
-    );
-    final samples = pSamples.asTypedList(numSamplesNeeded).asUnmodifiableView();
-
-    /// Seems freeing this pointer is not needed because "samples" gets
-    /// undefined after using "free"!? It will be GC-ed.
-    // calloc.free(pSamples);
-    if (ReadSamplesErrors.fromValue(error.value) !=
-        ReadSamplesErrors.readSamplesNoError) {
-      throw SoLoudCppException.fromReadSampleError(
-        ReadSamplesErrors.fromValue(error.value),
+    final pSamples = calloc<ffi.Float>(numSamplesNeeded);
+    var fileName = ffi.nullptr.cast<Utf8>();
+    try {
+      fileName = completeFileName.toNativeUtf8();
+      final error = native.readSamplesFromFile(
+        fileName.cast<ffi.Char>(),
+        startTime,
+        endTime,
+        numSamplesNeeded,
+        average,
+        pSamples,
       );
+      if (ReadSamplesErrors.fromValue(error.value) !=
+          ReadSamplesErrors.readSamplesNoError) {
+        throw SoLoudCppException.fromReadSampleError(
+          ReadSamplesErrors.fromValue(error.value),
+        );
+      }
+      // A view does not own calloc memory. Copy before releasing the native
+      // temporaries, including when this call runs in a worker isolate.
+      return Float32List.fromList(
+        pSamples.asTypedList(numSamplesNeeded),
+      ).asUnmodifiableView();
+    } finally {
+      calloc
+        ..free(fileName)
+        ..free(pSamples);
     }
-    return samples;
   }
 
   @override
@@ -2091,34 +2107,39 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     double endTime = -1,
     bool average = false,
   }) {
-    final pSamples = calloc<ffi.Float>(
-      numSamplesNeeded * ffi.sizeOf<ffi.Float>(),
-    );
-    final ffi.Pointer<ffi.Uint8> bufferPtr = calloc(buffer.length);
-    for (var i = 0; i < buffer.length; i++) {
-      bufferPtr[i] = buffer[i];
-    }
-    final error = native.readSamplesFromMem(
-      bufferPtr.cast<ffi.UnsignedChar>(),
-      buffer.length,
-      startTime,
-      endTime,
-      numSamplesNeeded,
-      average,
-      pSamples,
-    );
-    final samples = pSamples.asTypedList(numSamplesNeeded).asUnmodifiableView();
-
-    /// Seems freeing this pointer is not needed because "samples" gets
-    /// undefined after using "free"!? It will be GC-ed.
-    // calloc.free(pSamples);
-    if (ReadSamplesErrors.fromValue(error.value) !=
-        ReadSamplesErrors.readSamplesNoError) {
-      throw SoLoudCppException.fromReadSampleError(
-        ReadSamplesErrors.fromValue(error.value),
+    final pSamples = calloc<ffi.Float>(numSamplesNeeded);
+    var bufferPtr = ffi.nullptr.cast<ffi.UnsignedChar>();
+    try {
+      bufferPtr = calloc<ffi.UnsignedChar>(buffer.length);
+      if (buffer.isNotEmpty) {
+        bufferPtr
+            .cast<ffi.Uint8>()
+            .asTypedList(buffer.length)
+            .setAll(0, buffer);
+      }
+      final error = native.readSamplesFromMem(
+        bufferPtr,
+        buffer.length,
+        startTime,
+        endTime,
+        numSamplesNeeded,
+        average,
+        pSamples,
       );
+      if (ReadSamplesErrors.fromValue(error.value) !=
+          ReadSamplesErrors.readSamplesNoError) {
+        throw SoLoudCppException.fromReadSampleError(
+          ReadSamplesErrors.fromValue(error.value),
+        );
+      }
+      return Float32List.fromList(
+        pSamples.asTypedList(numSamplesNeeded),
+      ).asUnmodifiableView();
+    } finally {
+      calloc
+        ..free(bufferPtr)
+        ..free(pSamples);
     }
-    return samples;
   }
 
   /////////////////////////////////////////

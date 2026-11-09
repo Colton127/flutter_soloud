@@ -18,6 +18,22 @@
 
 namespace SoLoud {
 
+namespace {
+/// Holds SoLoud's audio mutex for a scope.
+class AudioMutexLock {
+public:
+  explicit AudioMutexLock(Soloud &aSoloud) : mSoloud(aSoloud) {
+    mSoloud.lockAudioMutex_internal();
+  }
+  ~AudioMutexLock() { mSoloud.unlockAudioMutex_internal(); }
+  AudioMutexLock(const AudioMutexLock &) = delete;
+  AudioMutexLock &operator=(const AudioMutexLock &) = delete;
+
+private:
+  Soloud &mSoloud;
+};
+} // namespace
+
 #ifdef MA_ENABLE_AUDIO_WORKLETS
 // Main-thread entry points for the stream event callbacks. On the
 // multi-threaded (AudioWorklet) build the callbacks can fire from the
@@ -33,7 +49,7 @@ static void onBufferingMainThread(int isBuffering, int handle, double time,
       {
         var functionName = "dartOnBufferingCallback_" + $3;
         if (typeof window[functionName] === "function") {
-          window[functionName]($0 == 1 ? true : false, $1, $2);
+          window[functionName]($0 == 1 ? true : false, $1 >>> 0, $2);
         }
       },
       isBuffering, handle, time, soundHash);
@@ -166,6 +182,7 @@ unsigned int PullBufferStreamInstance::getAudio(float *aBuffer,
   mReadScratch.resize(samplesToRead);
   const size_t readSamples =
       mParent->mCircularBuffer.read(mReadScratch.data(), samplesToRead);
+  SOLOUD_TEST_BARRIER(pullSamplesRead);
   const size_t readFrames = readSamples / mChannels;
   if (readFrames > 0) {
     for (unsigned int ch = 0; ch < mChannels; ++ch) {
@@ -300,7 +317,7 @@ result PullBufferStreamInstance::seek(double aSeconds, float *aScratch,
         mParent->mPendingSeekByteOffset = newOffset;
         mParent->mDataIsEnded.store(false);
         mParent->mWaitingForData.store(false);
-        mParent->resetDecoderForSeek(targetSample);
+        mParent->resetDecoderForSeek(targetSample, newOffset);
         // The buffer was just discarded, so this leaves the seek pending until
         // data at the target has been decoded.
         mParent->applyPendingSeek(/*aUnderAudioMutex*/ true);
@@ -330,6 +347,11 @@ result PullBufferStreamInstance::rewind() {
     // Rewind: discard the currently buffered decoded range without zeroing the
     // underlying memory so the circular buffer can continue from the start.
     mParent->resetBufferWindow(0, 0, 0.0, 0, 0);
+    // Rewinding discards even a completely delivered stream. Reopen the feed
+    // as an out-of-buffer seek does: otherwise hasEnded() sees an empty ended
+    // buffer, requests stop, and every subsequent delivery is refused. This
+    // also covers the mixer's automatic rewind at a looping voice's end.
+    mParent->mDataIsEnded.store(false);
     mParent->mPendingSeek.store(false);
     mParent->mPendingSeekTime = 0.0;
     mParent->mPendingSeekByteOffset = 0;
@@ -388,14 +410,16 @@ void PullBufferStream::resetProbeState() {
   mTailProbeBuffer.clear();
 }
 
-void PullBufferStream::resetDecoderForSeek(uint64_t targetSample) {
+void PullBufferStream::resetDecoderForSeek(uint64_t targetSample, uint64_t byteOffset) {
   if (mPCMformat.dataType != BufferType::AUTO || !mStreamDecoder) return;
   const DetectedType type = mStreamDecoder->getWrapperType();
   if (type == DetectedType::BUFFER_OGG_OPUS ||
       type == DetectedType::BUFFER_OGG_VORBIS ||
       type == DetectedType::BUFFER_WAV ||
+      type == DetectedType::BUFFER_MP3_STREAM ||
+      type == DetectedType::BUFFER_MP3_WITH_ID3 ||
       type == DetectedType::BUFFER_FLAC) {
-    mStreamDecoder->prepareForSeek(targetSample);
+    mStreamDecoder->prepareForSeek(targetSample, byteOffset);
   } else {
     mStreamDecoder = std::make_unique<StreamDecoder>();
   }
@@ -517,6 +541,14 @@ PlayerErrors PullBufferStream::setPullBufferStream(
 
 void PullBufferStream::resetPullBufferStream() {
   {
+    // The mixer reads the circular buffer and counts what it read with only
+    // the audio mutex held (getAudio() must not wait for a delivery that is
+    // decoding under the decode mutex). Holding the audio mutex keeps a reset
+    // from landing between that read and its count, which would leave the
+    // reset stream claiming samples it does not have. The mixer's lock order
+    // is audio mutex, then decode mutex, and nothing holding the decode mutex
+    // waits for the audio mutex (see its declaration).
+    AudioMutexLock audioLock(mThePlayer->soloud);
     // Held so the mixer, which decodes and drains under it, never finds the
     // decoder or the buffers replaced mid-use.
     std::lock_guard<std::mutex> lock(mDecodeMutex);
@@ -614,8 +646,12 @@ double PullBufferStream::getBufferEndTimeLocked() const {
   const unsigned int sampleRate = mPCMformat.sampleRate;
   const unsigned int channels = mPCMformat.channels;
   if (sampleRate == 0 || channels == 0) return 0.0;
-  const double endTime = static_cast<double>(mDecodedSamplesRead +
-                                              mCircularBuffer.available()) /
+  // Consumption removes ring samples before publishing its read count, so
+  // summing those two independently sampled values can temporarily shrink
+  // the range. Both the written count and backlog are protected by the decode
+  // mutex held here; their difference is the stable decoded end in the ring.
+  const double endTime = static_cast<double>(mDecodedSamplesWritten -
+                                              mDecodedBacklog.size()) /
                          static_cast<double>(sampleRate * channels);
   const double totalLength = getLengthLocked();
   if (totalLength > 0.0) {
@@ -1081,7 +1117,7 @@ void PullBufferStream::applyPendingSeek(bool aUnderAudioMutex) {
       mPendingStreamPosition.store(mPendingSeekTime, std::memory_order_relaxed);
       mStreamPositionPending.store(true, std::memory_order_release);
     }
-    resetDecoderForSeek(targetSample);
+    resetDecoderForSeek(targetSample, newOffset);
     mPendingSeekByteOffset = newOffset;
     mDataIsEnded.store(false);
     mWaitingForData.store(false);
@@ -1322,7 +1358,7 @@ void PullBufferStream::callOnBufferingCallback(bool isBuffering,
         var functionName = "dartOnBufferingCallback_" + $3;
         if (typeof window[functionName] === "function") {
           var buffering = $0 == 1 ? true : false;
-          window[functionName](buffering, $1, $2);
+          window[functionName](buffering, $1 >>> 0, $2);
         }
       },
       isBuffering, handle, time, mParent->soundHash);

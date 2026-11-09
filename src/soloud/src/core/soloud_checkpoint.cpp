@@ -357,15 +357,11 @@ namespace SoLoud
 		cp.mVoices.clear();
 		cp.mSerial = mCheckpointCounter;
 		cp.mTime = mStreamTime;
-		if (mSamplerate > 0)
-		{
-			long long framesMixed = (long long)floor(mStreamTime * (time)mSamplerate + 0.5);
-			cp.mRingWritePosition = (unsigned long long)(framesMixed >= 0 ? framesMixed : 0);
-		}
-		else
-		{
-			cp.mRingWritePosition = 0;
-		}
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		// The sample clock accumulates rounded durations. Reconstructing frame
+		// positions from it eventually shifts a boundary by a frame, causing
+		// rollback to render an extra quantum. Keep the exact counter instead.
+		cp.mRingWritePosition = mMixFramePosition;
 
 		// Engine-level POD state.
 		cp.mGlobalVolume = mGlobalVolume;
@@ -528,6 +524,8 @@ namespace SoLoud
 		// checkpoint must keep their ids, so restore takes the max instead of
 		// rolling the counter back (which would reissue existing handles).
 		mStreamTime = cp.mTime;
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		mMixFramePosition = cp.mRingWritePosition;
 		mGlobalVolume = cp.mGlobalVolume;
 		mGlobalVolumeFader = cp.mGlobalVolumeFader;
 		// Voices created after the checkpoint are left running (Phase 2
@@ -796,6 +794,12 @@ namespace SoLoud
 				// Pristine resampler state: the birth snapshot predates any
 				// pool block assignment; the next calcActiveVoices_internal
 				// re-assigns and zeroes the blocks.
+				// ###### flutter_soloud local patch (replayed resampler ownership) ######
+				// Restore preserves blocks for voices born after the checkpoint.
+				// Release that ownership too, or mapping sees an owner with null
+				// pointers and never gives this replayed birth its buffers back.
+				for (k = 0; k < mMaxActiveVoices; k++)
+					if (mResampleDataOwner[k] == v) mResampleDataOwner[k] = NULL;
 				v->mResampleData[0] = NULL;
 				v->mResampleData[1] = NULL;
 				v->mSrcOffset = 0;

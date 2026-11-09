@@ -20,8 +20,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -269,45 +272,121 @@ void testChordJournalReplay()
     EXPECT(sumA > 1.0, "A lost after B's rollback (sumA %f)", sumA);
 }
 
-// playScheduled inside the window lands at the exact frame; a time at/behind
-// the playhead falls back to legacy ASAP placement (the next quantum at the
-// write head).
+// Two retroactive plays at the same playhead: the second rollback restores the
+// checkpoint from before the first birth and replays that birth from the
+// journal. The replayed voice must get resample buffers again and keep
+// consuming its source, so it still sounds after B's short pulse.
+void testChordAtTheSamePlayhead()
+{
+    Rig rig;
+    PulseSource a(4096, 0.5f);
+    PulseSource b(64, 0.5f);
+
+    rig.topUp();
+    rig.discard(2048);
+    const SoLoud::handle ha = rig.engine.play(a);  // onset at ring frame 2048
+    const SoLoud::handle hb = rig.engine.play(b);  // same playhead, same onset
+    EXPECT(ha != 0 && hb != 0, "plays failed");
+
+    std::vector<float> buf = rig.readAll();  // starts at ring frame 2048
+    const unsigned int frames = (unsigned int)(buf.size() / 2);
+    EXPECT(frames >= 1024, "window too small: %u", frames);
+
+    double sumEarly = 0;
+    for (unsigned int i = 0; i < 64; ++i)
+        sumEarly += std::fabs(buf[i * 2]);
+    // Frames 128..1024: A alone. If the replayed birth lost its resample
+    // buffers, A stops consuming its source and this region is silent.
+    double sumA = 0;
+    for (unsigned int i = 128; i < 1024 && i < frames; ++i)
+        sumA += std::fabs(buf[i * 2]);
+    EXPECT(sumEarly > 1.0, "nothing audible at the shared onset (%f)", sumEarly);
+    EXPECT(sumA > 1.0, "A lost after B's rollback at the same playhead (sumA %f)",
+           sumA);
+    // A plus B for the first 64 frames, A alone afterwards: about twice A's
+    // per-frame level at the onset.
+    if (sumA > 1.0)
+        EXPECT(sumEarly / 64.0 > 1.5 * (sumA / 896.0),
+               "B missing at the shared onset (early %f, A %f)", sumEarly / 64.0,
+               sumA / 896.0);
+}
+
+// The device callback tops the ring up and copies its unread frames out, on its
+// own thread, while control threads start voices that land in that unread
+// window and re-mix it. The top-up's ring write, the device's ring read, and
+// the re-mix's staging writes and ring rewrite must not race: under
+// ThreadSanitizer (--tsan) any of them is reported. Without a sanitizer, a
+// top-up whose clock is published before its ring block can trip the re-mix's
+// mix-clock assertion.
+void testDeviceReadRacesRetroactivePlays()
+{
+    Rig rig;
+    PulseSource blip(256, 0.25f, /*finite=*/true);
+
+    rig.topUp();
+
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned long> reads{0};
+    std::atomic<unsigned long> plays{0};
+
+    std::thread device([&] {
+        std::vector<float> out(kDevicePeriod * 2);
+        while (!stop.load()) {
+            // What soloud_miniaudio_audiomixer() does per callback.
+            rig.topUp();
+            rig.engine.mRenderRing.read(out.data(), kDevicePeriod);
+            reads.fetch_add(1);
+        }
+    });
+    std::thread control([&] {
+        while (!stop.load()) {
+            if (rig.engine.play(blip) != 0)
+                plays.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    stop.store(true);
+    control.join();
+    device.join();
+
+    std::fprintf(stderr, "  %lu device reads, %lu retroactive plays\n",
+                 reads.load(), plays.load());
+    // These only show the threads overlapped. The device thread here is not
+    // paced like a real device callback, so it can keep winning the audio
+    // mutex and leave the control thread a few hundred plays a second, or
+    // fewer on a slow or loaded machine. The race itself is caught by the
+    // mix-clock assertion and, under --tsan, by ThreadSanitizer.
+    EXPECT(reads.load() > 100, "too few device reads: %lu", reads.load());
+    EXPECT(plays.load() > 20, "too few plays: %lu", plays.load());
+}
+
+// A deadline that has passed clamps to the earliest unplayed frame. Route
+// the two voices to separate channels so each onset is observed independently.
 void testScheduledInWindow()
 {
     Rig rig;
     PulseSource a(64, 1.0f);
     PulseSource b(64, 1.0f);
-
     rig.topUp();
     rig.discard(2048);
-
-    // In-window: 1000 frames ahead of the playhead.
     const SoLoud::time playhead = rig.engine.getPlayheadTime();
-    rig.engine.playScheduled(playhead + 1000.0 / kSampleRate, a);
-
-    // Behind the playhead: legacy placement at the write head.
-    rig.engine.playScheduled(playhead - 1.0, b);
-
+    rig.engine.playScheduled(playhead + 1000.0 / kSampleRate, a, 1.0f, -1.0f);
+    rig.engine.playScheduled(playhead - 1.0, b, 1.0f, 1.0f);
     std::vector<float> buf = rig.readAll();
     const long long onsetA = firstAudibleFrame(buf, 0.02f);
     EXPECT(onsetA >= 996 && onsetA <= 1004,
            "scheduled onset at %lld, expected ~1000", onsetA);
-
-    // After A's pulse ends (~1072) the window is silent: B was scheduled
-    // behind the playhead and got legacy placement, so it is not in the
-    // already-mixed window at all.
-    bool midSilent = true;
-    for (unsigned int i = 1072; i * 2 < buf.size(); ++i)
-        midSilent = midSilent && std::fabs(buf[i * 2]) <= 0.02f;
-    EXPECT(midSilent, "legacy-scheduled voice leaked into the window");
-
-    // B starts with the next mixed quantum (the old write head).
-    rig.topUp();
-    std::vector<float> buf2 = rig.readAll();
-    const long long onsetB = firstAudibleFrame(buf2, 0.02f);
+    long long onsetB = -1;
+    for (unsigned int i = 0; i * 2 + 1 < buf.size(); ++i)
+        if (std::fabs(buf[i * 2 + 1]) > 0.02f) { onsetB = i; break; }
     EXPECT(onsetB >= 0 && onsetB <= 4,
-           "legacy-scheduled onset at %lld, expected ~0 of the next quantum",
-           onsetB);
+           "past deadline onset at %lld, expected ~0", onsetB);
+    EXPECT(allSilent(buf, 1072, 0.02f), "audio after both pulses ended");
+    rig.topUp();
+    const std::vector<float> next = rig.readAll();
+    EXPECT(allSilent(next, 0, 0.02f), "scheduled voice duplicated at write head");
 }
 
 // With a non-restorable voice sounding in the window, every checkpoint is
@@ -637,24 +716,55 @@ void testScheduledFadeInWindow()
     EXPECT(allSilent(buf, 2100, 0.02f), "fade not finished in window");
 }
 
+// Rounded block durations eventually lose a frame when converted back to
+// positions. Keep the same real mix path for a long virtual playback and
+// check that its checkpoint boundary still agrees exactly with publication.
+void testLongClockKeepsExactFramePositions()
+{
+    Rig rig;
+    rig.topUp();
+    for (unsigned int i = 0; i < 65536; ++i) {
+        rig.discard(kQuantum);
+        rig.topUp();
+    }
+    const int cp = rig.engine.findCheckpointAtOrBefore_internal(
+        rig.engine.getEngineTime());
+    EXPECT(cp >= 0, "latest checkpoint missing");
+    if (cp >= 0)
+        EXPECT(rig.engine.mCheckpointPool[cp].mRingWritePosition ==
+                   rig.engine.mRenderRing.getWritePosition(),
+               "checkpoint drifted from the exact ring write position");
+}
+
+
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
-    testRetroactivePlayInsertion();
-    testChordJournalReplay();
-    testScheduledInWindow();
-    testFallbackNonRestorable();
-    testEndedReconciliation();
-    testEmptyRemixBitExact();
-    testFeatureOffUnchanged();
-    testWavRetroactive();
-    testRetroactiveStop();
-    testRetroactiveVolume();
-    testParamJournalReplay();
-    testRetroactivePause();
-    testScheduledStopInWindow();
-    testScheduledFadeInWindow();
+    // An optional test name runs only that test.
+    const char *only = argc > 1 ? argv[1] : nullptr;
+    auto run = [&](const char *name, void (*test)()) {
+        if (only == nullptr || std::strcmp(only, name) == 0)
+            test();
+    };
+
+    run("insertion", testRetroactivePlayInsertion);
+    run("chord", testChordJournalReplay);
+    run("chord-same-playhead", testChordAtTheSamePlayhead);
+    run("scheduled", testScheduledInWindow);
+    run("fallback", testFallbackNonRestorable);
+    run("ended", testEndedReconciliation);
+    run("empty", testEmptyRemixBitExact);
+    run("off", testFeatureOffUnchanged);
+    run("wav", testWavRetroactive);
+    run("stop", testRetroactiveStop);
+    run("volume", testRetroactiveVolume);
+    run("params", testParamJournalReplay);
+    run("pause", testRetroactivePause);
+    run("scheduled-stop", testScheduledStopInWindow);
+    run("scheduled-fade", testScheduledFadeInWindow);
+    run("device-race", testDeviceReadRacesRetroactivePlays);
+    run("long-clock", testLongClockKeepsExactFramePositions);
 
     std::fprintf(stderr, "\n%d assertions, %d failures\n", gAssertions,
                  gFailures);
