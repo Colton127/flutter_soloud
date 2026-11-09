@@ -43,7 +43,7 @@ else
         exit 0
     fi
     TASK_MP3_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pull_mp3_seek.XXXXXX")"
-    trap 'rm -rf "$TASK_MP3_DIR"' EXIT
+    trap 'rm -rf "$TASK_MP3_DIR" "$WORK_DIR"' EXIT
     TASK_MP3_FIXTURE="$TASK_MP3_DIR/vbr.mp3"
     if ! ffmpeg -y -hide_banner -loglevel error \
         -f lavfi -i 'anullsrc=r=44100:cl=stereo:d=5' \
@@ -125,4 +125,15 @@ c++ -std=c++17 -O2 -w -pthread "${SANITIZER[@]}" \
     "${PLATFORM_LIBS[@]}" \
     -ldl -lm
 
-"$OUT" "$TASK_MP3_FIXTURE" "$@"
+# A fixed-rate file without Xing makes a partial table's coverage explicit.
+TASK_MP3_CBR="$WORK_DIR/cbr-no-xing.mp3"
+if ! command -v ffmpeg >/dev/null; then
+    echo "SKIP: CBR coverage fixture requires ffmpeg"
+    "$OUT" "$TASK_MP3_FIXTURE" "$@"
+    exit $?
+fi
+ffmpeg -y -hide_banner -loglevel error -f lavfi \
+    -i 'sine=frequency=440:sample_rate=44100:duration=12' \
+    -ac 2 -c:a libmp3lame -b:a 128k -write_xing 0 -id3v2_version 0 \
+    "$TASK_MP3_CBR"
+"$OUT" "$TASK_MP3_FIXTURE" "$TASK_MP3_CBR" "$@"

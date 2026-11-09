@@ -237,6 +237,36 @@ bool loadFile(const char *path) {
     return true;
 }
 
+void checkEofDoesNotExtendAPrefixMap(const char *path) {
+    const unsigned int voice = startStream(path);
+    double start = 0, end = 0;
+    // Keep the last decoded window alive while the feeder reaches EOF.
+    const bool atTail = waitFor([&] {
+        getPullBufferTimeRange(gHash, &start, &end);
+        return end > 11.3;
+    }, 15000);
+    std::printf("CBR tail: [%.2f, %.2f]\n", start, end);
+    EXPECT(atTail, "CBR reaches the final delivery before seeking");
+    const uint64_t expected = fileOffsetOf(6.0);
+    const size_t before = logSize();
+    uint64_t requested = UINT64_MAX;
+    seek(voice, 6.0f);
+    waitFor([&] {
+        std::lock_guard<std::mutex> lock(gMutex);
+        for (size_t i = before; i < gLog.size(); ++i) {
+            if (gLog[i] < gFile.size() / 2) { requested = gLog[i]; return true; }
+        }
+        return false;
+    }, 3000);
+    const uint64_t difference = requested > expected ? requested - expected : expected - requested;
+    std::printf("CBR seek: requested=%llu reference=%llu difference=%llu\n",
+                (unsigned long long)requested, (unsigned long long)expected,
+                (unsigned long long)difference);
+    EXPECT(requested != UINT64_MAX && expected != 0, "CBR request and reference exist");
+    EXPECT(difference <= 4 * 1045, "EOF must not extend a prefix seek table's coverage");
+    endStream(voice);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { std::printf("FAIL: MP3 fixture path required\n"); return 2; }
     std::vector<const char *> files{argv[1]};
@@ -254,6 +284,7 @@ int main(int argc, char **argv) {
         checkMp3SeekOrigin(path);
     }
 
+    if (argc > 2 && loadFile(argv[2])) checkEofDoesNotExtendAPrefixMap(argv[2]);
     gStop.store(true);
     feed.join();
     dispose();
