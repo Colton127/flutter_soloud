@@ -23,6 +23,7 @@
 
 #include "audiobuffer/aac_stream_decoder.h"
 #include "audiobuffer/m4a_metadata.h"
+#include "audiobuffer/mp3_stream_decoder.h"
 #include "audiobuffer/flac_stream_decoder.h"
 #include <FLAC/stream_encoder.h>
 #include "audiobuffer/stream_decoder.h"
@@ -334,6 +335,76 @@ static void isolated(const char *name, const char *what, void (*fn)()) {
 #endif
 }
 
+static void checkId3Text(const Bytes &body, const std::string &expected) {
+    const Bytes tag = id3Tag(static_cast<uint32_t>(body.size()), body);
+    AacMetadata aac;
+    size_t tagSize = 0;
+    EXPECT(AACDecoderWrapper::parseId3Tags(tag.data(), tag.size(), aac, tagSize),
+           "AAC text tag parsed");
+    EXPECT(aac.title == expected, "AAC ID3 text differs from UTF-8 expectation");
+
+    MP3DecoderWrapper mp3;
+    mp3.detectedType = DetectedType::BUFFER_MP3_WITH_ID3;
+    std::string title;
+    unsigned reports = 0;
+    mp3.setTrackChangeCallback([&](AudioMetadata metadata) {
+        title = metadata.mp3Metadata.title;
+        ++reports;
+    });
+    EXPECT(mp3.initializeDecoder(44100, 1), "MP3 text decoder init");
+    // Four complete mono MPEG-1 layer-III silence frames let the real decoder
+    // initialize and report its parsed ID3 metadata without an external file.
+    Bytes frames(417 * 4, 0);
+    for (size_t i = 0; i < frames.size(); i += 417) {
+        frames[i] = 0xff; frames[i + 1] = 0xfb;
+        frames[i + 2] = 0x90; frames[i + 3] = 0xc0;
+    }
+    Bytes stream = cat(tag, frames);
+    int rate = 44100, channels = 1;
+    mp3.decode(stream, &rate, &channels);
+    EXPECT(reports != 0, "MP3 text metadata reported");
+    EXPECT(title == expected, "MP3 ID3 text differs from UTF-8 expectation");
+}
+
+static void runId3Latin1Utf8() {
+    checkId3Text({0, 'C', 'a', 'f', 0xe9}, "Caf\xc3\xa9");
+    checkId3Text({3, 'C', 'a', 'f', 0xc3, 0xa9}, "Caf\xc3\xa9");
+}
+
+static Bytes utf16Text(bool little, bool bom, uint8_t encoding,
+                       std::initializer_list<uint16_t> units) {
+    Bytes body = {encoding};
+    if (bom) {
+        body.push_back(little ? 0xff : 0xfe);
+        body.push_back(little ? 0xfe : 0xff);
+    }
+    for (uint16_t unit : units) {
+        body.push_back(little ? unit & 0xff : unit >> 8);
+        body.push_back(little ? unit >> 8 : unit & 0xff);
+    }
+    return body;
+}
+
+static void runId3Utf16NonBmp() {
+    const std::string expected = "A\xf0\x9f\x98\x80" "B";
+    for (bool little : {false, true}) {
+        for (bool bom : {false, true}) {
+            checkId3Text(utf16Text(little, bom, little || bom ? 1 : 2,
+                                   {0x41, 0xd83d, 0xde00, 0x42}), expected);
+        }
+    }
+    checkId3Text(utf16Text(false, true, 2, {0x41, 0xd83d, 0xde00, 0x42}), expected);
+    for (bool little : {false, true}) {
+        const uint8_t encoding = little ? 1 : 2;
+        checkId3Text(utf16Text(little, false, encoding, {0x41, 0xd83d, 0x42}),
+                     "A\xef\xbf\xbd" "B");
+        checkId3Text(utf16Text(little, false, encoding, {0x41, 0xde00, 0x42}),
+                     "A\xef\xbf\xbd" "B");
+        checkId3Text(utf16Text(little, false, encoding, {0x41, 0xd83d}),
+                     "A\xef\xbf\xbd");
+    }
+}
+
 static FLAC__StreamEncoderWriteStatus collectFlac(
     const FLAC__StreamEncoder *, const FLAC__byte bytes[], size_t length,
     unsigned, unsigned, void *opaque) {
@@ -470,6 +541,8 @@ int main(int argc, char **argv) {
     const auto want = [&](const char *name) { return only.empty() || only == name; };
 
     if (want("valid")) testValid();
+    if (want("id3-latin1-utf8")) runId3Latin1Utf8();
+    if (want("id3-utf16-nonbmp")) runId3Utf16NonBmp();
     if (want("flac-partial-final-header"))
         isolated("flac-partial-final-header", "a split final FLAC metadata block", runFlacPartialFinalHeader);
     if (want("flac-seek-split-header"))
