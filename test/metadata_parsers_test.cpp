@@ -422,6 +422,39 @@ static void runFlacPartialFinalHeader() {
     }
 }
 
+// The engine initializes the FLAC decoder before any audio arrives. A first
+// delivery that ends inside the metadata must still leave the whole header
+// cached, because a later seek replays it ahead of the new frame bytes.
+static void runFlacSeekAfterSplitHeader() {
+    const Bytes file = flacWithPadding();
+    EXPECT(file.size() > 65582, "FLAC fixture must include padding and frames");
+    if (file.size() <= 65582) return;
+    const auto reference = decodeFlacParts(file, false, true);
+    FlacDecoderWrapper decoder;
+    EXPECT(decoder.initializeDecoder(44100, 1), "FLAC preinit");
+    int rate = 44100, channels = 1;
+    Bytes chunk(file.begin(), file.begin() + 62);
+    decoder.decode(chunk, &rate, &channels);
+    chunk.assign(file.begin() + 62, file.end());
+    decoder.decode(chunk, &rate, &channels);
+    // Seek back to the first frame as a pull stream does: the new delivery
+    // holds frame bytes only, starting after the 65582 metadata bytes.
+    decoder.prepareForSeek(0);
+    chunk.assign(file.begin() + 65582, file.end());
+    auto result = decoder.decode(chunk, &rate, &channels);
+    EXPECT(result.second == DecoderError::NoError, "FLAC post-seek status");
+    std::vector<float> output = result.first;
+    decoder.setDataEnded();
+    for (int i = 0; i < 8 && decoder.hasPendingData(); ++i) {
+        chunk.clear();
+        result = decoder.decode(chunk, &rate, &channels);
+        output.insert(output.end(), result.first.begin(), result.first.end());
+    }
+    EXPECT(output == reference,
+           "FLAC after a seek differs from the reference: %zu versus %zu samples",
+           output.size(), reference.size());
+}
+
 static void runM4aLargeWrap() {
     // An extended-size child at offset 8 must not wrap its 64-bit end.
     const Bytes file = {0,0,0,8, 'f','r','e','e',
@@ -439,6 +472,8 @@ int main(int argc, char **argv) {
     if (want("valid")) testValid();
     if (want("flac-partial-final-header"))
         isolated("flac-partial-final-header", "a split final FLAC metadata block", runFlacPartialFinalHeader);
+    if (want("flac-seek-split-header"))
+        isolated("flac-seek-split-header", "a seek after a split FLAC header", runFlacSeekAfterSplitHeader);
     if (want("m4a-nested"))
         isolated("m4a-nested", "4 MiB of nested boxes on a 1 MiB stack", runM4aNested);
     if (want("m4a-large-wrap"))

@@ -169,9 +169,10 @@ std::pair<std::vector<float>, DecoderError> FlacDecoderWrapper::decode(std::vect
             mHeader.assign(m_audioData.begin(), m_audioData.begin() + headerLen);
             SOLOUD_DEBUG_LOG("[FlacDecoderWrapper] captured %zu header bytes\n", headerLen);
         }
-        else if (m_pFlacDecoder == nullptr)
+        else
         {
-            // Need the full header before we can initialize the decoder.
+            // StreamDecoder may already have initialized the codec. Keep the
+            // input intact until the complete header can be cached for seeks.
             return {{}, DecoderError::NoError};
         }
     }
