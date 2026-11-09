@@ -27,11 +27,19 @@
 // Build and run from the flutter_soloud repository root with:
 //
 //   ./test/run_filter_ops_test.sh [--tsan] [scenario]
+//
+//   compressor  A new compressor instance (one is made for every voice that
+//           plays with the filter) fed a steady signal well below its
+//           threshold must leave it untouched from the first sample. Its
+//           level detector has to start from silence: one that starts at
+//           full scale ducks the start of every voice until it releases.
 
+#include "../src/filters/compressor.h"
 #include "../src/filters/parametric_eq_filter.h"
 #include "../src/filters/pitch_shift_filter.h"
 
 #include "soloud.h"
+#include "soloud_fader.h"
 #include "soloud_biquadresonantfilter.h"
 
 #include <atomic>
@@ -287,6 +295,75 @@ void testPitchShiftUsesChannelStride() {
     delete packed;
 }
 
+void testCompressorStartsFromSilence() {
+    std::printf("compressor: a signal below the threshold passes untouched from the start\n");
+    constexpr unsigned int kFrames = 512;
+    constexpr float kLevel = 0.1f; // -20 dBFS, below the default -6 dB threshold
+
+    Compressor parent(kSampleRate);
+    SoLoud::FilterInstance *instance = parent.createInstance();
+
+    std::vector<float> buffer(kFrames * kChannels);
+    int changed = 0;
+    float firstGain = 1.0f;
+    for (int block = 0; block < 16; ++block) {
+        for (unsigned int ch = 0; ch < kChannels; ++ch)
+            for (unsigned int i = 0; i < kFrames; ++i)
+                buffer[ch * kFrames + i] = (i % 2 == 0) ? kLevel : -kLevel;
+        instance->filter(buffer.data(), kFrames, kFrames, kChannels,
+                         static_cast<float>(kSampleRate), 0.0);
+        if (block == 0)
+            firstGain = std::fabs(buffer[0]) / kLevel;
+        for (float s : buffer)
+            if (std::fabs(std::fabs(s) - kLevel) > 1e-4f)
+                ++changed;
+    }
+
+    EXPECT(changed == 0,
+           "%d of %u samples changed; the first came out at %.3f of its level",
+           changed, 16 * kFrames * kChannels, firstGain);
+    delete instance;
+}
+
+void testCompressorTimingFollowsFadersAndRate() {
+    constexpr unsigned int frames = 4096;
+    for (unsigned int attribute : {Compressor::ATTACK_TIME, Compressor::RELEASE_TIME}) {
+        Compressor parent(44100);
+        auto *moving = parent.createInstance();
+        auto *reference = parent.createInstance();
+        for (auto *instance : {moving, reference}) {
+            instance->setFilterParameter(Compressor::THRESHOLD, -30);
+            instance->setFilterParameter(Compressor::RATIO, 10);
+            instance->setFilterParameter(attribute, 1);
+        }
+        std::vector<float> a(frames, 0.9f), b = a;
+        if (attribute == Compressor::ATTACK_TIME) a.assign(frames, 0.01f);
+        b = a;
+        moving->filter(a.data(), frames, frames, 1, 44100, 0);
+        reference->filter(b.data(), frames, frames, 1, 44100, 0);
+        moving->mParamFader[attribute].set(1, 80, 0.1, 0);
+        reference->setFilterParameter(attribute, 80);
+        a.assign(frames, attribute == Compressor::ATTACK_TIME ? 0.9f : 0.01f);
+        b = a;
+        moving->filter(a.data(), frames, frames, 1, 44100, 0.2);
+        reference->filter(b.data(), frames, frames, 1, 44100, 0.2);
+        float difference = 0;
+        for (unsigned int i = 0; i < frames; ++i) difference = std::max(difference, std::fabs(a[i] - b[i]));
+        EXPECT(difference < 1e-6f, "compressor: fader timing differs for parameter %u (%g)", attribute, difference);
+        delete moving; delete reference;
+    }
+    Compressor oldRate(44100), actualRate(48000);
+    auto *aInstance = oldRate.createInstance();
+    auto *bInstance = actualRate.createInstance();
+    std::vector<float> a(frames, 0.9f), b = a;
+    aInstance->filter(a.data(), frames, frames, 1, 48000, 0);
+    bInstance->filter(b.data(), frames, frames, 1, 48000, 0);
+    float difference = 0;
+    for (unsigned int i = 0; i < frames; ++i) difference = std::max(difference, std::fabs(a[i] - b[i]));
+    EXPECT(difference < 1e-6f, "compressor: construction rate changes block timing (%g)", difference);
+    delete aInstance; delete bInstance;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -301,6 +378,10 @@ int main(int argc, char **argv) {
         testFilterGetterRacesVoiceEnd();
     if (wanted("pitch"))
         testPitchShiftUsesChannelStride();
+    if (wanted("compressor")) {
+        testCompressorStartsFromSilence();
+        testCompressorTimingFollowsFadersAndRate();
+    }
 
     if (gFailures == 0)
         std::printf("\nAll %d assertions passed.\n", gAssertions);

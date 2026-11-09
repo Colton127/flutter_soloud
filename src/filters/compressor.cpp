@@ -17,10 +17,12 @@ CompressorInstance::CompressorInstance(Compressor *aParent)
     mParam[Compressor::ATTACK_TIME] = aParent->mAttackTime;
     mParam[Compressor::RELEASE_TIME] = aParent->mReleaseTime;
 
-    attackCoef = expf(-1.0f / (mParam[Compressor::ATTACK_TIME] * 0.001f * mParent->mSamplerate));
-    releaseCoef = expf(-1.0f / (mParam[Compressor::RELEASE_TIME] * 0.001f * mParent->mSamplerate));
+    attackCoef = 0.0f;
+    releaseCoef = 0.0f;
 
-    mEnvelope.assign(8, 0.0f);
+    // The detector is in dB: zero means full scale, not an empty history.
+    // Match the input floor so a new voice starts from silence.
+    mEnvelope.assign(8, -160.0f);
 }
 
 void CompressorInstance::filter(
@@ -33,11 +35,19 @@ void CompressorInstance::filter(
 {
     updateParams(aTime);
 
+    // Faders update mParam without calling setFilterParameter. Recompute
+    // from the block's actual rate too: source filters can run at a rate
+    // different from the one at which their parent was constructed.
+    attackCoef = mParam[Compressor::ATTACK_TIME] > 0.0f
+        ? expf(-1.0f / (mParam[Compressor::ATTACK_TIME] * 0.001f * aSamplerate)) : 0.0f;
+    releaseCoef = mParam[Compressor::RELEASE_TIME] > 0.0f
+        ? expf(-1.0f / (mParam[Compressor::RELEASE_TIME] * 0.001f * aSamplerate)) : 0.0f;
+
     // Convert makeup gain to a linear scale
     float makeupGainLin = powf(10.0f, mParam[Compressor::MAKEUP_GAIN] / 20.0f);
 
     if (mEnvelope.size() != aChannels) {
-        mEnvelope.resize(aChannels, 0.0f);
+        mEnvelope.resize(aChannels, -160.0f);
     }
 
     for (unsigned int i = 0; i < aSamples; ++i) {
@@ -126,14 +136,12 @@ void CompressorInstance::setFilterParameter(unsigned int aAttributeId, float aVa
             aValue > mParent->getParamMax(Compressor::ATTACK_TIME))
             return;
         mParam[Compressor::ATTACK_TIME] = aValue;
-        attackCoef = expf(-1.0f / (mParam[Compressor::ATTACK_TIME] * 0.001f * mParent->mSamplerate));
         break;
     case Compressor::RELEASE_TIME:
         if (aValue < mParent->getParamMin(Compressor::RELEASE_TIME) ||
             aValue > mParent->getParamMax(Compressor::RELEASE_TIME))
             return;
         mParam[Compressor::RELEASE_TIME] = aValue;
-        releaseCoef = expf(-1.0f / (mParam[Compressor::RELEASE_TIME] * 0.001f * mParent->mSamplerate));
         break;
     }
 
