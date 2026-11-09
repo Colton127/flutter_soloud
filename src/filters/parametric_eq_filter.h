@@ -21,6 +21,10 @@ class ParametricEqInstance : public SoLoud::FilterInstance {
   unsigned int mReadOffset[MAX_CHANNELS];
 
   int mBands;
+  int mSTFT_WINDOW_SIZE;
+  int mSTFT_WINDOW_HALF;
+  int mSTFT_WINDOW_TWICE;
+  float mFFT_SCALE;
 
   // Helper functions for FFT processing
   void comp2MagPhase(float *aFFTBuffer, unsigned int aSamples);
