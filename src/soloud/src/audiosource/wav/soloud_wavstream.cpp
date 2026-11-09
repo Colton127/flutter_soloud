@@ -100,6 +100,12 @@ namespace SoLoud
 		mSeekTargetPosition = 0;
 		mSeekAtEnd = false;
 		mSeekClockFromSeek = false;
+		mSeekBudgetOutputLeft = 0;
+		mSeekBudgetLeft = 0;
+		mSeekBudgetInMixer = false;
+		mSeekBudgetMixTime = 0;
+		mSeekBudgetHasDeadline = false;
+		mSeekBudgetWorked = false;
 		if (aParent->mMemFile)
 		{
 			MemoryFile *mf = new MemoryFile();
@@ -248,6 +254,38 @@ namespace SoLoud
 		float tmp[512 * MAX_CHANNELS];
 		if (mFile == NULL)
 			return 0;
+		// ###### flutter_soloud local patch (seek budget across short reads) ######
+		// The core may split its source block at a loop endpoint. Charge those
+		// small reads to one allowance, including across loop restarts, so a
+		// one-frame loop cannot refresh the seek budget 512 times in a block.
+		// A region at least one block long allows at most one restart within
+		// a block. Keep its old per-read allowance: entering near its end may
+		// need both the initial seek and that restart, without added silence.
+		const double loopStart = mLoopStartFrame >= 0 ? (double)mLoopStartFrame :
+			(mLoopPoint > 0 ? floor(mLoopPoint * mBaseSamplerate) : 0);
+		double loopEnd = mLoopEndFrame >= 0 ? (double)mLoopEndFrame :
+			(mLoopEndPoint > 0 ? ceil(mLoopEndPoint * mBaseSamplerate) : 0);
+		// An unknown file length must not erase an explicit loop endpoint.
+		if (loopEnd <= loopStart ||
+			(mParent->mSampleCount > 0 && loopEnd > mParent->mSampleCount))
+			loopEnd = mParent->mSampleCount;
+		const bool fullLoopRegion = (mFlags & AudioSourceInstance::LOOPING) != 0 &&
+			loopEnd - loopStart >= SAMPLE_GRANULARITY;
+		const bool inMixer = mParent->mSoloud != NULL &&
+			mParent->mSoloud->mInsideAudioThreadMutex;
+		const double mixTime = inMixer ? mParent->mSoloud->mStreamTime : 0;
+		if (fullLoopRegion || mSeekBudgetOutputLeft == 0 || inMixer != mSeekBudgetInMixer ||
+			(inMixer && mixTime != mSeekBudgetMixTime))
+		{
+			mSeekBudgetOutputLeft = SAMPLE_GRANULARITY;
+			mSeekBudgetLeft = seekSkipBudget_internal();
+			mSeekBudgetInMixer = inMixer;
+			mSeekBudgetMixTime = mixTime;
+			mSeekBudgetHasDeadline = false;
+			mSeekBudgetWorked = false;
+		}
+		mSeekBudgetOutputLeft -= aSamplesToRead < mSeekBudgetOutputLeft ?
+			aSamplesToRead : mSeekBudgetOutputLeft;
 		// ###### flutter_soloud local patch (bounded wavstream seek) ######
 		// Do (up to a budget of) the work a seek left (see seek()). Until it
 		// is done, play silence and stay at the target: the call reports the
@@ -439,6 +477,9 @@ namespace SoLoud
 	static const unsigned long long kSeekChunkFrames = 2048;
 
 	std::atomic<unsigned int> gWavStreamSeekCallCapUs(WAVSTREAM_SEEK_CALL_CAP_US);
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+	std::atomic<unsigned long long> gWavStreamSeekDecodedFrames(0);
+#endif
 
 	// True once the time cap of this call (aDeadline; NULL: none) has passed.
 	// Never on the web: performance.now(), which the clock reads there, may
@@ -648,21 +689,32 @@ namespace SoLoud
 
 	bool WavStreamInstance::advanceSeek_internal()
 	{
-		long long budget = (long long)seekSkipBudget_internal();
+		long long &budget = mSeekBudgetLeft;
+		if (budget <= 0)
+			return false;
 		// This call's time cap: from now, or for the first call after a
 		// seek() from the start of that seek().
-		std::chrono::steady_clock::time_point deadline;
 		const std::chrono::steady_clock::time_point *deadlinePtr = NULL;
 #if !defined(__EMSCRIPTEN__)
 		const unsigned int capUs = gWavStreamSeekCallCapUs.load(std::memory_order_relaxed);
 		if (capUs > 0)
 		{
-			deadline = (mSeekClockFromSeek ? mSeekClockStart : std::chrono::steady_clock::now()) +
-				std::chrono::microseconds(capUs);
-			deadlinePtr = &deadline;
+			if (!mSeekBudgetHasDeadline)
+			{
+				mSeekBudgetDeadline = (mSeekClockFromSeek ? mSeekClockStart : std::chrono::steady_clock::now()) +
+					std::chrono::microseconds(capUs);
+				mSeekBudgetHasDeadline = true;
+			}
+			deadlinePtr = &mSeekBudgetDeadline;
 		}
 #endif
 		mSeekClockFromSeek = false;
+		// Once this source block has made progress, an expired deadline means
+		// silence for its remaining reads. The next block still makes at least
+		// one chunk of progress even if seek() itself used the whole cap.
+		if (mSeekBudgetWorked && seekDeadlinePassed(deadlinePtr))
+			return false;
+		mSeekBudgetWorked = true;
 		if (mSeekWork == SEEK_WORK_MP3_SYNC)
 		{
 			drmp3 *mp3 = mCodec.mMp3;
@@ -688,8 +740,12 @@ namespace SoLoud
 			if (n > kSeekChunkFrames)
 				n = kSeekChunkFrames;
 			const unsigned long long got = skipFrames_internal(n);
+#if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
+			gWavStreamSeekDecodedFrames.fetch_add(got, std::memory_order_relaxed);
+#endif
 			mSeekSkipFrames -= got;
 			left -= got;
+			budget -= (long long)got;
 			if (got < n)
 			{
 				// The stream ended before the target, though the length it

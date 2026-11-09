@@ -45,7 +45,7 @@ else
 fi
 
 c++ -std=c++17 -Wall -Wextra -pthread "${SANITIZER[@]}" \
-    -DWITH_NULL \
+    -DWITH_NULL -DSOLOUD_LIFECYCLE_TEST_HOOKS \
     "${XIPH_FLAGS[@]}" \
     -I src/soloud/include \
     -I src/soloud/src/audiosource/wav \
