@@ -32,6 +32,10 @@ BasicwaveInstance::BasicwaveInstance(Basicwave *aParent)
     mParent = aParent;
     mT = 0;
     mPhase = 0;
+    // Each instance starts from a known phase, including harmonics whose
+    // storage may have belonged to a previous voice.
+    for (double &phase : mHarmonicPhases)
+        phase = 0;
     mCurrentFrequency = mParent->mFreq;
 }
 

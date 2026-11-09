@@ -7,6 +7,10 @@
 //           waveform with that scale and that detune, not with the two
 //           swapped.
 //
+//   phases  A superwave instance must start its three harmonics at a defined
+//           phase. The instance is constructed in storage filled with a NaN
+//           bit pattern, so a harmonic phase the constructor leaves
+//           uninitialized turns every generated sample into NaN.
 //
 //
 // `params` and `race` open the default output device through a Player (the
@@ -86,6 +90,46 @@ void testLoadWaveformKeepsScaleAndDetune() {
     player.dispose();
 }
 
+// ---- phases -----------------------------------------------------------------
+
+void testSuperwaveHarmonicsStartAtADefinedPhase() {
+    std::printf("phases: superwave harmonics start at a defined phase\n");
+
+    Basicwave wave(SoLoud::Soloud::WAVE_SIN, true, 0.5, 0.1);
+
+    alignas(BasicwaveInstance) unsigned char storage[sizeof(BasicwaveInstance)];
+    // Every double this pattern covers is a NaN.
+    std::memset(storage, 0xff, sizeof(storage));
+    BasicwaveInstance *instance = new (storage) BasicwaveInstance(&wave);
+
+    constexpr unsigned int kFrames = 256;
+    std::vector<float> samples(kFrames);
+    instance->getAudio(samples.data(), kFrames, kFrames);
+
+    int nonFinite = 0;
+    for (float s : samples)
+        if (!std::isfinite(s))
+            ++nonFinite;
+    EXPECT(nonFinite == 0, "%d of %u superwave samples are not finite", nonFinite,
+           kFrames);
+
+    // The same waveform, constructed in zeroed storage, renders the same block:
+    // where the harmonics start must not depend on what the memory held.
+    alignas(BasicwaveInstance) unsigned char zeroed[sizeof(BasicwaveInstance)];
+    std::memset(zeroed, 0, sizeof(zeroed));
+    BasicwaveInstance *reference = new (zeroed) BasicwaveInstance(&wave);
+    std::vector<float> expected(kFrames);
+    reference->getAudio(expected.data(), kFrames, kFrames);
+    int differ = 0;
+    for (unsigned int i = 0; i < kFrames; ++i)
+        if (!(samples[i] == expected[i]))
+            ++differ;
+    EXPECT(differ == 0, "%d samples depend on the instance's prior memory", differ);
+
+    reference->~BasicwaveInstance();
+    instance->~BasicwaveInstance();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -96,6 +140,8 @@ int main(int argc, char **argv) {
 
     if (wanted("params"))
         testLoadWaveformKeepsScaleAndDetune();
+    if (wanted("phases"))
+        testSuperwaveHarmonicsStartAtADefinedPhase();
 
     if (gFailures == 0)
         std::printf("\nAll %d assertions passed.\n", gAssertions);
