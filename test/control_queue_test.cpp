@@ -683,6 +683,67 @@ void testFadersAndScheduledOps() {
     soloud.deinit();
 }
 
+// A fade retargeted while getAudio() is blocked must use the live value
+// already advanced by that block, not the last published getter snapshot.
+void testRetargetFadeDuringMix() {
+    std::printf("retarget a fade during an in-progress mix\n");
+    for (int kind = 0; kind < 3; ++kind) {
+        SoLoud::Soloud soloud;
+        if (!initEngine(soloud)) return;
+        TestSource source;
+        const auto h = playUnity(soloud, source);
+        const double blockTime = double(kBuffer) / kSampleRate;
+        const bool pan = kind == 1;
+        if (pan) {
+            soloud.setPan(h, 1.0f);
+            soloud.fadePan(h, 0.0f, 4 * blockTime);
+        } else {
+            soloud.fadeVolume(h, 0.0f, 4 * blockTime);
+        }
+        mixBlock(soloud);
+        EXPECT(near(pan ? soloud.getPan(h) : soloud.getVolume(h), 0.75),
+               "retarget: first published value should be 0.75");
+        source.armed.store(true);
+        std::thread mixer([&] { mixBlock(soloud); });
+        EXPECT(waitFor([&] { return source.inside.load(); }, 2000),
+               "retarget: mixer should enter the blocked source");
+        if (kind == 2)
+            soloud.scheduleFadeAt(h, 10.0, 0.75f, 1.0, false);
+        else if (pan)
+            soloud.fadePan(h, 0.75f, 1.0);
+        else
+            soloud.fadeVolume(h, 0.75f, 1.0);
+        mixer.join();
+        // Drain any setter the erroneous equality fast path queued.
+        soloud.getActiveVoiceCount();
+        auto *voice = voiceOf(soloud, h);
+        const auto &fader = pan ? voice->mPanFader : voice->mVolumeFader;
+        EXPECT(fader.mActive > 0 && near(fader.mFrom, 0.5),
+               "retarget kind %d: expected active fade from 0.5, got active=%d from=%f",
+               kind, fader.mActive, fader.mFrom);
+        mixBlock(soloud);
+        const float value = pan ? soloud.getPan(h) : soloud.getVolume(h);
+        EXPECT(value >= 0.5f - 1e-6f && value < 0.75f,
+               "retarget kind %d: should interpolate rather than jump (value=%f)", kind, value);
+        soloud.deinit();
+    }
+
+    // Each voice in a group supplies its own starting value.
+    SoLoud::Soloud soloud;
+    if (!initEngine(soloud)) return;
+    TestSource source;
+    const auto a = playUnity(soloud, source, 0.25f);
+    const auto b = playUnity(soloud, source, 0.5f);
+    const auto group = soloud.createVoiceGroup();
+    soloud.addVoiceToGroup(group, a);
+    soloud.addVoiceToGroup(group, b);
+    soloud.fadeVolume(group, 0.75f, 1.0);
+    EXPECT(near(voiceOf(soloud, a)->mVolumeFader.mFrom, 0.25) &&
+               near(voiceOf(soloud, b)->mVolumeFader.mFrom, 0.5),
+           "group fades must start from each voice's own volume");
+    soloud.deinit();
+}
+
 // Many more calls than voices between two blocks coalesce (one queued
 // change per voice and type, newest value wins) without losing or
 // reordering anything, and teardown with commands still queued is safe.
@@ -1242,6 +1303,7 @@ int main() {
     testHandleSemantics();
     testVoiceGroups();
     testFadersAndScheduledOps();
+    testRetargetFadeDuringMix();
     testManyCommandsAndTeardown();
     testRenderAheadAppliesImmediatelyWhenIdle();
     testIdleMixerAppliesAtOnce(false);
