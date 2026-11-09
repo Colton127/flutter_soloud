@@ -46,6 +46,7 @@ public:
   virtual SoLoud::SourceStateSnapshot *captureSourceState();
   virtual void restoreSourceState(SoLoud::SourceStateSnapshot *aState);
   bool samplerateAlreadySet;
+  uint64_t mFormatGeneration{0};
 
 private:
   /// This voice's handle, from SoLoud's voice table: 0 if it is not there.
@@ -67,6 +68,9 @@ public:
   std::atomic<uint64_t> mDartCallbackGeneration{dart_callbacks::kNoGeneration};
   unsigned int autoTypeChannels;
   float autoTypeSamplerate;
+  // Reset changes this under the audio and buffer mutexes. A voice compares
+  // its saved generation under those locks before using a detected format.
+  uint64_t mFormatGeneration{0};
   unsigned int mMaxBufferSize;
   // The counters and the end flag are updated by a delivery (under
   // sounds_mutex), by the background decode thread and, for a RELEASED

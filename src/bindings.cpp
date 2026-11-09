@@ -2413,6 +2413,18 @@ extern "C"
     }
   }
 
+  FFI_PLUGIN_EXPORT float soloudTestVoiceSampleRate(unsigned int handle)
+  {
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited()) return 0;
+    auto &engine = pin.get()->soloud;
+    engine.lockAudioMutex_internal();
+    const int index = engine.getVoiceFromHandle_internal(handle);
+    const float rate = index < 0 ? 0 : engine.mVoice[index]->mBaseSamplerate;
+    engine.unlockAudioMutex_internal();
+    return rate;
+  }
+
   /// Run the voice-ended body for [handle], tagged with the engine session
   /// [generation], the way the web AudioWorklet build runs it on the main
   /// browser thread some time after the voice ended (voiceEndedForwardToMain).
