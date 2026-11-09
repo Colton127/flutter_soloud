@@ -107,7 +107,8 @@ extern "C"
     enum PlayerErrors startMixerCapture(int format, int sampleRate,
                                         int channels, int bufferSizeBytes,
                                         int notificationThresholdBytes,
-                                        int chunkPCMFrames);
+                                        int chunkPCMFrames,
+                                        unsigned int *captureId = nullptr);
     void stopMixerCapture();
     int isMixerCaptureRunning();
 

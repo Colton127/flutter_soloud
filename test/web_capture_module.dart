@@ -24,21 +24,7 @@ class WebCaptureModule {
       ..['_setMixerOutputCallback'] = ((int pointer) {
         packets.clear();
       }).toJS
-      ..['_startMixerCapture'] =
-          ((
-                int format,
-                int rate,
-                int channels,
-                int size,
-                int threshold,
-                int chunkFrames,
-              ) {
-                if (running) return PlayerErrors.playerAlreadyInited.index;
-                running = true;
-                captureId++;
-                return 0;
-              })
-              .toJS
+      ..['_startMixerCapture'] = startCapture.toJS
       ..['_stopMixerCapture'] = (() {
         running = false;
         globalStops++;
@@ -58,7 +44,7 @@ class WebCaptureModule {
         heap.buffer.asUint8List().setAll(ptr, bytes);
         return ptr;
       }).toJS
-      ..['_getMixerCaptureId'] = (() => captureId).toJS
+      ..['_getMixerCaptureId'] = readCaptureId.toJS
       ..['_isMixerCaptureRunning'] = (() => running ? 1 : 0).toJS
       ..['_getMixerCaptureAvailableBytes'] = (() => tail.length).toJS
       ..['_getMixerCaptureBufferPointer'] = (() => tailPtr).toJS
@@ -101,10 +87,40 @@ class WebCaptureModule {
   }
 
   int captureId = 0;
+  bool replaceCaptureOnIdRead = false;
+  int replacements = 0;
   bool running = false;
   int globalStops = 0;
   var _top = 8;
   var _nextToken = 0;
+
+  // Keep six required arguments so the previous binding still reaches the
+  // replacement race. The seventh argument models the new native out slot.
+  int startCapture(
+    int format,
+    int rate,
+    int channels,
+    int size,
+    int threshold,
+    int chunkFrames, [
+    int? idPtr,
+  ]) {
+    if (running) return PlayerErrors.playerAlreadyInited.index;
+    running = true;
+    captureId++;
+    if (idPtr != null) heap.setInt32(idPtr, captureId, Endian.little);
+    return PlayerErrors.noError.index;
+  }
+
+  int readCaptureId() {
+    if (replaceCaptureOnIdRead) {
+      replaceCaptureOnIdRead = false;
+      replacements++;
+      captureId++;
+      running = true;
+    }
+    return captureId;
+  }
 
   int allocate(int size) {
     final ptr = _top;

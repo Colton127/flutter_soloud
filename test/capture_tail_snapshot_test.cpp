@@ -15,7 +15,7 @@ int main() {
         printf("Capture snapshot: FAIL (engine init)\n"); return 1;
     }
     stopAudioDevice(1);
-    if (startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 4096, 4096, -1) != noError) {
+    if (startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 4096, 4096, -1, nullptr) != noError) {
         printf("Capture snapshot: FAIL (capture start)\n"); dispose(); return 1;
     }
     MixerOutput::instance().setDataCallback(nullptr);
@@ -46,7 +46,7 @@ int main() {
     std::thread starter([&] {
         attempted.store(true);
         startResult = startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2,
-                                         1 << 20, 4096, -1);
+                                         1 << 20, 4096, -1, nullptr);
         restarted.store(true);
     });
     while (!attempted.load()) std::this_thread::yield();

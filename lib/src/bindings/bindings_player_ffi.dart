@@ -394,18 +394,24 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     int notificationThresholdBytes,
     int chunkPCMFrames,
   ) {
-    final ret = native.startMixerCapture(
-      format.value,
-      sampleRate,
-      channels,
-      bufferSizeBytes,
-      notificationThresholdBytes,
-      chunkPCMFrames,
-    );
-    if (ret == native.PlayerErrors.noError) {
-      _mixerCaptureId = native.getMixerCaptureId();
+    final id = calloc<ffi.UnsignedInt>();
+    try {
+      final ret = native.startMixerCapture(
+        format.value,
+        sampleRate,
+        channels,
+        bufferSizeBytes,
+        notificationThresholdBytes,
+        chunkPCMFrames,
+        id,
+      );
+      if (ret == native.PlayerErrors.noError) {
+        _mixerCaptureId = id.value;
+      }
+      return PlayerErrors.values[ret.value];
+    } finally {
+      calloc.free(id);
     }
-    return PlayerErrors.values[ret.value];
   }
 
   @override

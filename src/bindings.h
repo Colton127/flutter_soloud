@@ -122,10 +122,13 @@ extern "C"
   /// is fired.
   /// [chunkPCMFrames] fixed PCM chunk size in frames, or 0 to disable chunk
   /// mode.
+  /// [captureId] receives this capture's id on success, or zero on failure.
+  /// A null pointer is allowed for native callers that do not need the id.
   /// Returns [PlayerErrors.noError] if success.
   FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCapture(
       int format, int sampleRate, int channels, int bufferSizeBytes,
-      int notificationThresholdBytes, int chunkPCMFrames);
+      int notificationThresholdBytes, int chunkPCMFrames,
+      unsigned int *captureId);
 
   /// Stop capturing the master mixer output.
   FFI_PLUGIN_EXPORT void stopMixerCapture();

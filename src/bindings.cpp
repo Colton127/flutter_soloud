@@ -940,8 +940,9 @@ extern "C"
       int format, int sampleRate, int channels,
       int bufferSizeBytes,
       int notificationThresholdBytes,
-      int chunkPCMFrames)
+      int chunkPCMFrames, unsigned int *captureId)
   {
+    if (captureId != nullptr) *captureId = 0;
     MixerOutputFormat outputFormat = static_cast<MixerOutputFormat>(format);
 
     if (engine_shutdown_requested.load(std::memory_order_acquire))
@@ -982,11 +983,16 @@ extern "C"
     if (engine_shutdown_requested.load(std::memory_order_acquire))
       return backendNotInited;
 
-    return MixerOutput::instance().start(
+    const PlayerErrors result = MixerOutput::instance().start(
         outputFormat, sr, ch,
         static_cast<size_t>(bufferSizeBytes),
         static_cast<size_t>(notificationThresholdBytes),
         chunkPCMFrames);
+    // Publish the id before releasing the lifecycle lock. A separate query
+    // could observe a replacement capture started by another isolate.
+    if (result == noError && captureId != nullptr)
+      *captureId = MixerOutput::instance().captureId();
+    return result;
   }
 
   // A queued listener receives a token, never a borrowed ring pointer. Taking

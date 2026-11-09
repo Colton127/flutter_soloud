@@ -73,9 +73,19 @@ external void retireDartCallbacksFinalizer(ffi.Pointer<ffi.Void> token);
 /// is fired.
 /// [chunkPCMFrames] fixed PCM chunk size in frames, or 0 to disable chunk
 /// mode.
+/// [captureId] receives this capture's id on success, or zero on failure.
+/// A null pointer is allowed for native callers that do not need the id.
 /// Returns [PlayerErrors.noError] if success.
 @ffi.Native<
-  ffi.UnsignedInt Function(ffi.Int, ffi.Int, ffi.Int, ffi.Int, ffi.Int, ffi.Int)
+  ffi.UnsignedInt Function(
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Int,
+    ffi.Pointer<ffi.UnsignedInt>,
+  )
 >(symbol: 'startMixerCapture')
 external int _startMixerCapture(
   int format,
@@ -84,6 +94,7 @@ external int _startMixerCapture(
   int bufferSizeBytes,
   int notificationThresholdBytes,
   int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
 );
 
 PlayerErrors startMixerCapture(
@@ -93,6 +104,7 @@ PlayerErrors startMixerCapture(
   int bufferSizeBytes,
   int notificationThresholdBytes,
   int chunkPCMFrames,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
 ) => PlayerErrors.fromValue(
   _startMixerCapture(
     format,
@@ -101,6 +113,7 @@ PlayerErrors startMixerCapture(
     bufferSizeBytes,
     notificationThresholdBytes,
     chunkPCMFrames,
+    captureId,
   ),
 );
 

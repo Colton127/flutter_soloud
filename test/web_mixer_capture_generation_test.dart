@@ -4,6 +4,8 @@ library;
 import 'dart:typed_data';
 
 import 'package:flutter_soloud/src/bindings/bindings_player_web.dart';
+import 'package:flutter_soloud/src/bindings/js_extension.dart'
+    show wasmGetMixerCaptureId;
 import 'package:flutter_soloud/src/enums.dart';
 import 'package:test/test.dart';
 
@@ -57,6 +59,38 @@ void main() {
       expect(module.allocations, isEmpty);
       bindings.stopMixerOutputCapture();
       await subscription.cancel();
+    },
+  );
+
+  test(
+    'a capture keeps its start id when another capture replaces it',
+    () async {
+      final module = WebCaptureModule();
+      final bindings = FlutterSoLoudWeb();
+      await bindings.setDartEventCallbacks();
+      module.replaceCaptureOnIdRead = true;
+      expect(
+        bindings.startMixerOutputCapture(
+          MixerOutputFormat.pcmF32le,
+          44100,
+          2,
+          65536,
+          4096,
+          2048,
+        ),
+        PlayerErrors.noError,
+      );
+      // Old bindings have already queried here and adopted the replacement id.
+      // New bindings read the out slot; this unchanged getter then places the
+      // same replacement after their start. Both paths exercise a running B.
+      wasmGetMixerCaptureId();
+      expect(module.replacements, 1);
+      expect(module.captureId, 2);
+      final token = module.queue(Uint8List.fromList([7, 7, 7, 7]));
+      bindings.stopMixerOutputCapture();
+      expect(module.running, isTrue, reason: 'stopping A must spare B');
+      expect(module.packets.containsKey(token), isTrue);
+      expect(module.globalStops, 0);
     },
   );
 }

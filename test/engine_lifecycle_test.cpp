@@ -96,8 +96,10 @@ extern "C"
     enum PlayerErrors startMixerCapture(int format, int sampleRate, int channels,
                                         int bufferSizeBytes,
                                         int notificationThresholdBytes,
-                                        int chunkPCMFrames);
+                                        int chunkPCMFrames,
+                                        unsigned int *captureId = nullptr);
     void stopMixerCapture();
+    unsigned int getMixerCaptureId();
     int isMixerCaptureRunning();
     enum PlayerErrors isFilterActive(unsigned int, unsigned int,
                                      enum FilterType, int *);
@@ -890,10 +892,12 @@ void testCaptureRefusesAFormatTheMixDoesNotProduce()
     };
     for (const Case &c : refused)
     {
+        unsigned int refusedId = 123;
         const PlayerErrors error = startMixerCapture(
             MIXER_OUTPUT_PCM_F32LE, c.sampleRate, c.channels,
             /*bufferSizeBytes=*/256 * 1024,
-            /*notificationThresholdBytes=*/4096, /*chunkPCMFrames=*/-1);
+            /*notificationThresholdBytes=*/4096, /*chunkPCMFrames=*/-1, &refusedId);
+        EXPECT(refusedId == 0, "a refused start must clear its id output");
         EXPECT(error != noError,
                "a capture with %s (%d Hz, %d channels) should be refused",
                c.what, c.sampleRate, c.channels);
@@ -907,13 +911,18 @@ void testCaptureRefusesAFormatTheMixDoesNotProduce()
                "no capture should be left running (%s)", c.what);
     }
 
+    unsigned int firstId = 0;
     EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 256 * 1024,
-                             4096, -1) == noError,
+                             4096, -1, &firstId) == noError,
            "a capture in the engine's own format should start");
+    EXPECT(firstId != 0 && firstId == getMixerCaptureId(), "start returns its capture id");
     stopMixerCapture();
+    unsigned int secondId = 0;
     EXPECT(startMixerCapture(MIXER_OUTPUT_PCM_F32LE, -1, -1, 256 * 1024,
-                             4096, -1) == noError,
+                             4096, -1, &secondId) == noError,
            "a capture following the engine's format (-1) should start");
+    EXPECT(secondId != 0 && secondId != firstId && secondId == getMixerCaptureId(),
+           "a replacement start returns a different id");
     stopMixerCapture();
 
     resetGlobalState();

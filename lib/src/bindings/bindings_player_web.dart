@@ -247,18 +247,24 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     int notificationThresholdBytes,
     int chunkPCMFrames,
   ) {
-    final ret = wasmStartMixerCapture(
-      format.value,
-      sampleRate,
-      channels,
-      bufferSizeBytes,
-      notificationThresholdBytes,
-      chunkPCMFrames,
-    );
-    if (ret == PlayerErrors.noError.index) {
-      _mixerCaptureId = wasmGetMixerCaptureId().toUnsigned(32);
+    final idPtr = wasmMalloc(4);
+    try {
+      final ret = wasmStartMixerCapture(
+        format.value,
+        sampleRate,
+        channels,
+        bufferSizeBytes,
+        notificationThresholdBytes,
+        chunkPCMFrames,
+        idPtr,
+      );
+      if (ret == PlayerErrors.noError.index) {
+        _mixerCaptureId = wasmGetI32Value(idPtr, 'i32').toUnsigned(32);
+      }
+      return PlayerErrors.values[ret];
+    } finally {
+      wasmFree(idPtr);
     }
-    return PlayerErrors.values[ret];
   }
 
   @override
