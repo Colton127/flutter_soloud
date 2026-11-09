@@ -48,6 +48,8 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   /// session (see engineGeneration in bindings.cpp).
   int _engineGeneration = 0;
 
+  int? _mixerCaptureId;
+
   /// Serializes native engine lifecycle calls (initEngine / changeDevice /
   /// deinit / disposeAllSound).
   ///
@@ -193,7 +195,8 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
         final idPtr = wasmMalloc(4);
         final data = wasmTakeMixerOutputPacket(token, idPtr);
         try {
-          if (data == 0) {
+          if (data == 0 ||
+              wasmGetI32Value(idPtr, 'i32').toUnsigned(32) != _mixerCaptureId) {
             return;
           }
           final bytes = Uint8List.sublistView(
@@ -239,11 +242,15 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
       notificationThresholdBytes,
       chunkPCMFrames,
     );
+    if (ret == PlayerErrors.noError.index) {
+      _mixerCaptureId = wasmGetMixerCaptureId().toUnsigned(32);
+    }
     return PlayerErrors.values[ret];
   }
 
   @override
   void stopMixerOutputCapture() {
+    _mixerCaptureId = null;
     wasmStopMixerCapture();
   }
 
