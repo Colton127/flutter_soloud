@@ -17,6 +17,12 @@
 //           delete that voice. Run under ThreadSanitizer (--tsan), which
 //           reports the unsynchronized voice-table read.
 //
+//   pitch   Pitch shift on a planar buffer whose channel stride is larger
+//           than the frame count, as Soloud::mix() passes for block sizes
+//           that are not a multiple of 16. The filter must address channel
+//           c at c * stride: the samples must match the same input processed
+//           in a packed buffer, and the padding between channels must stay
+//           untouched.
 //
 // Build and run from the flutter_soloud repository root with:
 //
@@ -215,6 +221,72 @@ void testFilterGetterRacesVoiceEnd() {
     soloud.deinit();
 }
 
+// ---- pitch ------------------------------------------------------------------
+
+void testPitchShiftUsesChannelStride() {
+    std::printf("pitch: pitch shift on a padded planar buffer\n");
+
+    constexpr unsigned int kFrames = 129;  // Soloud::mix(…, 129)
+    constexpr unsigned int kStride = 144;  // (129 + 15) & ~15
+    constexpr float kPad = 7.0f;
+
+    PitchShift parent;
+    SoLoud::FilterInstance *padded = parent.createInstance();
+    SoLoud::FilterInstance *packed = parent.createInstance();
+    padded->setFilterParameter(PitchShift::SHIFT, 1.5f);
+    packed->setFilterParameter(PitchShift::SHIFT, 1.5f);
+
+    std::vector<float> a(kStride * kChannels);
+    std::vector<float> b(kFrames * kChannels);
+    unsigned int frame = 0;
+    int paddingChanged = 0;
+    int samplesDiffer = 0;
+    int rightDiffer = 0;
+    float maxOut = 0.0f;
+
+    for (int block = 0; block < 64; ++block) {
+        std::fill(a.begin(), a.end(), kPad);
+        for (unsigned int ch = 0; ch < kChannels; ++ch)
+            for (unsigned int i = 0; i < kFrames; ++i) {
+                const float s = 0.25f * std::sin(0.03f * static_cast<float>(frame + i) *
+                                                 static_cast<float>(ch + 1));
+                a[ch * kStride + i] = s;
+                b[ch * kFrames + i] = s;
+            }
+        frame += kFrames;
+
+        padded->filter(a.data(), kFrames, kStride, kChannels,
+                       static_cast<float>(kSampleRate), 0.0);
+        packed->filter(b.data(), kFrames, kFrames, kChannels,
+                       static_cast<float>(kSampleRate), 0.0);
+
+        for (unsigned int ch = 0; ch < kChannels; ++ch) {
+            for (unsigned int i = kFrames; i < kStride; ++i)
+                if (a[ch * kStride + i] != kPad)
+                    ++paddingChanged;
+            for (unsigned int i = 0; i < kFrames; ++i) {
+                maxOut = std::max(maxOut, std::fabs(b[ch * kFrames + i]));
+                if (std::fabs(a[ch * kStride + i] - b[ch * kFrames + i]) > 1e-6f) {
+                    ++samplesDiffer;
+                    if (ch == 1)
+                        ++rightDiffer;
+                }
+            }
+        }
+    }
+
+    EXPECT(maxOut > 0.01f, "the pitch shifter produced no output to compare (max %f)",
+           maxOut);
+    EXPECT(paddingChanged == 0,
+           "%d padding samples between the channels were overwritten", paddingChanged);
+    EXPECT(samplesDiffer == 0,
+           "%d samples (%d right-channel) differ from the packed-buffer result",
+           samplesDiffer, rightDiffer);
+
+    delete padded;
+    delete packed;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -227,6 +299,8 @@ int main(int argc, char **argv) {
         testEqWindowChangeOnOneOfTwoVoices();
     if (wanted("getter"))
         testFilterGetterRacesVoiceEnd();
+    if (wanted("pitch"))
+        testPitchShiftUsesChannelStride();
 
     if (gFailures == 0)
         std::printf("\nAll %d assertions passed.\n", gAssertions);

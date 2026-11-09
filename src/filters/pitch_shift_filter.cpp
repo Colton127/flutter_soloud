@@ -38,8 +38,11 @@ void PitchShiftInstance::filter(float *aBuffer, unsigned int aSamples,
   std::vector<float *> outputChannels(aChannels);
   std::vector<float> outputBuffer(aSamples * aChannels);
 
+  // SoLoud can pad planar channels for SIMD alignment. The supplied stride
+  // locates its channels for both input and copy-back; only the temporary
+  // output buffer below is packed using the number of live samples.
   for (unsigned int ch = 0; ch < aChannels; ch++) {
-    inputChannels[ch] = aBuffer + ch * aSamples;
+    inputChannels[ch] = aBuffer + ch * aBufferSize;
     outputChannels[ch] = outputBuffer.data() + ch * aSamples;
   }
 
@@ -49,7 +52,7 @@ void PitchShiftInstance::filter(float *aBuffer, unsigned int aSamples,
 
   // Apply wet/dry mix and copy back to buffer
   for (unsigned int ch = 0; ch < aChannels; ch++) {
-    float *channelIn = aBuffer + ch * aSamples;
+    float *channelIn = aBuffer + ch * aBufferSize;
     float *channelOut = outputChannels[ch];
 
     if (wetRatio < 1.0f) {
