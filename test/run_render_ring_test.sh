@@ -16,7 +16,7 @@ if [ "${1:-}" == "--tsan" ]; then
 fi
 
 c++ -std=c++17 -Wall -Wextra -pthread "${SANITIZER[@]}" \
-    -DWITH_NULL \
+    -DWITH_NULL -DSOLOUD_RENDER_RING_TEST_HOOKS \
     -I src/soloud/include \
     -o "$OUT" \
     test/render_ring_test.cpp \

@@ -875,7 +875,11 @@ namespace SoLoud
 			return 0;
 		// Frames mixed ahead of the device read head right now, plus one
 		// device period of cushion inside the backend.
-		unsigned long long buffered = mRenderRing.availableToRead();
+		// ###### flutter_soloud local patch (coherent observer latency) ######
+		// Unlike the producer and consumer, this observer owns neither counter.
+		// Sample a depth that existed between stable write-position loads.
+		unsigned long long buffered = mRenderRing.availableToReadForObserver();
+		// ###### flutter_soloud local patch end ######
 		return (time)(buffered + mDevicePeriodFrames) / (time)mSamplerate;
 	}
 

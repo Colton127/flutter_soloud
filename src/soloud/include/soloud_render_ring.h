@@ -26,6 +26,11 @@
 
 namespace SoLoud
 {
+	// ###### flutter_soloud local patch (observer latency test hook) ######
+#ifdef SOLOUD_RENDER_RING_TEST_HOOKS
+	void renderRingObserverAfterWriteLoad();
+#endif
+	// ###### flutter_soloud local patch end ######
 	class RenderRing
 	{
 	public:
@@ -79,6 +84,29 @@ namespace SoLoud
 			unsigned long long r = mReadPos.load(std::memory_order_acquire);
 			return (unsigned int)(w - r);
 		}
+
+		// ###### flutter_soloud local patch (coherent observer latency) ######
+		// An observer owns neither counter, so the writer can advance before the
+		// read load catches up. Retry if the write position changes around that
+		// load: an unchanged write position makes the sampled depth one the ring
+		// actually had, rather than a subtraction of unrelated counter values.
+		unsigned int availableToReadForObserver() const
+		{
+			unsigned long long w = mWritePos.load(std::memory_order_acquire);
+#ifdef SOLOUD_RENDER_RING_TEST_HOOKS
+			// Park only the first load; retries must be free to take a new snapshot.
+			renderRingObserverAfterWriteLoad();
+#endif
+			for (;;)
+			{
+				unsigned long long r = mReadPos.load(std::memory_order_acquire);
+				unsigned long long nextW = mWritePos.load(std::memory_order_acquire);
+				if (w == nextW)
+					return (unsigned int)(w - r);
+				w = nextW;
+			}
+		}
+		// ###### flutter_soloud local patch end ######
 
 		// Frames the writer may still append without overwriting unread data.
 		unsigned int availableToWrite() const

@@ -29,6 +29,21 @@
 #include <vector>
 
 namespace {
+std::atomic<bool> gObserverArmed{false};
+std::atomic<bool> gObserverReached{false};
+std::atomic<bool> gObserverRelease{false};
+}
+
+namespace SoLoud {
+void renderRingObserverAfterWriteLoad()
+{
+    if (!gObserverArmed.exchange(false)) return;
+    gObserverReached.store(true);
+    while (!gObserverRelease.load()) std::this_thread::yield();
+}
+}
+
+namespace {
 
 constexpr unsigned int kSampleRate = 44100;
 constexpr unsigned int kQuantum = 1024;      // engine mix quantum (bufferSize)
@@ -317,6 +332,39 @@ void testConcurrentReadAndRewrite()
            "device read combined different rewrite versions");
 }
 
+void testLatencyObserverBoundsMovingCounters()
+{
+    SoLoud::Soloud engine;
+    engine.setRenderAheadConfig(kDevicePeriod, kRenderAhead);
+    const auto result = engine.init(SoLoud::Soloud::CLIP_ROUNDOFF,
+                                    SoLoud::Soloud::NULLDRIVER,
+                                    kSampleRate, kQuantum, 2);
+    EXPECT(result == SoLoud::SO_NO_ERROR, "observer init");
+    if (result != SoLoud::SO_NO_ERROR) return;
+    gObserverReached.store(false);
+    gObserverRelease.store(false);
+    gObserverArmed.store(true);
+    double latency = 0;
+    std::thread observer([&] { latency = engine.getOutputLatency(); });
+    while (!gObserverReached.load()) std::this_thread::yield();
+    engine.renderRingTopUp_internal();
+    std::vector<float> output(kDevicePeriod * 2);
+    const auto read = engine.mRenderRing.read(output.data(), kDevicePeriod);
+    const auto depth = engine.mRenderRing.getWritePosition() -
+                       engine.mRenderRing.getReadPosition();
+    const double expected = double(depth + kDevicePeriod) / kSampleRate;
+    gObserverRelease.store(true);
+    observer.join();
+    EXPECT(read == kDevicePeriod, "device advances beyond observer's old write position");
+    EXPECT(latency == expected,
+           "observer latency %.9f differs from coherent depth %.9f", latency, expected);
+    const double maximum = double(engine.mRenderRing.getCapacity() + kDevicePeriod) /
+                           kSampleRate;
+    EXPECT(latency >= 0 && latency <= maximum,
+           "observer latency %.6f exceeds physical maximum %.6f", latency, maximum);
+    engine.deinit();
+}
+
 void testEngineReinitializationResetsCheckpointFrames()
 {
     SoLoud::Soloud engine;
@@ -352,6 +400,7 @@ int main()
     testEngineFeatureOff();
     testEngineFeatureOn();
     testEngineReinitializationResetsCheckpointFrames();
+    testLatencyObserverBoundsMovingCounters();
 
     std::fprintf(stderr, "\n%d assertions, %d failures\n", gAssertions,
                  gFailures);
