@@ -31,6 +31,9 @@
 //   * a reset while the mixer is parked between taking samples out of the
 //     circular buffer and counting them (pullSamplesRead) waits for it too,
 //     and leaves an empty stream with an empty buffered range;
+//   * a stream delivered completely can be rewound (seek(0)) and looped: the
+//     voice stays alive, the stream asks for its data from offset 0 again,
+//     and plays the new delivery;
 //   * the duration and metadata callbacks, which the web's Dart receives
 //     synchronously and may answer by calling back into the stream, are made
 //     with the decode mutex released: a callback that reads the stream's
@@ -54,10 +57,11 @@
 //   ./test/run_pull_stream_race_test.sh --asan     (AddressSanitizer)
 //   ./test/run_pull_stream_race_test.sh --tsan     (ThreadSanitizer)
 //
-// A scenario name after the flag (seek, rewind, reset, read-reset, callbacks
-// or stress) runs only that scenario.
+// A scenario name after the flag (seek, rewind, reset, read-reset, replay,
+// callbacks or stress) runs only that scenario.
 
 #include "bindings.h"
+#include "audiobuffer/pull_buffer_stream.h"
 #include "device_lifecycle_test_hooks.h"
 #include "enums.h"
 
@@ -651,6 +655,142 @@ void onMoreDataNeeded(uint64_t offset)
     gRequestPending.store(true, std::memory_order_release);
 }
 
+// These replay checks drive a null engine by hand. No device cadence can
+// end a short stream before seek(0), or race the exact samples being checked.
+std::vector<uint64_t> *tReplayRequests = nullptr;
+int gReplayDurationReports = 0;
+void onReplayRequest(uint64_t offset) {
+    if (tReplayRequests != nullptr) tReplayRequests->push_back(offset);
+}
+void onReplayDuration(double) { ++gReplayDurationReports; }
+
+struct ReplayRig {
+    Player player;
+    ActiveSound parent;
+    std::vector<uint64_t> requests;
+    std::vector<float> out = std::vector<float>(512 * 2);
+    SoLoud::PullBufferStream &stream() {
+        return *static_cast<SoLoud::PullBufferStream *>(parent.sound.get());
+    }
+    ReplayRig(BufferType format, size_t bytes) {
+        player.mSampleRate = kSampleRate;
+        player.mChannels = kChannels;
+        EXPECT(player.soloud.init(0, SoLoud::Soloud::NULLDRIVER, kSampleRate, 512, 2) == 0,
+               "replay: null engine must initialize");
+        player.soloud.setPostClipScaler(1);
+        player.soloud.setMainResampler(SoLoud::Soloud::RESAMPLER_POINT);
+        parent.sound = std::make_unique<SoLoud::PullBufferStream>();
+        tReplayRequests = &requests;
+        gReplayDurationReports = 0;
+        EXPECT(stream().setPullBufferStream(&player, &parent, 64u << 20, 0.5,
+                   kSampleRate, kChannels, format, bytes, nullptr, nullptr,
+                   onReplayRequest, onReplayDuration) == noError,
+               "replay: stream must initialize");
+    }
+    ~ReplayRig() {
+        player.soloud.stopAll();
+        tReplayRequests = nullptr;
+    }
+    unsigned int play(bool looping) {
+        const auto h = player.soloud.play(stream(), 1, 0, true);
+        player.soloud.setPanAbsolute(h, 1, 1);
+        player.soloud.setLooping(h, looping);
+        player.soloud.setPause(h, false);
+        return h;
+    }
+    void mix() { player.soloud.mix(out.data(), 512); }
+    bool audible() const {
+        for (float f : out) if (std::fabs(f) > 1e-6) return true;
+        return false;
+    }
+    bool requestedZero() const {
+        for (auto offset : requests) if (offset == 0) return true;
+        return false;
+    }
+};
+
+void fullPullStreamCanReplay()
+{
+    std::printf("full pull streams rewind and loop, PCM and AUTO\n");
+    const std::vector<float> pcm(4096 * 2, 0.125f);
+    const auto *pcmData = reinterpret_cast<const unsigned char *>(pcm.data());
+    const auto mp3 = readFile("example/assets/audio/sample-MP3.mp3");
+    EXPECT(!mp3.empty(), "replay: MP3 fixture must be readable");
+    for (bool compressed : {false, true}) {
+        const auto *data = compressed ? mp3.data() : pcmData;
+        const size_t bytes = compressed ? mp3.size() : pcm.size() * sizeof(float);
+        ReplayRig rig(compressed ? AUTO : PCM_F32LE, bytes);
+        EXPECT(rig.stream().addAudioData(data, bytes, 0) == noError,
+               "replay: complete feed must succeed");
+        const double duration = rig.stream().getLength();
+        EXPECT(duration > 0, "replay: full feed must establish duration");
+        const auto h = rig.play(false);
+        rig.mix();
+        rig.mix();
+        rig.requests.clear();
+        const int reports = gReplayDurationReports;
+        rig.player.soloud.seek(h, 0);
+        rig.mix();
+        EXPECT(rig.player.soloud.isValidVoiceHandle(h),
+               "replay %s: seek(0) must keep the voice alive", compressed ? "AUTO" : "PCM");
+        EXPECT(rig.requestedZero(), "replay %s: rewind must request offset 0", compressed ? "AUTO" : "PCM");
+        const auto delivered = rig.stream().addAudioData(data, bytes, 0);
+        EXPECT(delivered == noError,
+               "replay %s: second complete feed must be accepted, got %d", compressed ? "AUTO" : "PCM", int(delivered));
+        bool heard = false;
+        for (int block = 0; block < 4; ++block) { rig.mix(); heard |= rig.audible(); }
+        EXPECT(heard, "replay %s: must produce audio after rewind", compressed ? "AUTO" : "PCM");
+        EXPECT(rig.stream().getLength() == duration && gReplayDurationReports == reports,
+               "replay: rewind must preserve known duration without reporting it twice");
+    }
+    for (bool compressed : {false, true}) {
+        const auto *data = compressed ? mp3.data() : pcmData;
+        const size_t bytes = compressed ? mp3.size() : pcm.size() * sizeof(float);
+        ReplayRig rig(compressed ? AUTO : PCM_F32LE, bytes);
+        EXPECT(rig.stream().addAudioData(data, bytes, 0) == noError,
+               "loop replay: first feed");
+        const auto h = rig.play(true);
+        for (int pass = 0; pass < 2; ++pass) {
+            rig.requests.clear();
+            const auto oldLoops = rig.player.soloud.getLoopCount(h);
+            double previous = rig.player.soloud.getStreamPosition(h);
+            bool wrapped = false;
+            for (int block = 0; block < 5000 && !rig.requestedZero(); ++block) {
+                rig.mix();
+                const double position = rig.player.soloud.getStreamPosition(h);
+                wrapped |= position < previous;
+                previous = position;
+            }
+            EXPECT(rig.requestedZero() && rig.player.soloud.getLoopCount(h) > oldLoops && wrapped,
+                   "loop replay pass %d: must wrap and request offset 0", pass);
+            EXPECT(rig.player.soloud.isValidVoiceHandle(h), "loop replay: voice must remain alive");
+            EXPECT(rig.stream().addAudioData(data, bytes, 0) == noError,
+                   "loop replay pass %d: next full feed must be accepted", pass);
+            bool heard = false, exact = true;
+            for (int block = 0; block < 4; ++block) {
+                rig.mix();
+                heard |= rig.audible();
+                if (!compressed)
+                    for (float f : rig.out) exact &= std::fabs(f - 0.125f) < 1e-6f;
+            }
+            EXPECT(heard, "loop replay %s pass %d: must keep producing samples", compressed ? "AUTO" : "PCM", pass);
+            EXPECT(exact, "loop replay pass %d: samples must match delivered PCM", pass);
+        }
+    }
+    // Rewinding before any data arrives must leave the duration probe able to
+    // establish the duration from the first full feed, and report it once.
+    {
+        ReplayRig rig(AUTO, mp3.size());
+        const auto h = rig.play(false);
+        rig.player.soloud.seek(h, 0);
+        rig.mix();
+        EXPECT(rig.stream().addAudioData(mp3.data(), mp3.size(), 0) == noError,
+               "unknown duration rewind: full feed must succeed");
+        EXPECT(rig.stream().getLength() > 0 && gReplayDurationReports == 1,
+               "unknown duration rewind: new decoder must still establish duration");
+    }
+}
+
 enum class StreamKind
 {
     pcm,
@@ -858,7 +998,7 @@ int main(int argc, char **argv)
 
     const char *only = argc > 1 ? argv[1] : nullptr;
     const char *const kScenarios[] = {"seek", "rewind", "reset",
-                                       "callbacks", "stress", "read-reset"};
+                                       "callbacks", "stress", "read-reset", "replay"};
     if (only != nullptr)
     {
         bool known = false;
@@ -868,7 +1008,7 @@ int main(int argc, char **argv)
         {
             std::fprintf(stderr,
                          "Unknown scenario '%s': use seek, rewind, reset, "
-                         "callbacks, read-reset or stress.\n",
+                         "callbacks, read-reset, replay or stress.\n",
                          only);
             return 2;
         }
@@ -890,6 +1030,8 @@ int main(int argc, char **argv)
         return std::getenv("SOLOUD_LIFECYCLE_TEST_ALLOW_NO_DEVICE") ? 0 : 1;
     }
 
+    if (wanted("replay"))
+        fullPullStreamCanReplay();
     if (wanted("seek"))
         seekKeepsADeliveryOut(10.0);
     if (wanted("rewind"))
