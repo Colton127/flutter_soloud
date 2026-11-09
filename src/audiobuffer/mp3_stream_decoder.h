@@ -30,6 +30,11 @@ public:
   // Call this when no more data will be added to signal end-of-stream
   void setDataEnded() override;
 
+  void prepareForSeek(uint64_t targetSample) override {
+    prepareForSeek(targetSample, 0);
+  }
+  void prepareForSeek(uint64_t targetSample, uint64_t byteOffset) override;
+
   std::pair<std::vector<float>, DecoderError>
   decode(std::vector<unsigned char> &buffer, int *samplerate,
          int *channels, size_t maxOutputSamples = 0) override;
@@ -61,6 +66,8 @@ private:
   /// Value of m_audioDataBaseOffset in effect when mSeekPoints was built;
   /// added to seek point byte positions to get absolute stream offsets.
   uint64_t m_seekTableBaseOffset;
+  uint32_t m_seekTableSampleRate{0};
+  bool mAfterSeek{false};
   /// Size of the ID3v2 tag detected at initialization (0 when absent).
   size_t m_id3Size;
   int mIcyMetaInt;

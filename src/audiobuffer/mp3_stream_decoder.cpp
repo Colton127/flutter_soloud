@@ -159,6 +159,9 @@ void MP3DecoderWrapper::cleanup() {
     isInitialized = false;
   }
   audioData.clear();
+  mSeekPoints.clear();
+  m_seekTableSampleRate = 0;
+  mAfterSeek = false;
   m_read_pos = 0;
   m_audioDataBaseOffset = 0;
   m_seekTableBaseOffset = 0;
@@ -373,6 +376,10 @@ bool MP3DecoderWrapper::hasPendingData() const {
 }
 
 void MP3DecoderWrapper::buildSeekTable() {
+  // A table built from a seek fragment would start its PCM positions at zero.
+  // Only the original stream can anchor those positions to the whole file.
+  if (mAfterSeek) return;
+
   if (!isInitialized || !mSeekPoints.empty()) {
     return;
   }
@@ -389,11 +396,27 @@ void MP3DecoderWrapper::buildSeekTable() {
     // Seek point byte positions are relative to the current window start;
     // remember the base so timeToByteOffset can return absolute offsets.
     m_seekTableBaseOffset = m_audioDataBaseOffset;
+    m_seekTableSampleRate = decoder.sampleRate;
   }
 }
 
+void MP3DecoderWrapper::prepareForSeek(uint64_t targetSample, uint64_t byteOffset) {
+  (void)targetSample;
+  if (isInitialized) drmp3_uninit(&decoder);
+  isInitialized = false;
+  audioData.clear();
+  m_read_pos = 0;
+  m_audioDataBaseOffset = byteOffset;
+  mDataEnded = false;
+  mDrained = false;
+  mAfterSeek = true;
+  // Keep the original seek points and their file-byte base. MP3 frames carry
+  // no absolute PCM timestamp, so rebuilding from the new fragment would mix
+  // local time and byte coordinates with the caller's file-relative targets.
+}
+
 bool MP3DecoderWrapper::canSeekToTime(double seconds) const {
-  return isInitialized && !mSeekPoints.empty() && seconds > 0.0;
+  return !mSeekPoints.empty() && m_seekTableSampleRate != 0 && seconds > 0.0;
 }
 
 uint64_t MP3DecoderWrapper::timeToByteOffset(double seconds) {
@@ -405,7 +428,7 @@ uint64_t MP3DecoderWrapper::timeToByteOffset(double seconds) {
   }
 
   const uint64_t targetFrame = static_cast<uint64_t>(
-      std::floor(seconds * decoder.sampleRate));
+      std::floor(seconds * m_seekTableSampleRate));
 
   // Seek points are sorted by pcmFrameIndex; binary-search the last one at or
   // before the target frame.
