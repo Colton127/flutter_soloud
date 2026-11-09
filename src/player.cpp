@@ -662,6 +662,10 @@ PlayerErrors Player::setLinuxAudioBackend(LinuxAudioBackend backend)
 // List available playback devices.
 #if defined(SOLOUD_LIFECYCLE_TEST_HOOKS)
 static std::atomic<int> testPlaybackDeviceCount{-1};
+static std::atomic<bool> testPlaybackDeviceShortNames{false};
+extern "C" FFI_PLUGIN_EXPORT void soloudTestSetPlaybackDeviceShortNames(int enabled) {
+    testPlaybackDeviceShortNames.store(enabled != 0);
+}
 extern "C" FFI_PLUGIN_EXPORT void soloudTestSetPlaybackDeviceCount(int count) {
     testPlaybackDeviceCount.store(count);
 }
@@ -676,6 +680,10 @@ std::vector<PlaybackDevice> Player::listPlaybackDevices()
         for (int i = 0; i < fakeCount; ++i) {
             PlaybackDevice device{};
             device.name = "Test Output " + std::to_string(i);
+            if (testPlaybackDeviceShortNames.load()) {
+                static const char *const names[] = {"DAC", "HDMI", "USB-A", "\x01" "device", ""};
+                device.name = names[i % 5];
+            }
             device.id = i;
             device.isDefault = i == 0;
             ret.push_back(device);

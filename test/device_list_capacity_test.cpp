@@ -6,6 +6,7 @@
 #include <initializer_list>
 extern "C" {
 void soloudTestSetPlaybackDeviceCount(int);
+void soloudTestSetPlaybackDeviceShortNames(int);
 void listPlaybackDevices(char **, int **, int **, int *, int);
 void freeListPlaybackDevices(char **, int **, int **, int);
 }
@@ -27,6 +28,23 @@ int main() {
         freeListPlaybackDevices(names, ids, defaults, count);
         free(names); free(ids); free(defaults);
     }
+    soloudTestSetPlaybackDeviceCount(5);
+    soloudTestSetPlaybackDeviceShortNames(1);
+    char *names[5] = {};
+    int *ids[5] = {}, *defaults[5] = {};
+    int count = 0;
+    listPlaybackDevices(names, ids, defaults, &count, 5);
+    if (count != 3) {
+        printf("FAIL: short device names: expected 3, got %d\n", count);
+        ++failures;
+    }
+    const char *expectedNames[] = {"DAC", "HDMI", "USB-A"};
+    for (int i = 0; i < count; ++i) {
+        if (i >= 3 || strcmp(names[i], expectedNames[i]) != 0 || *ids[i] != i)
+            ++failures;
+    }
+    freeListPlaybackDevices(names, ids, defaults, count);
+    soloudTestSetPlaybackDeviceShortNames(0);
     soloudTestSetPlaybackDeviceCount(-1);
     printf("Device capacity: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures != 0;
