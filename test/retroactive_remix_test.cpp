@@ -362,45 +362,31 @@ void testDeviceReadRacesRetroactivePlays()
     EXPECT(plays.load() > 20, "too few plays: %lu", plays.load());
 }
 
-// playScheduled inside the window lands at the exact frame; a time at/behind
-// the playhead falls back to legacy ASAP placement (the next quantum at the
-// write head).
+// A deadline that has passed clamps to the earliest unplayed frame. Route
+// the two voices to separate channels so each onset is observed independently.
 void testScheduledInWindow()
 {
     Rig rig;
     PulseSource a(64, 1.0f);
     PulseSource b(64, 1.0f);
-
     rig.topUp();
     rig.discard(2048);
-
-    // In-window: 1000 frames ahead of the playhead.
     const SoLoud::time playhead = rig.engine.getPlayheadTime();
-    rig.engine.playScheduled(playhead + 1000.0 / kSampleRate, a);
-
-    // Behind the playhead: legacy placement at the write head.
-    rig.engine.playScheduled(playhead - 1.0, b);
-
+    rig.engine.playScheduled(playhead + 1000.0 / kSampleRate, a, 1.0f, -1.0f);
+    rig.engine.playScheduled(playhead - 1.0, b, 1.0f, 1.0f);
     std::vector<float> buf = rig.readAll();
     const long long onsetA = firstAudibleFrame(buf, 0.02f);
     EXPECT(onsetA >= 996 && onsetA <= 1004,
            "scheduled onset at %lld, expected ~1000", onsetA);
-
-    // After A's pulse ends (~1072) the window is silent: B was scheduled
-    // behind the playhead and got legacy placement, so it is not in the
-    // already-mixed window at all.
-    bool midSilent = true;
-    for (unsigned int i = 1072; i * 2 < buf.size(); ++i)
-        midSilent = midSilent && std::fabs(buf[i * 2]) <= 0.02f;
-    EXPECT(midSilent, "legacy-scheduled voice leaked into the window");
-
-    // B starts with the next mixed quantum (the old write head).
-    rig.topUp();
-    std::vector<float> buf2 = rig.readAll();
-    const long long onsetB = firstAudibleFrame(buf2, 0.02f);
+    long long onsetB = -1;
+    for (unsigned int i = 0; i * 2 + 1 < buf.size(); ++i)
+        if (std::fabs(buf[i * 2 + 1]) > 0.02f) { onsetB = i; break; }
     EXPECT(onsetB >= 0 && onsetB <= 4,
-           "legacy-scheduled onset at %lld, expected ~0 of the next quantum",
-           onsetB);
+           "past deadline onset at %lld, expected ~0", onsetB);
+    EXPECT(allSilent(buf, 1072, 0.02f), "audio after both pulses ended");
+    rig.topUp();
+    const std::vector<float> next = rig.readAll();
+    EXPECT(allSilent(next, 0, 0.02f), "scheduled voice duplicated at write head");
 }
 
 // With a non-restorable voice sounding in the window, every checkpoint is

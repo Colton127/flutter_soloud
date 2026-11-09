@@ -377,8 +377,8 @@ namespace SoLoud
 		// ###### flutter_soloud local patch (retroactive re-mix) ######
 		// With the render-ahead ring enabled, do the whole operation in one
 		// audio-mutex hold: insert paused, then either roll back and re-mix
-		// (aEngineTime inside the rendered-but-unplayed window) or apply the
-		// legacy delay placement.
+		// (aEngineTime inside the rendered-but-unplayed window, or a past
+		// deadline clamped to the playhead) or delay a future start.
 		if (isRenderAheadEnabled() && mRenderRing.isInited())
 		{
 			if (aSound.mFlags & AudioSource::SINGLE_INSTANCE)
