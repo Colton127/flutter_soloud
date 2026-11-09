@@ -33,6 +33,7 @@ class MixerOutputStreamManager {
 
   /// The broadcast stream of captured mixer output data.
   StreamController<Uint8List>? _streamController;
+  StreamController<Uint8List>? _dispatchingController;
 
   /// Whether this manager owns a Dart stream, even if native capture stopped.
   bool get hasStream => _streamController != null;
@@ -116,28 +117,52 @@ class MixerOutputStreamManager {
 
   void _emitChunk(Uint8List chunk) {
     final controller = _streamController;
-    if (controller == null || controller.isClosed) {
+    if (controller != null) {
+      _emitTo(controller, chunk);
+    }
+  }
+
+  void _emitTo(StreamController<Uint8List> controller, Uint8List chunk) {
+    if (controller.isClosed || chunk.isEmpty) {
       return;
     }
-
-    if (chunk.isEmpty) {
-      return;
+    final previous = _dispatchingController;
+    _dispatchingController = controller;
+    try {
+      controller.add(chunk);
+    } finally {
+      _dispatchingController = previous;
     }
-
-    controller.add(chunk);
   }
 
   /// Stops the mixer output capture stream and releases associated resources.
   void stop() {
+    final controller = _streamController;
+    if (controller == null) {
+      return;
+    }
+    // Detach the old stream before calling listeners. A new start, including
+    // one inside a listener, must own a different controller and subscription.
+    _streamController = null;
     _subscription?.cancel();
     _subscription = null;
     bindings.stopMixerOutputCapture(onlyOwned: true);
-    // The native stop returns one owned snapshot: queued chunks and the ring
-    // tail. No borrowed pointer survives a concurrent capture restart.
-    _emitChunk(bindings.takeStoppedMixerOutputPackets());
+    final tail = bindings.takeStoppedMixerOutputPackets();
+    void finalize() {
+      _emitTo(controller, tail);
+      controller.close();
+    }
 
-    _streamController?.close();
-    _streamController = null;
+    if (identical(_dispatchingController, controller)) {
+      // A synchronous controller cannot add or close while firing an event.
+      // The snapshot already owns its bytes, so finalization can safely wait
+      // until that dispatch returns, even across deinit or a new capture.
+      scheduleMicrotask(finalize);
+    } else {
+      // Preserve synchronous tail delivery for callers that cancel their
+      // subscription immediately after a normal stop returns.
+      finalize();
+    }
   }
 
   /// Whether mixer output capture is currently active.
