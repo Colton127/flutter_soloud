@@ -317,7 +317,7 @@ result PullBufferStreamInstance::seek(double aSeconds, float *aScratch,
         mParent->mPendingSeekByteOffset = newOffset;
         mParent->mDataIsEnded.store(false);
         mParent->mWaitingForData.store(false);
-        mParent->resetDecoderForSeek(targetSample);
+        mParent->resetDecoderForSeek(targetSample, newOffset);
         // The buffer was just discarded, so this leaves the seek pending until
         // data at the target has been decoded.
         mParent->applyPendingSeek(/*aUnderAudioMutex*/ true);
@@ -410,14 +410,14 @@ void PullBufferStream::resetProbeState() {
   mTailProbeBuffer.clear();
 }
 
-void PullBufferStream::resetDecoderForSeek(uint64_t targetSample) {
+void PullBufferStream::resetDecoderForSeek(uint64_t targetSample, uint64_t byteOffset) {
   if (mPCMformat.dataType != BufferType::AUTO || !mStreamDecoder) return;
   const DetectedType type = mStreamDecoder->getWrapperType();
   if (type == DetectedType::BUFFER_OGG_OPUS ||
       type == DetectedType::BUFFER_OGG_VORBIS ||
       type == DetectedType::BUFFER_WAV ||
       type == DetectedType::BUFFER_FLAC) {
-    mStreamDecoder->prepareForSeek(targetSample);
+    mStreamDecoder->prepareForSeek(targetSample, byteOffset);
   } else {
     mStreamDecoder = std::make_unique<StreamDecoder>();
   }
@@ -1115,7 +1115,7 @@ void PullBufferStream::applyPendingSeek(bool aUnderAudioMutex) {
       mPendingStreamPosition.store(mPendingSeekTime, std::memory_order_relaxed);
       mStreamPositionPending.store(true, std::memory_order_release);
     }
-    resetDecoderForSeek(targetSample);
+    resetDecoderForSeek(targetSample, newOffset);
     mPendingSeekByteOffset = newOffset;
     mDataIsEnded.store(false);
     mWaitingForData.store(false);

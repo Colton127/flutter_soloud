@@ -455,6 +455,12 @@ public:
   /// [targetSample] is the absolute decoded sample position the caller will
   /// continue from, in the wrapper's output sample rate.
   virtual void prepareForSeek(uint64_t targetSample) { (void)targetSample; }
+  // Ogg indexing needs the absolute origin of the next encoded bytes too.
+  // Other wrappers keep their established seek preparation unchanged.
+  virtual void prepareForSeek(uint64_t targetSample, uint64_t byteOffset) {
+    (void)byteOffset;
+    prepareForSeek(targetSample);
+  }
 
   void setTrackChangeCallback(TrackChangeCallback callback) {
     onTrackChange = callback;
@@ -512,7 +518,7 @@ public:
   int granuleSampleRate() const;
 
   /// Prepare the wrapped decoder for a seek to [targetSample].
-  void prepareForSeek(uint64_t targetSample);
+  void prepareForSeek(uint64_t targetSample, uint64_t byteOffset = 0);
 
   /// Set the total encoded audio size in bytes. The value is forwarded to the
   /// wrapped decoder as soon as it is created, so wrappers can estimate

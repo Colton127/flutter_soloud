@@ -41,14 +41,15 @@ struct OggSeekIndex {
     }
   }
 
-  void clear() {
+  void clear(uint64_t byteOffset = 0) {
     entries.clear();
-    bytesConsumed = 0;
+    bytesConsumed = byteOffset;
   }
 
   /// True when the index covers [targetGranule].
   bool covers(ogg_int64_t targetGranule) const {
-    return !entries.empty() && entries.back().granule >= targetGranule;
+    return !entries.empty() && entries.front().granule <= targetGranule &&
+           targetGranule <= entries.back().granule;
   }
 
   /// Interpolated byte offset for [targetGranule], or 0 when not covered.
