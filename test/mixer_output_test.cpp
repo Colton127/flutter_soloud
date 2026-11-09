@@ -454,12 +454,55 @@ void surroundDefaultKeepsWholeFrames()
     }
 }
 
+void stoppedCaptureDrainsPendingPackets() {
+    {
+        std::lock_guard<std::mutex> lock(gHeldMutex);
+        gHeld.clear();
+    }
+    capture().setDataCallback(holdPointer);
+    EXPECT(startPcm(1 << 20, 4096, 2048) == noError, "drain: start");
+    float next = 0;
+    feed(4096 + 8, next);
+    EXPECT(waitFor([] { return heldCount() >= 2; }, 2000), "drain: publish two chunks");
+    const uint32_t id = capture().captureId();
+    capture().stop();
+    size_t length = 0;
+    uint8_t *bytes = nullptr;
+#ifdef SOLOUD_CAPTURE_PACKET_DRAIN
+    bytes = MixerOutput::takeStoppedPackets(id, length);
+#endif
+    std::vector<float> all(length / sizeof(float));
+    if (length != 0) std::memcpy(all.data(), bytes, length);
+    std::free(bytes);
+    const auto tail = unread();
+    all.insert(all.end(), tail.begin(), tail.end());
+    EXPECT(length == 4096 * kBytesPerFrame, "drain: complete chunks missing (%zu bytes)", length);
+    EXPECT(all.size() == static_cast<size_t>(next) && isNewestRun(all, next),
+           "drain: packet bytes must precede the ring tail, in order");
+    {
+        std::lock_guard<std::mutex> lock(gHeldMutex);
+        for (const auto &held : gHeld) {
+            uint32_t packetId = 0;
+            auto *late = MixerOutput::takePacket(held.data, packetId);
+            EXPECT(late == nullptr, "drain: delayed notifications must be retired");
+            std::free(late);
+        }
+    }
+#ifdef SOLOUD_CAPTURE_PACKET_DRAIN
+    bytes = MixerOutput::takeStoppedPackets(id, length);
+    EXPECT(length == 0, "drain: second drain must be empty");
+    std::free(bytes);
+#endif
+    capture().setDataCallback(nullptr);
+    MixerOutput::discardPackets();
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     const char *only = argc > 1 ? argv[1] : nullptr;
-    const char *const kScenarios[] = {"fill", "overrun", "oversized", "chunks", "deferred", "allocation", "surround"};
+    const char *const kScenarios[] = {"fill", "overrun", "oversized", "chunks", "deferred", "allocation", "surround", "drain"};
     if (only != nullptr)
     {
         bool known = false;
@@ -468,7 +511,7 @@ int main(int argc, char **argv)
         if (!known)
         {
             std::fprintf(stderr,
-                         "Unknown scenario '%s': use fill, overrun, oversized, chunks, deferred, allocation or surround.\n",
+                         "Unknown scenario '%s': use fill, overrun, oversized, chunks, deferred, allocation, surround or drain.\n",
                          only);
             return 2;
         }
@@ -491,6 +534,7 @@ int main(int argc, char **argv)
 #endif
     if (wanted("surround"))
         surroundDefaultKeepsWholeFrames();
+    if (wanted("drain")) stoppedCaptureDrainsPendingPackets();
     retiredPacketsCannotBeClaimedAgain();
 
     if (gFailures == 0)

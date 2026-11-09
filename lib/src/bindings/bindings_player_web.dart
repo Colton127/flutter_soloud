@@ -59,6 +59,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   int _engineGeneration = 0;
 
   int? _mixerCaptureId;
+  int? _stoppedMixerCaptureId;
 
   /// Serializes native engine lifecycle calls (initEngine / changeDevice /
   /// deinit / disposeAllSound).
@@ -262,8 +263,30 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   void stopMixerOutputCapture() {
+    _stoppedMixerCaptureId = _mixerCaptureId;
     _mixerCaptureId = null;
     wasmStopMixerCapture();
+  }
+
+  @override
+  Uint8List takeStoppedMixerOutputPackets() {
+    final id = _stoppedMixerCaptureId;
+    _stoppedMixerCaptureId = null;
+    if (id == null) return Uint8List(0);
+    final lengthPtr = wasmMalloc(4);
+    var ptr = 0;
+    try {
+      ptr = wasmDrainMixerCapturePackets(id, lengthPtr);
+      final length = wasmGetI32Value(lengthPtr, 'i32').toUnsigned(32);
+      return ptr == 0
+          ? Uint8List(0)
+          : Uint8List.fromList(
+              Uint8List.sublistView(wasmHeapU8.toDart, ptr, ptr + length),
+            );
+    } finally {
+      wasmFree(ptr);
+      wasmFree(lengthPtr);
+    }
   }
 
   @override

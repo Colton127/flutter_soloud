@@ -383,6 +383,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   // ////////////////////////////////////////////////
 
   int? _mixerCaptureId;
+  int? _stoppedMixerCaptureId;
 
   @override
   PlayerErrors startMixerOutputCapture(
@@ -409,8 +410,27 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   void stopMixerOutputCapture() {
+    _stoppedMixerCaptureId = _mixerCaptureId;
     _mixerCaptureId = null;
     native.stopMixerCapture();
+  }
+
+  @override
+  Uint8List takeStoppedMixerOutputPackets() {
+    final id = _stoppedMixerCaptureId;
+    _stoppedMixerCaptureId = null;
+    if (id == null) return Uint8List(0);
+    final length = calloc<ffi.Size>();
+    var ptr = ffi.nullptr.cast<ffi.UnsignedChar>();
+    try {
+      ptr = native.drainMixerCapturePackets(id, length);
+      return ptr == ffi.nullptr
+          ? Uint8List(0)
+          : Uint8List.fromList(ptr.cast<ffi.Uint8>().asTypedList(length.value));
+    } finally {
+      nativeFree(ptr.cast<ffi.Void>());
+      calloc.free(length);
+    }
   }
 
   @override

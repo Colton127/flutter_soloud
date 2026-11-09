@@ -37,9 +37,22 @@ class WebCaptureModule {
               .toJS
       ..['_stopMixerCapture'] = (() {}).toJS
       ..['_getMixerCaptureId'] = (() => captureId).toJS
-      ..['_getMixerCaptureAvailableBytes'] = (() => 0).toJS
+      ..['_getMixerCaptureAvailableBytes'] = (() => tail.length).toJS
+      ..['_getMixerCaptureBufferPointer'] = (() => tailPtr).toJS
       ..['_getMixerCaptureBufferSize'] = (() => 1 << 20).toJS
       ..['_getMixerCaptureReadOffset'] = (() => 0).toJS
+      ..['_drainMixerCapturePackets'] = ((int id, int lengthPtr) {
+        final tokens = packets.keys.where((t) => packets[t]!.id == id).toList()
+          ..sort();
+        final bytes = Uint8List.fromList([
+          for (final token in tokens) ...packets.remove(token)!.bytes,
+        ]);
+        heap.setInt32(lengthPtr, bytes.length, Endian.little);
+        if (bytes.isEmpty) return 0;
+        final ptr = allocate(bytes.length);
+        heap.buffer.asUint8List().setAll(ptr, bytes);
+        return ptr;
+      }).toJS
       ..['_takeMixerOutputPacket'] = ((int token, int idPtr) {
         final packet = packets.remove(token);
         if (packet == null) return 0;
@@ -56,6 +69,14 @@ class WebCaptureModule {
   final heap = ByteData(1 << 20);
   final allocations = <int, int>{};
   final packets = <int, ({int id, Uint8List bytes})>{};
+  Uint8List tail = Uint8List(0);
+  int tailPtr = 0;
+  void setTail(Uint8List bytes) {
+    tail = bytes;
+    tailPtr = allocate(bytes.length);
+    heap.buffer.asUint8List().setAll(tailPtr, bytes);
+  }
+
   int captureId = 0;
   var _top = 8;
   var _nextToken = 0;

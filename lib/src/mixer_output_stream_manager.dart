@@ -117,6 +117,9 @@ class MixerOutputStreamManager {
     _subscription?.cancel();
     _subscription = null;
     bindings.stopMixerOutputCapture();
+    // Complete chunks have already left the ring but may still be queued
+    // for the Dart listener. Deliver them before the partial ring tail.
+    _emitChunk(bindings.takeStoppedMixerOutputPackets());
 
     // Flush any captured data that did not reach the notification threshold.
     // The native side keeps the buffer alive after stopping so we can copy the

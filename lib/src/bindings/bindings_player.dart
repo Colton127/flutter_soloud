@@ -125,6 +125,10 @@ abstract class FlutterSoLoud {
   @mustBeOverridden
   void stopMixerOutputCapture();
 
+  /// Copy and retire pending chunks from the capture just stopped.
+  @mustBeOverridden
+  Uint8List takeStoppedMixerOutputPackets();
+
   /// Whether mixer output capture is currently active.
   @mustBeOverridden
   bool isMixerOutputCaptureRunning();

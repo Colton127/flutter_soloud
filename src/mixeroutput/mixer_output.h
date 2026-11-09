@@ -1,5 +1,9 @@
 #pragma once
 
+// Feature probes for the native tests, which also build against trees
+// without these APIs to show the old caller protocol failing.
+#define SOLOUD_CAPTURE_PACKET_DRAIN 1
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -112,6 +116,9 @@ class MixerOutput {
   static uint8_t *takePacket(uint8_t *token, uint32_t &captureId);
   static void discardPacket(uint8_t *token);
   static void discardPackets();
+  /// Drain untaken fixed chunks of a stopped capture, in publication order.
+  /// Threshold tokens are retired too; their bytes remain in the ring tail.
+  static uint8_t *takeStoppedPackets(uint32_t captureId, size_t &length);
   static uint8_t *copyPacket(const uint8_t *data, size_t length,
                              uint32_t captureId, uint64_t readThrough = 0);
 

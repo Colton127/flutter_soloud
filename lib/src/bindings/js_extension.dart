@@ -911,3 +911,6 @@ external int wasmTakeMixerOutputPacket(int token, int captureIdPtr);
 
 @JS('Module_soloud._getMixerCaptureId')
 external int wasmGetMixerCaptureId();
+
+@JS('Module_soloud._drainMixerCapturePackets')
+external int wasmDrainMixerCapturePackets(int captureId, int lengthPtr);

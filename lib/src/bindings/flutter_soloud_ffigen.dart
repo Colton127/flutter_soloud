@@ -119,6 +119,15 @@ external ffi.Pointer<ffi.UnsignedChar> takeMixerOutputPacket(
 @ffi.Native<ffi.UnsignedInt Function()>()
 external int getMixerCaptureId();
 
+/// Owned pending chunks from a stopped capture; free with nativeFree.
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(ffi.UnsignedInt, ffi.Pointer<ffi.Size>)
+>()
+external ffi.Pointer<ffi.UnsignedChar> drainMixerCapturePackets(
+  int captureId,
+  ffi.Pointer<ffi.Size> length,
+);
+
 /// Stop capturing the master mixer output.
 @ffi.Native<ffi.Void Function()>()
 external void stopMixerCapture();

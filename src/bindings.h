@@ -1,3 +1,4 @@
+#include <stddef.h>
 /// Declarations of every FFI_PLUGIN_EXPORT entry point defined in
 /// `src/bindings.cpp`. This header is the single source of truth for the
 /// native ABI: `src/bindings.cpp` includes it so the definitions are checked
@@ -134,6 +135,9 @@ extern "C"
   FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacket(
       unsigned char *token, unsigned int *captureId);
   FFI_PLUGIN_EXPORT unsigned int getMixerCaptureId();
+  /// Owned pending chunks from a stopped capture; free with nativeFree.
+  FFI_PLUGIN_EXPORT unsigned char *drainMixerCapturePackets(
+      unsigned int captureId, size_t *length);
 
   /// Returns 1 if mixer capture is running, 0 otherwise.
   FFI_PLUGIN_EXPORT int isMixerCaptureRunning();

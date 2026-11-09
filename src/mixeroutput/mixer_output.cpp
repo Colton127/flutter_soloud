@@ -115,6 +115,66 @@ uint8_t *MixerOutput::copyPacket(const uint8_t *data, size_t length,
 #endif
 }
 
+uint8_t *MixerOutput::takeStoppedPackets(uint32_t captureId, size_t &length) {
+  length = 0;
+  if (instance().isRunning() && instance().captureId() == captureId) return nullptr;
+  // Reserve no heap storage under the registry lock. A packet may be retired
+  // between these passes, but tokens are never reused, so it cannot be confused
+  // with a replacement. Normal stop joins the publisher before this runs.
+  std::array<uintptr_t, 64> tokens{};
+  size_t count = 0, capacity = 0;
+  {
+    std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+#ifdef __EMSCRIPTEN__
+    for (const auto &slot : gWebPackets) {
+      if (slot.token == 0 || slot.packet.captureId != captureId) continue;
+      tokens[count++] = slot.token;
+      if (slot.packet.readThrough == 0) {
+        if (slot.packet.length > SIZE_MAX - capacity) return nullptr;
+        capacity += slot.packet.length;
+      }
+    }
+#else
+    for (const auto &entry : gPackets) {
+      if (entry.second.captureId != captureId) continue;
+      tokens[count++] = entry.first;
+      if (entry.second.readThrough == 0) {
+        if (entry.second.length > SIZE_MAX - capacity) return nullptr;
+        capacity += entry.second.length;
+      }
+    }
+#endif
+  }
+  std::sort(tokens.begin(), tokens.begin() + count);
+  auto *bytes = capacity == 0 ? nullptr : static_cast<uint8_t *>(std::malloc(capacity));
+  if (capacity != 0 && bytes == nullptr) return nullptr;
+  {
+    std::lock_guard<MixerOutputMutex> lock(gPacketMutex);
+    for (size_t i = 0; i < count; ++i) {
+#ifdef __EMSCRIPTEN__
+      auto *slot = findWebPacket(tokens[i]);
+      if (slot == nullptr) continue;
+      const auto &packet = slot->packet;
+#else
+      auto it = gPackets.find(tokens[i]);
+      if (it == gPackets.end()) continue;
+      const auto &packet = it->second;
+#endif
+      if (packet.readThrough == 0) {
+        std::memcpy(bytes + length, packet.bytes, packet.length);
+        length += packet.length;
+      }
+#ifdef __EMSCRIPTEN__
+      slot->token = 0;
+#else
+      std::free(packet.bytes);
+      gPackets.erase(it);
+#endif
+    }
+  }
+  return bytes;
+}
+
 uint8_t *MixerOutput::takePacket(uint8_t *token, uint32_t &captureId) {
   CapturePacket packet{};
 #ifdef __EMSCRIPTEN__

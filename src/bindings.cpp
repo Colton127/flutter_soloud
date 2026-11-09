@@ -1003,6 +1003,13 @@ extern "C"
     return MixerOutput::instance().captureId();
   }
 
+  FFI_PLUGIN_EXPORT unsigned char *drainMixerCapturePackets(
+      unsigned int captureId, size_t *length)
+  {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
+    return MixerOutput::takeStoppedPackets(captureId, *length);
+  }
+
   FFI_PLUGIN_EXPORT void stopMixerCapture()
   {
     // Serialized against engine teardown's own stop, and against another
