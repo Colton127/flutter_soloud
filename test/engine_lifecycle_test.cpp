@@ -98,6 +98,14 @@ extern "C"
                                         int chunkPCMFrames);
     void stopMixerCapture();
     int isMixerCaptureRunning();
+    enum PlayerErrors addFilter(unsigned int soundHash, unsigned int busId,
+                                enum FilterType filterType);
+    enum PlayerErrors setFilterParams(unsigned int handle, unsigned int busId,
+                                      enum FilterType filterType,
+                                      int attributeId, float value);
+    enum PlayerErrors getFilterParams(unsigned int handle, unsigned int busId,
+                                      enum FilterType filterType,
+                                      int attributeId, float *filterValue);
     bool setVisualizationCallbackForEngine(dartVisualizationCallback_t callback,
                                            int64_t owner_engine_id);
     void visualizationPacketDone(float *packet);
@@ -168,6 +176,7 @@ extern "C"
     int soloudTestRefusedPlayerPins();
     int soloudTestSoundIsLoaded(unsigned int hash);
     int soloudTestVoiceIsValid(unsigned int handle);
+
 }
 
 namespace SoLoud
@@ -833,6 +842,69 @@ void testTeardownDuringActiveMixerCapture()
 
     resetGlobalState();
 }
+
+
+
+/// Zero is a valid filter parameter value (a wet mix of 0, say). Reading it
+/// back for a sound's voice and for a bus must succeed and return it, like
+/// any other value; only a missing filter is an error.
+void testZeroFilterParameterReadsBack()
+{
+    std::printf("a zero-valued filter parameter reads back\n");
+    resetGlobalState();
+
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+
+    unsigned int hash = 0;
+    EXPECT(loadWaveform(0, false, 0.25f, 1.0f, &hash) == noError,
+           "the waveform should load");
+    EXPECT(addFilter(hash, 0, EchoFilter) == noError,
+           "the sound filter should be added");
+    unsigned int handle = 0;
+    EXPECT(play(hash, 0, 0.0f, 0.0f, false, true, 0.0, 0.0, 0, 0, 1.0f,
+                &handle) == noError &&
+               handle != 0,
+           "the waveform should play");
+
+    float value = -1.0f;
+    EXPECT(setFilterParams(handle, 0, EchoFilter, 0, 0.0f) == noError,
+           "setting the voice's wet to 0 should succeed");
+    PlayerErrors error = getFilterParams(handle, 0, EchoFilter, 0, &value);
+    EXPECT(error == noError, "reading the voice's wet back failed: error %d",
+           static_cast<int>(error));
+    EXPECT(value == 0.0f, "the voice's wet should read back as 0, got %f",
+           value);
+
+    const unsigned int busId = createBus();
+    unsigned int busHandle = 0;
+    EXPECT(busPlayOnEngine(busId, 1.0f, false, &busHandle) == noError,
+           "the bus should play");
+    EXPECT(addFilter(0, busId, EchoFilter) == noError,
+           "the bus filter should be added");
+    value = -1.0f;
+    EXPECT(setFilterParams(0, busId, EchoFilter, 0, 0.0f) == noError,
+           "setting the bus's wet to 0 should succeed");
+    error = getFilterParams(0, busId, EchoFilter, 0, &value);
+    EXPECT(error == noError, "reading the bus's wet back failed: error %d",
+           static_cast<int>(error));
+    EXPECT(value == 0.0f, "the bus's wet should read back as 0, got %f",
+           value);
+
+    // A filter that was never added is still reported as missing.
+    error = getFilterParams(handle, 0, LofiFilter, 0, &value);
+    EXPECT(error == filterNotFound,
+           "a missing filter should be filterNotFound, got %d",
+           static_cast<int>(error));
+
+    resetGlobalState();
+}
+
+
 
 /// Retirement stops the visualizations, whose single worker thread invokes the
 /// Dart callable through the gate and holds its own lock across each pass over
@@ -2510,6 +2582,7 @@ int main()
     testMixerCallbackPublicationIsOwnerScoped();
     testStaleWorkerMixerCallbackCannotBeRevived();
     testTeardownDuringActiveMixerCapture();
+    testZeroFilterParameterReadsBack();
     testRetirementWhileVisualizationsDispatch();
     testRetirementSparesWhatANewerRegistrationStarted();
     testVisualizationSendsOnePacketAtATime();

@@ -4039,7 +4039,8 @@ extern "C"
         {
           *filterValue =
               busFilters->filters.getFilterParams(handle > 0 ? handle : busFilters->handle, filterType, attributeId);
-          if (!(isnormal(*filterValue) || isnan(*filterValue)))
+          // Zero is a valid parameter value, including a completely dry filter.
+          if (!std::isfinite(*filterValue))
             return filterParameterGetError;
           if (*filterValue == 9999.0f)
             return filterNotFound;
@@ -4053,7 +4054,7 @@ extern "C"
             {
               *filterValue =
                   s.filters->getFilterParams(handle, filterType, attributeId);
-              if (!(isnormal(*filterValue) || isnan(*filterValue)))
+              if (!std::isfinite(*filterValue))
                 return filterParameterGetError;
               if (*filterValue == 9999.0f)
                 return filterNotFound;
