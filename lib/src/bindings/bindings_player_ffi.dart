@@ -409,11 +409,13 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   @override
-  void stopMixerOutputCapture() {
+  void stopMixerOutputCapture({bool onlyOwned = false}) {
     final id = _mixerCaptureId;
     _mixerCaptureId = null;
     if (id == null) {
-      native.stopMixerCapture();
+      if (!onlyOwned) {
+        native.stopMixerCapture();
+      }
       return;
     }
     // Only a stop that drains a capture of its own replaces the snapshot: a

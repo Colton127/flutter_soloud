@@ -76,7 +76,8 @@ class SoLoudIsolate {
   /// Engine teardown in another isolate cannot close this isolate's stream.
   /// Stop it here before the engine is deinitialized to keep all final audio.
   /// After the engine is initialized again, a new start closes the old stream
-  /// and opens a new capture.
+  /// and opens a new capture. While another isolate's capture runs, a start
+  /// here throws and leaves that capture alone.
   ///
   /// See [SoLoud.startMixerOutputStream] for parameter details.
   @experimental

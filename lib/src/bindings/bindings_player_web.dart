@@ -262,11 +262,13 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  void stopMixerOutputCapture() {
+  void stopMixerOutputCapture({bool onlyOwned = false}) {
     final id = _mixerCaptureId;
     _mixerCaptureId = null;
     if (id == null) {
-      wasmStopMixerCapture();
+      if (!onlyOwned) {
+        wasmStopMixerCapture();
+      }
       return;
     }
     // Only a stop that drains a capture of its own replaces the snapshot: a

@@ -74,6 +74,13 @@ class MixerOutputStreamManager {
       stop();
     }
 
+    // Refuse a foreign capture before publishing callbacks for this isolate.
+    if (bindings.isMixerOutputCaptureRunning()) {
+      throw SoLoudCppException.fromPlayerError(
+        PlayerErrors.playerAlreadyInited,
+      );
+    }
+
     // The controller must be synchronous: [stop] flushes the captured tail
     // into the stream and callers typically cancel their subscription right
     // after [stop] returns. With the default asynchronous delivery those
@@ -124,7 +131,7 @@ class MixerOutputStreamManager {
   void stop() {
     _subscription?.cancel();
     _subscription = null;
-    bindings.stopMixerOutputCapture();
+    bindings.stopMixerOutputCapture(onlyOwned: true);
     // The native stop returns one owned snapshot: queued chunks and the ring
     // tail. No borrowed pointer survives a concurrent capture restart.
     _emitChunk(bindings.takeStoppedMixerOutputPackets());

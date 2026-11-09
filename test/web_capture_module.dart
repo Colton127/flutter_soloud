@@ -41,6 +41,7 @@ class WebCaptureModule {
               .toJS
       ..['_stopMixerCapture'] = (() {
         running = false;
+        globalStops++;
       }).toJS
       ..['_stopMixerCaptureAndDrain'] = ((int id, int lengthPtr) {
         if (id == captureId) running = false;
@@ -101,6 +102,7 @@ class WebCaptureModule {
 
   int captureId = 0;
   bool running = false;
+  int globalStops = 0;
   var _top = 8;
   var _nextToken = 0;
 
