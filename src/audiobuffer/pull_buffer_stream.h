@@ -189,7 +189,7 @@ private:
   void resetProbeState();
 
   /// Reset the decoder state for an out-of-buffer seek.
-  void resetDecoderForSeek(uint64_t targetSample);
+  void resetDecoderForSeek(uint64_t targetSample, uint64_t byteOffset);
 
   /// Current start/end of the decoded circular buffer in seconds.
   double getBufferStartTimeLocked() const;

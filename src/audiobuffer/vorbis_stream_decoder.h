@@ -29,7 +29,8 @@ public:
     uint64_t timeToByteOffset(double seconds) override;
     double getDuration() const override;
     int granuleSampleRate() const override { return static_cast<int>(vi.rate); }
-    void prepareForSeek(uint64_t targetSample) override;
+    void prepareForSeek(uint64_t targetSample) override { prepareForSeek(targetSample, 0); }
+    void prepareForSeek(uint64_t targetSample, uint64_t byteOffset) override;
 
 private:
     AudioMetadata getMetadata();
