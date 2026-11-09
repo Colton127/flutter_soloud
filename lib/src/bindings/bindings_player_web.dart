@@ -520,39 +520,31 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   List<PlaybackDevice> listPlaybackDevices() {
-    /// allocate 50 device strings
-    final namesPtr = wasmMalloc(50 * 255);
-    final deviceIdPtr = wasmMalloc(50 * 4);
-    final isDefaultPtr = wasmMalloc(50 * 4);
-    final nDevicesPtr = wasmMalloc(4); // 4 bytes for an int32
-
-    wasmListPlaybackDevices(namesPtr, deviceIdPtr, isDefaultPtr, nDevicesPtr);
-
-    final nDevices = wasmGetI32Value(nDevicesPtr, 'i32');
-    final devices = <PlaybackDevice>[];
-    for (var i = 0; i < nDevices; i++) {
-      final namePtr = wasmGetI32Value(namesPtr + i * 4, 'i32');
-      final name = wasmUtf8ToString(namePtr);
-      final deviceId = wasmGetI32Value(
-        wasmGetI32Value(deviceIdPtr + i * 4, 'i32'),
-        'i32',
-      );
-      final isDefault = wasmGetI32Value(
-        wasmGetI32Value(isDefaultPtr + i * 4, 'i32'),
-        'i32',
-      );
-
-      devices.add(PlaybackDevice(deviceId, isDefault == 1, name));
+    const capacity = 255;
+    final names = wasmMalloc(capacity * 4);
+    final ids = wasmMalloc(capacity * 4);
+    final defaults = wasmMalloc(capacity * 4);
+    final countPtr = wasmMalloc(4);
+    var count = 0;
+    try {
+      wasmListPlaybackDevices(names, ids, defaults, countPtr, capacity);
+      count = wasmGetI32Value(countPtr, 'i32');
+      return [
+        for (var i = 0; i < count; i++)
+          PlaybackDevice(
+            wasmGetI32Value(wasmGetI32Value(ids + i * 4, 'i32'), 'i32'),
+            wasmGetI32Value(wasmGetI32Value(defaults + i * 4, 'i32'), 'i32') ==
+                1,
+            wasmUtf8ToString(wasmGetI32Value(names + i * 4, 'i32')),
+          ),
+      ];
+    } finally {
+      wasmFreeListPlaybackDevices(names, ids, defaults, count);
+      wasmFree(names);
+      wasmFree(ids);
+      wasmFree(defaults);
+      wasmFree(countPtr);
     }
-
-    wasmFreeListPlaybackDevices(namesPtr, deviceIdPtr, isDefaultPtr, nDevices);
-
-    wasmFree(nDevicesPtr);
-    wasmFree(deviceIdPtr);
-    wasmFree(isDefaultPtr);
-    wasmFree(namesPtr);
-
-    return devices;
   }
 
   @override

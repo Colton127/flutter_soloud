@@ -1637,7 +1637,7 @@ extern "C"
 
   /// List playback devices.
   FFI_PLUGIN_EXPORT void listPlaybackDevices(char **devicesName, int **deviceId,
-                                             int **isDefault, int *n_devices)
+                                             int **isDefault, int *n_devices, int capacity)
   {
     // Deliberately not routed through the global `player`: `dispose()` now runs
     // on a worker isolate, so reading that `unique_ptr` here would race with it
@@ -1645,10 +1645,12 @@ extern "C"
     // directly instead of guarding with the lifecycle mutex — taking that lock
     // would stall this (UI-thread) call for the whole of an in-flight
     // `initEngine()`, which is the very block this release removes.
+    *n_devices = 0;
+    if (capacity <= 0) return;
     std::vector<PlaybackDevice> d = Player::listPlaybackDevices();
 
     int numDevices = 0;
-    for (int i = 0; i < (int)d.size(); i++)
+    for (int i = 0; i < (int)d.size() && numDevices < capacity; i++)
     {
       /// Check the length first: the character scan below reads the first 5
       /// bytes, which is only in bounds once the name is known to be longer.

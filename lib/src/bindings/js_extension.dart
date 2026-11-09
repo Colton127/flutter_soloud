@@ -260,6 +260,7 @@ external void wasmListPlaybackDevices(
   int deviceIdPtr,
   int isDefaultPtr,
   int nDevicePtr,
+  int capacity,
 );
 
 @JS('Module_soloud._freeListPlaybackDevices')

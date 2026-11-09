@@ -252,10 +252,10 @@ extern "C"
   /// notification callback. This is intentionally absent from the public API.
   FFI_PLUGIN_EXPORT void debugTriggerAudioInterruption(unsigned int began);
 
-  /// List playback devices.
+  /// List at most capacity playback devices. n_devices is the number written.
   FFI_PLUGIN_EXPORT void listPlaybackDevices(char **devicesName,
                                              int **deviceId, int **isDefault,
-                                             int *n_devices);
+                                             int *n_devices, int capacity);
 
   /// Change the playback device.
   ///

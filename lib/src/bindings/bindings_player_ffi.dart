@@ -579,54 +579,29 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   List<PlaybackDevice> listPlaybackDevices() {
-    final ret = <PlaybackDevice>[];
-    final ffi.Pointer<ffi.Pointer<ffi.Char>> deviceNames = calloc(
-      ffi.sizeOf<ffi.Pointer<ffi.Pointer<ffi.Char>>>() * 255,
-    );
-    final ffi.Pointer<ffi.Pointer<ffi.Int>> deviceIds = calloc(
-      ffi.sizeOf<ffi.Pointer<ffi.Pointer<ffi.Int>>>() * 50,
-    );
-    final ffi.Pointer<ffi.Pointer<ffi.Int>> deviceIsDefault = calloc(
-      ffi.sizeOf<ffi.Pointer<ffi.Pointer<ffi.Int>>>() * 50,
-    );
-    final ffi.Pointer<ffi.Int> nDevices = calloc();
-
-    native.listPlaybackDevices(
-      deviceNames,
-      deviceIds,
-      deviceIsDefault,
-      nDevices,
-    );
-
-    final ndev = nDevices.value;
-    for (var i = 0; i < ndev; i++) {
-      final s1 = (deviceNames + i).value;
-      final s = s1.cast<Utf8>().toDartString();
-      final id1 = (deviceIds + i).value;
-      final id = id1.value;
-      final n1 = (deviceIsDefault + i).value;
-      final n = n1.value;
-      ret.add(PlaybackDevice(id, n == 1, s));
+    const capacity = 255;
+    final names = calloc<ffi.Pointer<ffi.Char>>(capacity);
+    final ids = calloc<ffi.Pointer<ffi.Int>>(capacity);
+    final defaults = calloc<ffi.Pointer<ffi.Int>>(capacity);
+    final count = calloc<ffi.Int>();
+    try {
+      native.listPlaybackDevices(names, ids, defaults, count, capacity);
+      return [
+        for (var i = 0; i < count.value; i++)
+          PlaybackDevice(
+            ids[i].value,
+            defaults[i].value == 1,
+            names[i].cast<Utf8>().toDartString(),
+          ),
+      ];
+    } finally {
+      native.freeListPlaybackDevices(names, ids, defaults, count.value);
+      calloc
+        ..free(names)
+        ..free(ids)
+        ..free(defaults)
+        ..free(count);
     }
-
-    /// Free allocated memory is done in C.
-    /// This work on all platforms but not on win.
-    // for (int i = 0; i < ndev; i++) {
-    //   calloc.free(devices.elementAt(i).value.ref.name);
-    //   calloc.free(devices.elementAt(i).value);
-    // }
-    native.freeListPlaybackDevices(
-      deviceNames,
-      deviceIds,
-      deviceIsDefault,
-      ndev,
-    );
-
-    calloc
-      ..free(deviceNames)
-      ..free(deviceIds)
-      ..free(nDevices);
-    return ret;
   }
 
   void freeListPlaybackDevices(

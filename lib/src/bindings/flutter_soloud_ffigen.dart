@@ -314,6 +314,7 @@ external void debugTriggerAudioInterruption(int began);
     ffi.Pointer<ffi.Pointer<ffi.Int>>,
     ffi.Pointer<ffi.Pointer<ffi.Int>>,
     ffi.Pointer<ffi.Int>,
+    ffi.Int,
   )
 >()
 external void listPlaybackDevices(
@@ -321,6 +322,7 @@ external void listPlaybackDevices(
   ffi.Pointer<ffi.Pointer<ffi.Int>> deviceId,
   ffi.Pointer<ffi.Pointer<ffi.Int>> isDefault,
   ffi.Pointer<ffi.Int> n_devices,
+  int capacity,
 );
 
 /// Change the playback device.
