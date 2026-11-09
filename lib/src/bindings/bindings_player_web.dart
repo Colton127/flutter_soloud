@@ -31,6 +31,16 @@ import 'package:meta/meta.dart';
 /// Callback set in `setBufferStream` for the `onMetadata` closure.
 typedef OnMetadataCallbackTFunction = void Function(int metadataPtr);
 
+// Native exports consume UTF-8 C strings, not Dart UTF-16 code units.
+int _allocateUtf8(String value) {
+  final bytes = utf8.encode(value);
+  final ptr = wasmMalloc(bytes.length + 1);
+  wasmHeapU8.toDart
+    ..setAll(ptr, bytes)
+    ..[ptr + bytes.length] = 0;
+  return ptr;
+}
+
 /// JS/WASM bindings to SoLoud
 @internal
 class FlutterSoLoudWeb extends FlutterSoLoud {
@@ -214,12 +224,12 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   /// If we will need to send messages to the native. Not used now.
   void sendMessageToWasmWorker(String message, int value) {
-    final messagePtr = wasmMalloc(message.length);
-    for (var i = 0; i < message.length; i++) {
-      wasmSetValue(messagePtr + i, message.codeUnits[i], 'i8');
+    final ptr = _allocateUtf8(message);
+    try {
+      wasmSendToWorker(ptr, value);
+    } finally {
+      wasmFree(ptr);
     }
-    wasmSendToWorker(messagePtr, value);
-    wasmFree(messagePtr);
   }
 
   @override
@@ -628,16 +638,11 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   ) {
     final hashPtr = wasmMalloc(4); // 4 bytes for an int32
     final bytesPtr = wasmMalloc(buffer.length);
-    final pathPtr = wasmMalloc(uniqueName.length);
+    final pathPtr = _allocateUtf8(uniqueName);
 
     /// Copy the buffer into WASM memory using the HEAPU8 view.
     final heapU8 = wasmHeapU8;
     heapU8.toDart.setAll(bytesPtr, buffer);
-
-    /// Copy the path string into WASM memory.
-    for (var i = 0; i < uniqueName.length; i++) {
-      wasmSetValue(pathPtr + i, uniqueName.codeUnits[i], 'i8');
-    }
 
     final result = wasmLoadMem(
       pathPtr,
@@ -668,17 +673,12 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     final hashPtr = wasmMalloc(4); // 4 bytes for an int32
     final bytes1Ptr = wasmMalloc(bufferLeft.length);
     final bytes2Ptr = wasmMalloc(bufferRight.length);
-    final pathPtr = wasmMalloc(uniqueName.length);
+    final pathPtr = _allocateUtf8(uniqueName);
 
     /// Copy the buffers into WASM memory using the HEAPU8 view.
     final heapU8 = wasmHeapU8;
     heapU8.toDart.setAll(bytes1Ptr, bufferLeft);
     heapU8.toDart.setAll(bytes2Ptr, bufferRight);
-
-    /// Copy the path string into WASM memory.
-    for (var i = 0; i < uniqueName.length; i++) {
-      wasmSetValue(pathPtr + i, uniqueName.codeUnits[i], 'i8');
-    }
 
     final result = wasmJoinTwoSources(
       pathPtr,
@@ -1029,19 +1029,19 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   ({PlayerErrors error, SoundHandle handle}) speechText(String textToSpeech) {
-    final handlePtr = wasmMalloc(4); // 4 bytes for an int32
-    final textToSpeechPtr = wasmMalloc(textToSpeech.length);
-    final result = wasmSpeechText(textToSpeechPtr, handlePtr);
-
-    final newHandle = wasmGetI32Value(handlePtr, 'i32');
-    final ret = (
-      error: PlayerErrors.values[result],
-      handle: SoundHandle(newHandle),
-    );
-    wasmFree(textToSpeechPtr);
-    wasmFree(handlePtr);
-
-    return ret;
+    final handlePtr = wasmMalloc(4);
+    var textPtr = 0;
+    try {
+      textPtr = _allocateUtf8(textToSpeech);
+      final result = wasmSpeechText(textPtr, handlePtr);
+      return (
+        error: PlayerErrors.values[result],
+        handle: SoundHandle(wasmGetI32Value(handlePtr, 'i32')),
+      );
+    } finally {
+      wasmFree(textPtr);
+      wasmFree(handlePtr);
+    }
   }
 
   @override
