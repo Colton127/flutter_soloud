@@ -22,6 +22,8 @@
 #include "soloud_checkpoint.h"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -288,6 +290,33 @@ void testEngineFeatureOn()
     engine.deinit();
 }
 
+// A rewrite of a published unread window and a device copy can start
+// together. Larger copies make their overlap reliable under the race checker;
+// the output must still be one coherent version of the window.
+void testConcurrentReadAndRewrite()
+{
+    constexpr unsigned int frames = 1u << 20;
+    SoLoud::RenderRing ring;
+    ring.init(frames, 2);
+    std::vector<float> old(frames * 2, 0.0f);
+    std::vector<float> replacement(frames * 2, 1.0f);
+    std::vector<float> output(frames * 2, -1.0f);
+    EXPECT(ring.write(old.data(), frames) == frames, "concurrent prefill");
+    std::atomic<bool> starting{false};
+    std::thread writer([&] {
+        starting.store(true, std::memory_order_release);
+        ring.rewrite(0, replacement.data(), frames);
+    });
+    while (!starting.load(std::memory_order_acquire)) std::this_thread::yield();
+    EXPECT(ring.read(output.data(), frames) == frames, "concurrent device read");
+    writer.join();
+    const float version = output.front();
+    EXPECT((version == 0.0f || version == 1.0f) &&
+               std::all_of(output.begin(), output.end(),
+                           [version](float sample) { return sample == version; }),
+           "device read combined different rewrite versions");
+}
+
 void testEngineReinitializationResetsCheckpointFrames()
 {
     SoLoud::Soloud engine;
@@ -319,6 +348,7 @@ int main()
     testRingWraparound();
     testRingUnderrunAndClamp();
     testRingRewriteAndRewind();
+    testConcurrentReadAndRewrite();
     testEngineFeatureOff();
     testEngineFeatureOn();
     testEngineReinitializationResetsCheckpointFrames();

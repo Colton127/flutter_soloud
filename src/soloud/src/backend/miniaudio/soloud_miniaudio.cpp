@@ -1324,8 +1324,10 @@ namespace SoLoud
         {
             // Render-ahead ring path: the engine has already mixed
             // renderAheadFrames into its own ring; this callback only copies
-            // out and tops the ring back up. The ring read is lock-free SPSC,
-            // so the device never blocks behind the audio mutex.
+            // out and tops the ring back up.
+            // ###### flutter_soloud local patch (ring copy serialization) ######
+            // The read serializes only with bounded retroactive ring copies;
+            // decoding never holds that copy lock.
             soloud->renderRingTopUp_internal();
             unsigned int got =
                 soloud->mRenderRing.read((float *)pOutput, frameCount);

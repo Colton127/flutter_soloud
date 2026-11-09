@@ -9,8 +9,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT="${TMPDIR:-/tmp}/render_ring_test"
+SANITIZER=(-O2)
+if [ "${1:-}" == "--tsan" ]; then
+    SANITIZER=(-fsanitize=thread -g -O1)
+    OUT="${OUT}_tsan"
+fi
 
-c++ -std=c++17 -O2 -Wall -Wextra -pthread \
+c++ -std=c++17 -Wall -Wextra -pthread "${SANITIZER[@]}" \
     -DWITH_NULL \
     -I src/soloud/include \
     -o "$OUT" \
