@@ -115,6 +115,27 @@ uint8_t *MixerOutput::copyPacket(const uint8_t *data, size_t length,
 #endif
 }
 
+uint8_t *MixerOutput::copyStoppedTail(size_t &length) {
+  length = 0;
+  if (isRunning()) return nullptr;
+  const size_t available = getAvailableBytes();
+  if (available == 0) return nullptr;
+  auto *copy = static_cast<uint8_t *>(std::malloc(available));
+  if (copy == nullptr) return nullptr;
+  // Allocation is outside the copy lock. Start cannot replace the ring while
+  // the caller holds the lifecycle lock across stop and this snapshot.
+  std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
+  SOLOUD_TEST_BARRIER(mixerCaptureTailSelected);
+  const uint64_t read = m_readOffset.load(std::memory_order_relaxed);
+  const size_t offset = read % m_bufferSize;
+  const size_t first = std::min(available, m_bufferSize - offset);
+  std::memcpy(copy, m_buffer.data() + offset, first);
+  if (first < available) std::memcpy(copy + first, m_buffer.data(), available - first);
+  m_readOffset.store(read + available, std::memory_order_release);
+  length = available;
+  return copy;
+}
+
 uint8_t *MixerOutput::takeStoppedPackets(uint32_t captureId, size_t &length) {
   length = 0;
   if (instance().isRunning() && instance().captureId() == captureId) return nullptr;
@@ -476,8 +497,8 @@ void MixerOutput::stop() {
 
 #ifdef __EMSCRIPTEN__
   // On web there is no encoder thread: flush the encoder tail inline so the
-  // circular buffer is complete when this returns. The Dart side reads the
-  // remaining data synchronously right after stop (_flushRemaining), and
+  // circular buffer is complete when this returns. The stop-and-drain export
+  // snapshots the remaining data before releasing the lifecycle lock, and
   // joining a pthread here would block the main browser thread.
   if (m_encoder != nullptr) {
     m_encodeScratch.clear();

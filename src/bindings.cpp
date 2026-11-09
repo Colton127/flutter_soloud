@@ -1010,12 +1010,12 @@ extern "C"
     return MixerOutput::takeStoppedPackets(captureId, *length);
   }
 
-  FFI_PLUGIN_EXPORT void stopMixerCapture()
+  // The caller serializes capture lifecycle changes for the whole operation.
+  static void stopMixerCaptureLocked()
   {
     // Serialized against engine teardown's own stop, and against another
     // isolate's: MixerOutput::stop() joins both worker threads and resets the
     // encoder and queue, none of which survives being run twice at once.
-    std::lock_guard<std::mutex> mixerGuard(mixer_lifecycle_mutex);
 #ifdef __EMSCRIPTEN__
     // On the multi-threaded (AudioWorklet) build the audio callback runs on
     // the worklet rendering thread and encodes inline in onAudioData().
@@ -1038,6 +1038,40 @@ extern "C"
     }
 #endif
     MixerOutput::instance().stop();
+  }
+
+  FFI_PLUGIN_EXPORT void stopMixerCapture()
+  {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
+    stopMixerCaptureLocked();
+  }
+
+  FFI_PLUGIN_EXPORT unsigned char *stopMixerCaptureAndDrain(
+      unsigned int captureId, size_t *length)
+  {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
+    auto &capture = MixerOutput::instance();
+    *length = 0;
+    // A superseded client must not stop a newer capture.
+    if (capture.captureId() != captureId)
+      return MixerOutput::takeStoppedPackets(captureId, *length);
+    stopMixerCaptureLocked();
+    size_t packetLength = 0, tailLength = 0;
+    auto *packets = MixerOutput::takeStoppedPackets(captureId, packetLength);
+    auto *tail = capture.copyStoppedTail(tailLength);
+    if (packetLength == 0) { free(packets); *length = tailLength; return tail; }
+    if (tailLength == 0) { free(tail); *length = packetLength; return packets; }
+    unsigned char *result = nullptr;
+    if (tailLength <= SIZE_MAX - packetLength)
+      result = static_cast<unsigned char *>(malloc(packetLength + tailLength));
+    if (result != nullptr) {
+      memcpy(result, packets, packetLength);
+      memcpy(result + packetLength, tail, tailLength);
+      *length = packetLength + tailLength;
+    }
+    free(packets);
+    free(tail);
+    return result;
   }
 
   FFI_PLUGIN_EXPORT int isMixerCaptureRunning()
@@ -1074,6 +1108,7 @@ extern "C"
 
   FFI_PLUGIN_EXPORT unsigned char *getMixerOutputWavHeader()
   {
+    std::lock_guard<std::mutex> guard(mixer_lifecycle_mutex);
     const auto &header = MixerOutput::instance().getWavHeader();
     if (header.empty())
     {

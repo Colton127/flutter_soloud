@@ -36,6 +36,20 @@ class WebCaptureModule {
               })
               .toJS
       ..['_stopMixerCapture'] = (() {}).toJS
+      ..['_stopMixerCaptureAndDrain'] = ((int id, int lengthPtr) {
+        final tokens = packets.keys.where((t) => packets[t]!.id == id).toList()
+          ..sort();
+        final bytes = Uint8List.fromList([
+          for (final token in tokens) ...packets.remove(token)!.bytes,
+          if (id == captureId) ...tail,
+        ]);
+        if (id == captureId) tail = Uint8List(0);
+        heap.setInt32(lengthPtr, bytes.length, Endian.little);
+        if (bytes.isEmpty) return 0;
+        final ptr = allocate(bytes.length);
+        heap.buffer.asUint8List().setAll(ptr, bytes);
+        return ptr;
+      }).toJS
       ..['_getMixerCaptureId'] = (() => captureId).toJS
       ..['_getMixerCaptureAvailableBytes'] = (() => tail.length).toJS
       ..['_getMixerCaptureBufferPointer'] = (() => tailPtr).toJS

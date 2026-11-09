@@ -128,6 +128,14 @@ external ffi.Pointer<ffi.UnsignedChar> drainMixerCapturePackets(
   ffi.Pointer<ffi.Size> length,
 );
 
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(ffi.UnsignedInt, ffi.Pointer<ffi.Size>)
+>()
+external ffi.Pointer<ffi.UnsignedChar> stopMixerCaptureAndDrain(
+  int captureId,
+  ffi.Pointer<ffi.Size> length,
+);
+
 /// Stop capturing the master mixer output.
 @ffi.Native<ffi.Void Function()>()
 external void stopMixerCapture();

@@ -129,6 +129,10 @@ extern "C"
 
   /// Stop capturing the master mixer output.
   FFI_PLUGIN_EXPORT void stopMixerCapture();
+  /// Stop and return owned pending chunks followed by the tail, atomically
+  /// with respect to a restart. Free the returned bytes with nativeFree.
+  FFI_PLUGIN_EXPORT unsigned char *stopMixerCaptureAndDrain(
+      unsigned int captureId, size_t *length);
 
   /// Claim an immutable capture packet; free the returned bytes with nativeFree.
   /// Returns null for a retired or already claimed token.

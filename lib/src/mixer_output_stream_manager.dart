@@ -117,50 +117,12 @@ class MixerOutputStreamManager {
     _subscription?.cancel();
     _subscription = null;
     bindings.stopMixerOutputCapture();
-    // Complete chunks have already left the ring but may still be queued
-    // for the Dart listener. Deliver them before the partial ring tail.
+    // The native stop returns one owned snapshot: queued chunks and the ring
+    // tail. No borrowed pointer survives a concurrent capture restart.
     _emitChunk(bindings.takeStoppedMixerOutputPackets());
-
-    // Flush any captured data that did not reach the notification threshold.
-    // The native side keeps the buffer alive after stopping so we can copy the
-    // tail synchronously and avoid losing compressed-format headers.
-    _flushRemaining();
 
     _streamController?.close();
     _streamController = null;
-  }
-
-  void _flushRemaining() {
-    final controller = _streamController;
-    if (controller == null || controller.isClosed) {
-      return;
-    }
-
-    final available = bindings.getMixerOutputAvailableBytes();
-    if (available <= 0) {
-      return;
-    }
-
-    final bufferSize = bindings.getMixerOutputBufferSize();
-    final readOffset = bindings.getMixerOutputReadOffset();
-    final firstLength = available < bufferSize - readOffset
-        ? available
-        : bufferSize - readOffset;
-
-    if (firstLength > 0) {
-      final chunk = bindings.copyMixerOutputBuffer(readOffset, firstLength);
-      if (chunk.isNotEmpty) {
-        controller.add(chunk);
-      }
-    }
-
-    if (available > firstLength) {
-      final secondLength = available - firstLength;
-      final chunk = bindings.copyMixerOutputBuffer(0, secondLength);
-      if (chunk.isNotEmpty) {
-        controller.add(chunk);
-      }
-    }
   }
 
   /// Whether mixer output capture is currently active.

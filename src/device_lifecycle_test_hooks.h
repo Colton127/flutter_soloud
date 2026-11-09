@@ -149,6 +149,8 @@ namespace soloud_test
     /// After native capture packet allocation, before the ring-copy lock.
     /// Parking here must never prevent the device from writing another block.
     mixerPacketStorageAllocated,
+    /// After the stopped ring was selected, before copying its tail.
+    mixerCaptureTailSelected,
     barrierCount
   };
 

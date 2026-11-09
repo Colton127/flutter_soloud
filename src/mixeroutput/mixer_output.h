@@ -3,6 +3,7 @@
 // Feature probes for the native tests, which also build against trees
 // without these APIs to show the old caller protocol failing.
 #define SOLOUD_CAPTURE_PACKET_DRAIN 1
+#define SOLOUD_CAPTURE_TAIL_SNAPSHOT 1
 
 #include <atomic>
 #include <cstddef>
@@ -119,6 +120,8 @@ class MixerOutput {
   /// Drain untaken fixed chunks of a stopped capture, in publication order.
   /// Threshold tokens are retired too; their bytes remain in the ring tail.
   static uint8_t *takeStoppedPackets(uint32_t captureId, size_t &length);
+  /// Caller holds the capture lifecycle lock and has stopped the producers.
+  uint8_t *copyStoppedTail(size_t &length);
   static uint8_t *copyPacket(const uint8_t *data, size_t length,
                              uint32_t captureId, uint64_t readThrough = 0);
 

@@ -59,7 +59,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   int _engineGeneration = 0;
 
   int? _mixerCaptureId;
-  int? _stoppedMixerCaptureId;
+  Uint8List _stoppedMixerOutput = Uint8List(0);
 
   /// Serializes native engine lifecycle calls (initEngine / changeDevice /
   /// deinit / disposeAllSound).
@@ -263,30 +263,34 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
 
   @override
   void stopMixerOutputCapture() {
-    _stoppedMixerCaptureId = _mixerCaptureId;
+    final id = _mixerCaptureId;
     _mixerCaptureId = null;
-    wasmStopMixerCapture();
-  }
-
-  @override
-  Uint8List takeStoppedMixerOutputPackets() {
-    final id = _stoppedMixerCaptureId;
-    _stoppedMixerCaptureId = null;
-    if (id == null) return Uint8List(0);
+    _stoppedMixerOutput = Uint8List(0);
+    if (id == null) {
+      wasmStopMixerCapture();
+      return;
+    }
     final lengthPtr = wasmMalloc(4);
     var ptr = 0;
     try {
-      ptr = wasmDrainMixerCapturePackets(id, lengthPtr);
-      final length = wasmGetI32Value(lengthPtr, 'i32').toUnsigned(32);
-      return ptr == 0
-          ? Uint8List(0)
-          : Uint8List.fromList(
-              Uint8List.sublistView(wasmHeapU8.toDart, ptr, ptr + length),
-            );
+      ptr = wasmStopMixerCaptureAndDrain(id, lengthPtr);
+      if (ptr != 0) {
+        final length = wasmGetI32Value(lengthPtr, 'i32').toUnsigned(32);
+        _stoppedMixerOutput = Uint8List.fromList(
+          Uint8List.sublistView(wasmHeapU8.toDart, ptr, ptr + length),
+        );
+      }
     } finally {
       wasmFree(ptr);
       wasmFree(lengthPtr);
     }
+  }
+
+  @override
+  Uint8List takeStoppedMixerOutputPackets() {
+    final bytes = _stoppedMixerOutput;
+    _stoppedMixerOutput = Uint8List(0);
+    return bytes;
   }
 
   @override
