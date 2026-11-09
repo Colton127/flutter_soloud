@@ -2153,41 +2153,39 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
     bool average = false,
   }) {
     final bufferPtr = wasmMalloc(buffer.length);
-
-    /// Copy the buffer into WASM memory using the HEAPU8 view.
-    final heapU8 = wasmHeapU8;
-    heapU8.toDart.setAll(bufferPtr, buffer);
-
-    final samplesPtr = wasmMalloc(numSamplesNeeded * 4);
-    final error = wasmReadSamplesFromMem(
-      bufferPtr,
-      buffer.length,
-      startTime,
-      endTime,
-      numSamplesNeeded,
-      average,
-      samplesPtr,
-    );
-
-    // Create a view of the WASM memory using JSFloat32Array first
-    final jsHeapF32 = wasmHeapF32;
-    // Convert the TypedArray view to a Dart Float32List
-    final samples = Float32List.sublistView(
-      jsHeapF32.toDart,
-      samplesPtr ~/ 4, // divide by 4 because Float32 is 4 bytes
-      (samplesPtr ~/ 4) + numSamplesNeeded,
-    );
-
-    wasmFree(samplesPtr);
-    wasmFree(bufferPtr);
-
-    if (ReadSamplesErrors.fromValue(error) !=
-        ReadSamplesErrors.readSamplesNoError) {
-      throw SoLoudCppException.fromReadSampleError(
-        ReadSamplesErrors.fromValue(error),
+    var samplesPtr = 0;
+    try {
+      wasmHeapU8.toDart.setAll(bufferPtr, buffer);
+      samplesPtr = wasmMalloc(numSamplesNeeded * 4);
+      final error = wasmReadSamplesFromMem(
+        bufferPtr,
+        buffer.length,
+        startTime,
+        endTime,
+        numSamplesNeeded,
+        average,
+        samplesPtr,
       );
+      if (ReadSamplesErrors.fromValue(error) !=
+          ReadSamplesErrors.readSamplesNoError) {
+        throw SoLoudCppException.fromReadSampleError(
+          ReadSamplesErrors.fromValue(error),
+        );
+      }
+      // Neither a JS typed-array conversion nor sublistView owns WASM bytes.
+      // Copy before releasing allocations or allowing the next call to
+      // reuse them.
+      return Float32List.fromList(
+        Float32List.sublistView(
+          wasmHeapF32.toDart,
+          samplesPtr ~/ 4,
+          samplesPtr ~/ 4 + numSamplesNeeded,
+        ),
+      );
+    } finally {
+      wasmFree(samplesPtr);
+      wasmFree(bufferPtr);
     }
-    return samples;
   }
 
   /////////////////////////////////////////
