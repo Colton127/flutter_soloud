@@ -23,6 +23,8 @@
 
 #include "audiobuffer/aac_stream_decoder.h"
 #include "audiobuffer/m4a_metadata.h"
+#include "audiobuffer/flac_stream_decoder.h"
+#include <FLAC/stream_encoder.h>
 #include "audiobuffer/stream_decoder.h"
 
 #include <ogg/ogg.h>
@@ -332,6 +334,94 @@ static void isolated(const char *name, const char *what, void (*fn)()) {
 #endif
 }
 
+static FLAC__StreamEncoderWriteStatus collectFlac(
+    const FLAC__StreamEncoder *, const FLAC__byte bytes[], size_t length,
+    unsigned, unsigned, void *opaque) {
+    auto &out = *static_cast<Bytes *>(opaque);
+    out.insert(out.end(), bytes, bytes + length);
+    return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+}
+
+static Bytes flacWithPadding() {
+    Bytes encoded;
+    auto *encoder = FLAC__stream_encoder_new();
+    EXPECT(encoder != nullptr, "FLAC encoder allocation");
+    if (!encoder) return {};
+    FLAC__stream_encoder_set_channels(encoder, 1);
+    FLAC__stream_encoder_set_bits_per_sample(encoder, 16);
+    FLAC__stream_encoder_set_sample_rate(encoder, 44100);
+    FLAC__stream_encoder_set_total_samples_estimate(encoder, 512);
+    const auto status = FLAC__stream_encoder_init_stream(
+        encoder, collectFlac, nullptr, nullptr, nullptr, &encoded);
+    EXPECT(status == FLAC__STREAM_ENCODER_INIT_STATUS_OK, "FLAC encoder init");
+    FLAC__int32 samples[512];
+    for (unsigned i = 0; i < 512; ++i) samples[i] = int(i * 113 % 32768) - 16384;
+    EXPECT(FLAC__stream_encoder_process_interleaved(encoder, samples, 512),
+           "FLAC encoder samples");
+    EXPECT(FLAC__stream_encoder_finish(encoder), "FLAC encoder finish");
+    FLAC__stream_encoder_delete(encoder);
+    if (encoded.size() < 42) return {};
+    size_t audio = 4;
+    for (;;) {
+        if (audio + 4 > encoded.size()) return {};
+        const bool last = (encoded[audio] & 0x80) != 0;
+        const size_t length = (size_t(encoded[audio + 1]) << 16) |
+                              (size_t(encoded[audio + 2]) << 8) | encoded[audio + 3];
+        audio += 4 + length;
+        if (audio > encoded.size()) return {};
+        if (last) break;
+    }
+    // Keep STREAMINFO and the encoded frames, replacing optional metadata
+    // with one final padding block. Its header plus sixteen bytes ends at 62.
+    Bytes file(encoded.begin(), encoded.begin() + 42);
+    file[4] &= 0x7f;
+    file.insert(file.end(), {0x81, 0x01, 0x00, 0x00});
+    file.resize(file.size() + 65536, 0);
+    file.insert(file.end(), encoded.begin() + audio, encoded.end());
+    return file;
+}
+
+static std::vector<float> decodeFlacParts(const Bytes &file, bool split,
+                                          bool initialized) {
+    FlacDecoderWrapper decoder;
+    if (initialized) EXPECT(decoder.initializeDecoder(44100, 1), "FLAC preinit");
+    int rate = 44100, channels = 1;
+    std::vector<float> output;
+    const size_t first = split ? 62 : file.size();
+    Bytes chunk(file.begin(), file.begin() + first);
+    auto result = decoder.decode(chunk, &rate, &channels);
+    EXPECT(result.second == DecoderError::NoError, "FLAC first decode status");
+    output.insert(output.end(), result.first.begin(), result.first.end());
+    if (split) {
+        EXPECT(output.empty(), "partial FLAC metadata must not produce samples");
+        chunk.assign(file.begin() + first, file.end());
+        result = decoder.decode(chunk, &rate, &channels);
+        EXPECT(result.second == DecoderError::NoError, "FLAC remainder status");
+        output.insert(output.end(), result.first.begin(), result.first.end());
+    }
+    decoder.setDataEnded();
+    for (int i = 0; i < 8 && decoder.hasPendingData(); ++i) {
+        chunk.clear();
+        result = decoder.decode(chunk, &rate, &channels);
+        output.insert(output.end(), result.first.begin(), result.first.end());
+    }
+    return output;
+}
+
+static void runFlacPartialFinalHeader() {
+    const Bytes file = flacWithPadding();
+    EXPECT(file.size() > 65582, "FLAC fixture must include padding and frames");
+    if (file.size() <= 65582) return;
+    const auto reference = decodeFlacParts(file, false, true);
+    EXPECT(reference.size() == 512, "unsplit FLAC sample count %zu", reference.size());
+    for (bool initialized : {false, true}) {
+        const auto split = decodeFlacParts(file, true, initialized);
+        EXPECT(split == reference,
+               "split FLAC differs from unsplit (preinitialized=%d): %zu versus %zu",
+               initialized, split.size(), reference.size());
+    }
+}
+
 static void runM4aLargeWrap() {
     // An extended-size child at offset 8 must not wrap its 64-bit end.
     const Bytes file = {0,0,0,8, 'f','r','e','e',
@@ -347,6 +437,8 @@ int main(int argc, char **argv) {
     const auto want = [&](const char *name) { return only.empty() || only == name; };
 
     if (want("valid")) testValid();
+    if (want("flac-partial-final-header"))
+        isolated("flac-partial-final-header", "a split final FLAC metadata block", runFlacPartialFinalHeader);
     if (want("m4a-nested"))
         isolated("m4a-nested", "4 MiB of nested boxes on a 1 MiB stack", runM4aNested);
     if (want("m4a-large-wrap"))

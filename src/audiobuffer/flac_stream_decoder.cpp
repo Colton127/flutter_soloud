@@ -1,6 +1,7 @@
 #if !defined(NO_XIPH_LIBS)
 
 #include "flac_stream_decoder.h"
+#include "metadata_bounds.h"
 #include "../soloud_common.h"
 #include <cstring> // For memcpy
 
@@ -32,7 +33,7 @@ namespace
         size_t pos = 4;
         while (true)
         {
-            if (pos + 4 > data.size())
+            if (!metadataHasBytes(data.size(), pos, 4))
                 return 0; // need more data
 
             const unsigned char blockType = data[pos];
@@ -41,6 +42,10 @@ namespace
                 (static_cast<size_t>(data[pos + 2]) << 8) |
                 static_cast<size_t>(data[pos + 3]);
 
+            // A delivery can end anywhere inside metadata. Do not cache a
+            // declared header range until every payload byte has arrived.
+            if (!metadataHasBytes(data.size(), pos + 4, blockSize))
+                return 0;
             pos += 4 + blockSize;
 
             if (blockType & 0x80)
