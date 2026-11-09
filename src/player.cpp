@@ -2790,6 +2790,19 @@ float Player::getApproximateVolume(unsigned int channel)
     return Analyzer::instance().getChannelPeak(static_cast<int>(channel));
 }
 
+// A voice can end while this thread holds sounds_mutex: its callback then
+// leaves the handle removal for the next outermost lock holder. Admission
+// and eviction must inspect the published voice state as well as the list,
+// otherwise an already-ended voice consumes a slot or hides the first voice
+// that can actually be evicted. The handle query never waits for the mix.
+static SoLoud::handle firstLiveHandle(SoLoud::Soloud &soloud, const ActiveSound &sound)
+{
+    for (const auto &entry : sound.handle)
+        if (soloud.isValidVoiceHandle(entry.handle))
+            return entry.handle;
+    return 0;
+}
+
 unsigned int Player::getActiveVoiceCount_internal()
 {
     std::lock_guard<SoundsMutex> lock(sounds_mutex);
@@ -2797,6 +2810,19 @@ unsigned int Player::getActiveVoiceCount_internal()
     for (auto &s : sounds)
     {
         count += s->handle.size();
+    }
+    return count;
+}
+
+unsigned int Player::getLiveVoiceCount_internal()
+{
+    std::lock_guard<SoundsMutex> lock(sounds_mutex);
+    unsigned int count = 0;
+    for (auto &s : sounds)
+    {
+        for (const auto &entry : s->handle)
+            if (soloud.isValidVoiceHandle(entry.handle))
+                ++count;
     }
     return count;
 }
@@ -2856,7 +2882,7 @@ PlayerErrors Player::play(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -2869,12 +2895,13 @@ PlayerErrors Player::play(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
             // Its idle evaluation is deferred to the release (see SoundsLock).
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -2985,7 +3012,7 @@ PlayerErrors Player::playClocked(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -2998,11 +3025,12 @@ PlayerErrors Player::playClocked(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -3116,7 +3144,7 @@ PlayerErrors Player::playScheduled(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -3129,11 +3157,12 @@ PlayerErrors Player::playScheduled(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If no other instances are playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -3998,7 +4027,7 @@ PlayerErrors Player::play3d(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -4011,11 +4040,12 @@ PlayerErrors Player::play3d(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -4138,7 +4168,7 @@ PlayerErrors Player::play3dClocked(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -4151,11 +4181,12 @@ PlayerErrors Player::play3dClocked(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
@@ -4257,7 +4288,7 @@ PlayerErrors Player::play3dScheduled(
     // A BufferStream using `release` buffer type can only have one instance.
     if (sound->soundType == SoundType::TYPE_BUFFER_STREAM &&
         static_cast<SoLoud::BufferStream *>(sound->sound.get())->getBufferingType() == BufferingType::RELEASED &&
-        sound->handle.size() > 0)
+        firstLiveHandle(soloud, *sound) != 0)
     {
         return bufferStreamCanBePlayedOnlyOnce;
     }
@@ -4270,11 +4301,12 @@ PlayerErrors Player::play3dScheduled(
     // check if [soudHash] has other instances playing. If true remove the first and play the new one.
     // If there are no other instances playing, this sound cannot be played and return an error.
     // Issue https://github.com/alnitak/flutter_soloud/issues/204
-    if (getActiveVoiceCount_internal() >= getMaxActiveVoiceCount())
+    if (getLiveVoiceCount_internal() >= getMaxActiveVoiceCount())
     {
-        if (sound->handle.size() > 0)
+        const SoLoud::handle evicted = firstLiveHandle(soloud, *sound);
+        if (evicted != 0)
         {
-            stop(sound->handle[0].handle);
+            stop(evicted);
         }
         else
         {
