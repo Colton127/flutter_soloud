@@ -10,6 +10,7 @@
 // definitions rather than being repeated by hand in Java, Objective-C++ and
 // Dart.
 #include "engine_lifecycle.h"
+#include "mixeroutput/dart_port.h"
 #include "mixeroutput/mixer_output.h"
 #include "mixeroutput/wav_output_encoder.h"
 #include "player.h"
@@ -408,6 +409,9 @@ extern "C"
   std::atomic<dartFileLoadedCallback_t> dartFileLoadedCallback{nullptr};
   std::atomic<dartStateChangedCallback_t> dartStateChangedCallback{nullptr};
   std::atomic<dartMixerOutputDataCallback_t> dartMixerOutputDataCallback{nullptr};
+  std::atomic<mixer_output_port::PostInteger> mixerPostInteger{nullptr};
+  std::atomic<int64_t> mixerOutputPort{0};
+  std::atomic<uint64_t> orphanedMixerCapture{UINT64_MAX};
   std::atomic<dartVisualizationCallback_t> dartVisualizationCallback{nullptr};
 
   /// Monotonic engine session counter, bumped every time the native player
@@ -785,6 +789,8 @@ extern "C"
     dartFileLoadedCallback.store(nullptr, std::memory_order_release);
     dartStateChangedCallback.store(nullptr, std::memory_order_release);
     dartMixerOutputDataCallback.store(nullptr, std::memory_order_release);
+    mixerOutputPort.store(0, std::memory_order_release);
+    mixerPostInteger.store(nullptr, std::memory_order_release);
     dartVisualizationCallback.store(nullptr, std::memory_order_release);
     // The packets in flight went to the callable just retired.
     Analyzer::abandonDartDispatches();
@@ -943,7 +949,8 @@ extern "C"
       int bufferSizeBytes,
       int notificationThresholdBytes,
       int chunkPCMFrames, unsigned int *captureId,
-      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId)
+      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId,
+      mixer_output_port::PostInteger post = nullptr, int64_t port = 0)
   {
     if (captureId != nullptr) *captureId = 0;
     MixerOutputFormat outputFormat = static_cast<MixerOutputFormat>(format);
@@ -989,8 +996,14 @@ extern "C"
     // Admission is serialized with every start and stop. Check it before
     // touching the callback: a refused client must leave its owner alone.
     auto &capture = MixerOutput::instance();
+    // A closed worker port cannot run any cleanup of its own. Reap its
+    // capture here, on the next caller's thread, never by joining the
+    // notification thread from inside that thread's failed post.
+    if (capture.isRunning() &&
+        orphanedMixerCapture.load(std::memory_order_acquire) == capture.captureId())
+      capture.stop();
     if (capture.isRunning()) return playerAlreadyInited;
-    const bool publish = callback != nullptr;
+    const bool publish = callback != nullptr || post != nullptr;
     if (publish) {
       {
         // The gate is a leaf: validate and publish, then release it before
@@ -1002,6 +1015,9 @@ extern "C"
           return backendNotInited;
         MixerOutput::discardPackets();
         dartMixerOutputDataCallback.store(callback, std::memory_order_release);
+        mixerPostInteger.store(post, std::memory_order_release);
+        mixerOutputPort.store(port, std::memory_order_release);
+        orphanedMixerCapture.store(UINT64_MAX, std::memory_order_release);
         mixerCallbackGeneration = registration.generation();
       }
       capture.setDataCallback(dispatchMixerOutputToDart);
@@ -1016,6 +1032,8 @@ extern "C"
       // belonging to an isolate that may return as soon as it sees the error.
       dart_callbacks::Registration registration;
       dartMixerOutputDataCallback.store(nullptr, std::memory_order_release);
+      mixerPostInteger.store(nullptr, std::memory_order_release);
+      mixerOutputPort.store(0, std::memory_order_release);
       mixerCallbackGeneration = dart_callbacks::kNoGeneration;
     }
     // Publish the id before releasing the lifecycle lock. A separate query
@@ -1033,17 +1051,17 @@ extern "C"
         notificationThresholdBytes, chunkPCMFrames, captureId, nullptr, kNoEngineId);
   }
 
-  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureForEngine(
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureOnPort(
       int format, int sampleRate, int channels, int bufferSizeBytes,
       int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId,
-      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId)
+      void *apiData, int64_t port, int64_t ownerEngineId)
   {
-    if (callback == nullptr) {
-      if (captureId != nullptr) *captureId = 0;
-      return invalidParameter;
-    }
+    if (captureId != nullptr) *captureId = 0;
+    const auto post = mixer_output_port::resolve(apiData);
+    if (post == nullptr || port <= 0) return invalidParameter;
     return startMixerCaptureInternal(format, sampleRate, channels, bufferSizeBytes,
-        notificationThresholdBytes, chunkPCMFrames, captureId, callback, ownerEngineId);
+        notificationThresholdBytes, chunkPCMFrames, captureId, nullptr,
+        ownerEngineId, post, port);
   }
 
   // A queued listener receives a token, never a borrowed ring pointer. Taking
@@ -1053,6 +1071,12 @@ extern "C"
       unsigned char *token, unsigned int *captureId)
   {
     return MixerOutput::takePacket(token, *captureId);
+  }
+
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacketWithLength(
+      unsigned char *token, unsigned int *captureId, size_t *length)
+  {
+    return MixerOutput::takePacket(token, *captureId, length);
   }
 
   FFI_PLUGIN_EXPORT unsigned int getMixerCaptureId()
@@ -1131,9 +1155,35 @@ extern "C"
     return result;
   }
 
+  static int mixerCaptureRunning(bool probeOwner)
+  {
+    auto &capture = MixerOutput::instance();
+    if (!capture.isRunning()) return 0;
+#ifndef __EMSCRIPTEN__
+    const dart_callbacks::InvocationPass pass;
+    const int64_t port = mixerOutputPort.load(std::memory_order_acquire);
+    if (port != 0 && probeOwner) {
+      if (!pass.isLive(mixerCallbackGeneration)) return 0;
+      const auto post = mixerPostInteger.load(std::memory_order_acquire);
+      // A zero probe is ignored by Dart. It also detects an exited worker
+      // when the device is idle and no audio packet can discover the closure.
+      if (post == nullptr || !post(port, 0)) {
+        orphanedMixerCapture.store(capture.captureId(), std::memory_order_release);
+        return 0;
+      }
+    }
+#endif
+    return orphanedMixerCapture.load(std::memory_order_acquire) != capture.captureId();
+  }
+
   FFI_PLUGIN_EXPORT int isMixerCaptureRunning()
   {
-    return MixerOutput::instance().isRunning() ? 1 : 0;
+    return mixerCaptureRunning(false);
+  }
+
+  FFI_PLUGIN_EXPORT int isMixerCaptureRunningForStart()
+  {
+    return mixerCaptureRunning(true);
   }
 
   FFI_PLUGIN_EXPORT unsigned char *getMixerCaptureBufferPointer()
@@ -1195,15 +1245,21 @@ extern "C"
     sendMixerOutputToWorker(offset, length,
                             MixerOutput::instance().captureId());
 #else
-    // Held across the call so a retirement cannot return — and the owning
-    // isolate cannot go away — while this trampoline is running. Checked
-    // against the generation *this callable* was published at, not the one
-    // currently live: those differ whenever the mixer callable outlives the
-    // registration it joined.
+    // Snapshot the registered delivery mode under the engine callback gate.
+    // A VM port remains safe even if its worker exits during the post; it
+    // rejects the message instead of invoking an isolate-owned trampoline.
     const dart_callbacks::InvocationPass pass;
     if (!pass.isLive(mixerCallbackGeneration))
     {
       MixerOutput::discardPacket(data);
+      return;
+    }
+    const int64_t port = mixerOutputPort.load(std::memory_order_acquire);
+    if (port != 0) {
+      if (!mixer_output_port::send(
+              mixerPostInteger.load(std::memory_order_acquire), port, data))
+        orphanedMixerCapture.store(MixerOutput::instance().captureId(),
+                                   std::memory_order_release);
       return;
     }
     auto cb = dartMixerOutputDataCallback.load(std::memory_order_acquire);
@@ -1243,6 +1299,9 @@ extern "C"
       MixerOutput::discardPackets();
       dartMixerOutputDataCallback.store(callback, std::memory_order_release);
       mixerCallbackGeneration = registration.generation();
+      mixerOutputPort.store(0, std::memory_order_release);
+      mixerPostInteger.store(nullptr, std::memory_order_release);
+      orphanedMixerCapture.store(UINT64_MAX, std::memory_order_release);
     }
 
     MixerOutput::instance().setDataCallback(dispatchMixerOutputToDart);

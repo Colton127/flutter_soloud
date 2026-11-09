@@ -76,7 +76,7 @@ class MixerOutputStreamManager {
     }
 
     // Refuse a foreign capture before publishing callbacks for this isolate.
-    if (bindings.isMixerOutputCaptureRunning()) {
+    if (bindings.isMixerOutputCaptureRunning(probeOwner: true)) {
       throw SoLoudCppException.fromPlayerError(
         PlayerErrors.playerAlreadyInited,
       );
@@ -90,7 +90,7 @@ class MixerOutputStreamManager {
 
     // Ensure the mixer output callback is registered in this isolate so that
     // [bindings.mixerOutputChunkEvents] receives the copied chunks. On FFI
-    // this creates a native callable for the current isolate; on web it is a
+    // this prepares a VM port for the current isolate; on web it is a
     // no-op because the worker plumbing is already shared. Calling this before
     // [startMixerOutputCapture] is safe and idempotent.
     bindings.registerMixerOutputCallback();

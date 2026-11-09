@@ -304,7 +304,7 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   }
 
   @override
-  bool isMixerOutputCaptureRunning() {
+  bool isMixerOutputCaptureRunning({bool probeOwner = false}) {
     // A deinit can arrive while the WASM module is still instantiating
     // (init and deinit raced at startup): there is no capture running yet,
     // and the exports are not callable anyway.

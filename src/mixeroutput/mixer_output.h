@@ -114,7 +114,7 @@ class MixerOutput {
   /// Packet ownership for asynchronous consumers. These functions never
   /// borrow ring storage. A stopped capture's packets remain readable until
   /// claimed or explicitly discarded when their callback is retired.
-  static uint8_t *takePacket(uint8_t *token, uint32_t &captureId);
+  static uint8_t *takePacket(uint8_t *token, uint32_t &captureId, size_t *length = nullptr);
   static void discardPacket(uint8_t *token);
   static void discardPackets();
   /// Drain untaken fixed chunks of a stopped capture, in publication order.

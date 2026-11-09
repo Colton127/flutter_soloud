@@ -29,6 +29,7 @@
 // allocation or surround) runs only that scenario.
 
 #include "mixeroutput/mixer_output.h"
+#include "mixeroutput/dart_port.h"
 #include "device_lifecycle_test_hooks.h"
 
 #include <atomic>
@@ -499,10 +500,52 @@ void stoppedCaptureDrainsPendingPackets() {
 
 } // namespace
 
+static bool portOpen = true;
+static int64_t receivedToken = 0;
+static bool fakePostInteger(int64_t port, int64_t token) {
+    if (!portOpen) return false;
+    EXPECT(port == 17, "port: receiver id");
+    receivedToken = token;
+    return true;
+}
+
+static void nativePortPacketsHaveIndependentLifetime() {
+    auto &capture = MixerOutput::instance();
+    EXPECT(capture.start(MIXER_OUTPUT_PCM_F32LE, 44100, 2, 4096, 4096, -1) == noError,
+           "port: prepare capture packet storage");
+    capture.stop();
+    struct Entry { const char *name; void (*function)(); };
+    struct Api { int major; int minor; const Entry *functions; };
+    Entry entries[] = {{"Dart_PostInteger", reinterpret_cast<void (*)()>(fakePostInteger)}, {nullptr, nullptr}};
+    Api api{2, 0, entries};
+    auto post = mixer_output_port::resolve(&api);
+    EXPECT(post != nullptr, "port: resolve the versioned VM entry");
+    api.major = 3;
+    EXPECT(mixer_output_port::resolve(&api) == nullptr, "port: reject incompatible VM ABI");
+    const uint8_t payload[] = {1, 2, 3, 4};
+    auto *token = MixerOutput::copyPacket(payload, sizeof(payload), 71);
+    portOpen = true;
+    mixer_output_port::send(post, 17, token);
+    EXPECT(receivedToken == static_cast<int64_t>(reinterpret_cast<uintptr_t>(token)), "port: post the token");
+    uint32_t id = 0;
+    size_t length = 99;
+    auto *bytes = MixerOutput::takePacket(token, id, &length);
+    EXPECT(bytes != nullptr && id == 71 && length == sizeof(payload), "port: claim packet and length together");
+    if (bytes != nullptr) EXPECT(std::memcmp(bytes, payload, sizeof(payload)) == 0, "port: owned bytes");
+    std::free(bytes);
+    length = 99;
+    EXPECT(MixerOutput::takePacket(token, id, &length) == nullptr && length == 0, "port: no duplicate claim");
+    token = MixerOutput::copyPacket(payload, sizeof(payload), 72);
+    portOpen = false;
+    mixer_output_port::send(post, 17, token);
+    EXPECT(MixerOutput::takePacket(token, id) == nullptr, "port: failed post retires its packet");
+    portOpen = true;
+}
+
 int main(int argc, char **argv)
 {
     const char *only = argc > 1 ? argv[1] : nullptr;
-    const char *const kScenarios[] = {"fill", "overrun", "oversized", "chunks", "deferred", "allocation", "surround", "drain"};
+    const char *const kScenarios[] = {"fill", "overrun", "oversized", "chunks", "deferred", "allocation", "surround", "drain", "port"};
     if (only != nullptr)
     {
         bool known = false;
@@ -511,13 +554,15 @@ int main(int argc, char **argv)
         if (!known)
         {
             std::fprintf(stderr,
-                         "Unknown scenario '%s': use fill, overrun, oversized, chunks, deferred, allocation, surround or drain.\n",
+                         "Unknown scenario '%s': use fill, overrun, oversized, chunks, deferred, allocation, surround, drain or port.\n",
                          only);
             return 2;
         }
     }
     auto wanted = [&](const char *name) { return only == nullptr || std::strcmp(only, name) == 0; };
 
+    if (wanted("port"))
+        nativePortPacketsHaveIndependentLifetime();
     if (wanted("fill"))
         exactFillKeepsEveryByte();
     if (wanted("overrun"))

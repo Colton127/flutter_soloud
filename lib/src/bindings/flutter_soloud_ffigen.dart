@@ -117,7 +117,11 @@ PlayerErrors startMixerCapture(
   ),
 );
 
-/// Admit a native capture and publish its callable in the same transaction.
+/// Check port liveness before admitting a replacement for an exited worker.
+@ffi.Native<ffi.Int Function()>(symbol: 'isMixerCaptureRunningForStart')
+external int isMixerCaptureRunningForStart();
+
+/// Start notifications through a VM native port, safe after isolate exit.
 @ffi.Native<
   ffi.UnsignedInt Function(
     ffi.Int,
@@ -127,11 +131,12 @@ PlayerErrors startMixerCapture(
     ffi.Int,
     ffi.Int,
     ffi.Pointer<ffi.UnsignedInt>,
-    ffi.Pointer<ffi.NativeFunction<dartMixerOutputDataCallback_tFunction>>,
+    ffi.Pointer<ffi.Void>,
+    ffi.Int64,
     ffi.Int64,
   )
->(symbol: 'startMixerCaptureForEngine')
-external int _startMixerCaptureForEngine(
+>(symbol: 'startMixerCaptureOnPort')
+external int _startMixerCaptureOnPort(
   int format,
   int sampleRate,
   int channels,
@@ -139,12 +144,12 @@ external int _startMixerCaptureForEngine(
   int notificationThresholdBytes,
   int chunkPCMFrames,
   ffi.Pointer<ffi.UnsignedInt> captureId,
-  ffi.Pointer<ffi.NativeFunction<dartMixerOutputDataCallback_tFunction>>
-  callback,
+  ffi.Pointer<ffi.Void> apiData,
+  int port,
   int ownerEngineId,
 );
 
-PlayerErrors startMixerCaptureForEngine(
+PlayerErrors startMixerCaptureOnPort(
   int format,
   int sampleRate,
   int channels,
@@ -152,11 +157,11 @@ PlayerErrors startMixerCaptureForEngine(
   int notificationThresholdBytes,
   int chunkPCMFrames,
   ffi.Pointer<ffi.UnsignedInt> captureId,
-  ffi.Pointer<ffi.NativeFunction<dartMixerOutputDataCallback_tFunction>>
-  callback,
+  ffi.Pointer<ffi.Void> apiData,
+  int port,
   int ownerEngineId,
 ) => PlayerErrors.fromValue(
-  _startMixerCaptureForEngine(
+  _startMixerCaptureOnPort(
     format,
     sampleRate,
     channels,
@@ -164,9 +169,24 @@ PlayerErrors startMixerCaptureForEngine(
     notificationThresholdBytes,
     chunkPCMFrames,
     captureId,
-    callback,
+    apiData,
+    port,
     ownerEngineId,
   ),
+);
+
+/// Claim a port notification's packet and obtain its owned byte length.
+@ffi.Native<
+  ffi.Pointer<ffi.UnsignedChar> Function(
+    ffi.Pointer<ffi.UnsignedChar>,
+    ffi.Pointer<ffi.UnsignedInt>,
+    ffi.Pointer<ffi.Size>,
+  )
+>(symbol: 'takeMixerOutputPacketWithLength')
+external ffi.Pointer<ffi.UnsignedChar> takeMixerOutputPacketWithLength(
+  ffi.Pointer<ffi.UnsignedChar> token,
+  ffi.Pointer<ffi.UnsignedInt> captureId,
+  ffi.Pointer<ffi.Size> length,
 );
 
 /// Claim an immutable capture packet.

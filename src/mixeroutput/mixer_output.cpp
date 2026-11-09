@@ -196,7 +196,8 @@ uint8_t *MixerOutput::takeStoppedPackets(uint32_t captureId, size_t &length) {
   return bytes;
 }
 
-uint8_t *MixerOutput::takePacket(uint8_t *token, uint32_t &captureId) {
+uint8_t *MixerOutput::takePacket(uint8_t *token, uint32_t &captureId, size_t *length) {
+  if (length != nullptr) *length = 0;
   CapturePacket packet{};
 #ifdef __EMSCRIPTEN__
   {
@@ -230,6 +231,7 @@ uint8_t *MixerOutput::takePacket(uint8_t *token, uint32_t &captureId) {
   }
 #endif
   captureId = packet.captureId;
+  if (length != nullptr) *length = packet.length;
   // An acknowledgement belongs to its original ring, never a replacement.
   // Admission also excludes start()/stop() while touching the ring's state.
   MixerOutput &capture = instance();

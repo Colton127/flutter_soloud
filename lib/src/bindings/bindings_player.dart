@@ -134,7 +134,7 @@ abstract class FlutterSoLoud {
 
   /// Whether mixer output capture is currently active.
   @mustBeOverridden
-  bool isMixerOutputCaptureRunning();
+  bool isMixerOutputCaptureRunning({bool probeOwner = false});
 
   /// Whether the running native capture is the one this binding started.
   @mustBeOverridden

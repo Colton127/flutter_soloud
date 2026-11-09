@@ -101,8 +101,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   nativeFileLoadedCallable;
   ffi.NativeCallable<native.dartStateChangedCallback_tFunction>?
   nativeStateChangedCallable;
-  ffi.NativeCallable<native.dartMixerOutputDataCallback_tFunction>?
-  nativeMixerOutputDataCallable;
+  RawReceivePort? _mixerOutputPort;
   ffi.NativeCallable<native.dartVisualizationCallback_tFunction>?
   nativeVisualizationCallable;
 
@@ -178,12 +177,16 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     stateChangedController.add(s);
   }
 
-  void _mixerOutputDataCallback(
-    ffi.Pointer<ffi.UnsignedChar> data,
-    int length,
-  ) {
+  void _mixerOutputPortMessage(dynamic message) {
+    if (message is! int || message <= 0) return;
+    final data = ffi.Pointer<ffi.UnsignedChar>.fromAddress(message);
+    final length = calloc<ffi.Size>();
     final captureId = calloc<ffi.UnsignedInt>();
-    final bytes = native.takeMixerOutputPacket(data, captureId);
+    final bytes = native.takeMixerOutputPacketWithLength(
+      data,
+      captureId,
+      length,
+    );
     try {
       if (bytes == ffi.nullptr || captureId.value != _mixerCaptureId) {
         return;
@@ -191,7 +194,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       if (mixerOutputDataAvailableController.hasListener ||
           mixerOutputChunkController.hasListener) {
         final copy = Uint8List.fromList(
-          bytes.cast<ffi.Uint8>().asTypedList(length),
+          bytes.cast<ffi.Uint8>().asTypedList(length.value),
         );
         if (mixerOutputDataAvailableController.hasListener) {
           mixerOutputDataAvailableController.add(copy);
@@ -202,7 +205,9 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       }
     } finally {
       nativeFree(bytes.cast<ffi.Void>());
-      calloc.free(captureId);
+      calloc
+        ..free(captureId)
+        ..free(length);
     }
   }
 
@@ -282,8 +287,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     nativeFileLoadedCallable = null;
     nativeStateChangedCallable?.close();
     nativeStateChangedCallable = null;
-    nativeMixerOutputDataCallable?.close();
-    nativeMixerOutputDataCallable = null;
+    _mixerOutputPort?.close();
+    _mixerOutputPort = null;
     nativeVisualizationCallable?.close();
     nativeVisualizationCallable = null;
   }
@@ -308,10 +313,6 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         ffi.NativeCallable<native.dartStateChangedCallback_tFunction>.listener(
           _stateChangedCallback,
         );
-    nativeMixerOutputDataCallable ??=
-        ffi.NativeCallable<
-          native.dartMixerOutputDataCallback_tFunction
-        >.listener(_mixerOutputDataCallback);
     nativeVisualizationCallable ??=
         ffi.NativeCallable<native.dartVisualizationCallback_tFunction>.listener(
           _visualizationDataCallback,
@@ -341,12 +342,9 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   void registerMixerOutputCallback() {
-    nativeMixerOutputDataCallable ??=
-        ffi.NativeCallable<
-          native.dartMixerOutputDataCallback_tFunction
-        >.listener(_mixerOutputDataCallback);
-    // Preparation is isolate-local. Only an admitted native start publishes
-    // this callable, so a refused or abandoned attempt cannot redirect output.
+    // Preparing a VM port is local to this isolate. Publication belongs to
+    // the admitted native start, and a closed port can safely reject posts.
+    _mixerOutputPort ??= RawReceivePort(_mixerOutputPortMessage);
   }
 
   late final ffi.NativeFinalizer _isolateFinalizer = ffi.NativeFinalizer(
@@ -373,7 +371,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     registerMixerOutputCallback();
     final id = calloc<ffi.UnsignedInt>();
     try {
-      final ret = native.startMixerCaptureForEngine(
+      final ret = native.startMixerCaptureOnPort(
         format.value,
         sampleRate,
         channels,
@@ -381,11 +379,15 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
         notificationThresholdBytes,
         chunkPCMFrames,
         id,
-        nativeMixerOutputDataCallable!.nativeFunction,
+        ffi.NativeApi.initializeApiDLData,
+        ffi.NativePort(_mixerOutputPort!.sendPort).nativePort,
         currentEngineId,
       );
       if (ret == native.PlayerErrors.noError) {
         _mixerCaptureId = id.value;
+      } else if (_mixerCaptureId == null) {
+        _mixerOutputPort?.close();
+        _mixerOutputPort = null;
       }
       return PlayerErrors.values[ret.value];
     } finally {
@@ -401,6 +403,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
       if (!onlyOwned) {
         native.stopMixerCapture();
       }
+      _mixerOutputPort?.close();
+      _mixerOutputPort = null;
       return;
     }
     // Only a stop that drains a capture of its own replaces the snapshot: a
@@ -418,6 +422,8 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     } finally {
       nativeFree(ptr.cast<ffi.Void>());
       calloc.free(length);
+      _mixerOutputPort?.close();
+      _mixerOutputPort = null;
     }
   }
 
@@ -429,8 +435,11 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   }
 
   @override
-  bool isMixerOutputCaptureRunning() {
-    return native.isMixerCaptureRunning() != 0;
+  bool isMixerOutputCaptureRunning({bool probeOwner = false}) {
+    return (probeOwner
+            ? native.isMixerCaptureRunningForStart()
+            : native.isMixerCaptureRunning()) !=
+        0;
   }
 
   @override

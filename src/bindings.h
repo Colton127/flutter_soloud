@@ -130,11 +130,14 @@ extern "C"
       int notificationThresholdBytes, int chunkPCMFrames,
       unsigned int *captureId);
 
-  /// Admit a native capture and publish its callable in the same transaction.
-  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureForEngine(
+  /// Start notifications through a VM native port, safe after isolate exit.
+  FFI_PLUGIN_EXPORT enum PlayerErrors startMixerCaptureOnPort(
       int format, int sampleRate, int channels, int bufferSizeBytes,
       int notificationThresholdBytes, int chunkPCMFrames, unsigned int *captureId,
-      dartMixerOutputDataCallback_t callback, int64_t ownerEngineId);
+      void *apiData, int64_t port, int64_t ownerEngineId);
+  /// Claim a port notification's packet and obtain its owned byte length.
+  FFI_PLUGIN_EXPORT unsigned char *takeMixerOutputPacketWithLength(
+      unsigned char *token, unsigned int *captureId, size_t *length);
 
   /// Stop capturing the master mixer output.
   FFI_PLUGIN_EXPORT void stopMixerCapture();
@@ -154,6 +157,8 @@ extern "C"
 
   /// Returns 1 if mixer capture is running, 0 otherwise.
   FFI_PLUGIN_EXPORT int isMixerCaptureRunning();
+  /// Check port liveness before admitting a replacement for an exited worker.
+  FFI_PLUGIN_EXPORT int isMixerCaptureRunningForStart();
 
   /// Get the pointer to the circular capture buffer.
   FFI_PLUGIN_EXPORT unsigned char *getMixerCaptureBufferPointer();
