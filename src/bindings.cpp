@@ -2194,6 +2194,31 @@ extern "C"
       return -1;
     return pin.get()->getSoundHandleCount(hash);
   }
+
+  /// Mix [frames] frames into [output] the way the device callback does:
+  /// through the render-ahead ring when it is enabled, else directly. A test
+  /// on the null backend drives sample progress with it.
+  FFI_PLUGIN_EXPORT void soloudTestMixPlayerFrames(float *output,
+                                                  unsigned int frames)
+  {
+    const PlayerPin pin(PlayerPinKind::operation);
+    if (pin.get() == nullptr || !pin.get()->isInited())
+      return;
+    auto &engine = pin.get()->soloud;
+    if (engine.isRenderAheadEnabled() && engine.mRenderRing.isInited())
+    {
+      engine.renderRingTopUp_internal();
+      const unsigned int read = engine.mRenderRing.read(output, frames);
+      if (read < frames)
+        memset(output + read * engine.getBackendChannels(), 0,
+               (frames - read) * engine.getBackendChannels() * sizeof(float));
+    }
+    else
+    {
+      engine.mix(output, frames);
+    }
+  }
+
 #endif
 
 #if defined(__ANDROID__)
