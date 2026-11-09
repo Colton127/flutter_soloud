@@ -10,6 +10,12 @@
 //           instance that indexes its old, smaller buffers with the new
 //           window size is reported as a heap-buffer-overflow.
 //
+//   getter  getFilterParameter() on a voice handle races voices that end in
+//           the mix and new voices that take their slots. The handle must be
+//           resolved under the audio mutex: resolving it first reads the
+//           voice table (and the voice's play index) while the mixer can
+//           delete that voice. Run under ThreadSanitizer (--tsan), which
+//           reports the unsynchronized voice-table read.
 //
 //
 // Build and run from the flutter_soloud repository root with:
@@ -146,6 +152,69 @@ void testEqWindowChangeOnOneOfTwoVoices() {
     soloud.deinit();
 }
 
+// ---- getter -----------------------------------------------------------------
+
+void testFilterGetterRacesVoiceEnd() {
+    std::printf("getter: getFilterParameter racing voices that end in the mix\n");
+
+    SoLoud::Soloud soloud;
+    if (!initEngine(soloud))
+        return;
+
+    // Shorter than one block: every voice ends, and is deleted, in the first
+    // mix block that renders it.
+    ToneSource blip(64);
+    SoLoud::BiquadResonantFilter biquad;
+    blip.setFilter(0, &biquad);
+
+    std::atomic<bool> stop{false};
+    std::atomic<SoLoud::handle> latest{0};
+    std::atomic<unsigned long> reads{0};
+    std::atomic<unsigned long> plays{0};
+
+    std::thread mixer([&] {
+        std::vector<float> out(256 * kChannels);
+        while (!stop.load())
+            soloud.mix(out.data(), 256);
+    });
+    std::thread player([&] {
+        while (!stop.load()) {
+            const SoLoud::handle h = soloud.play(blip);
+            if (h != 0) {
+                latest.store(h);
+                plays.fetch_add(1);
+            }
+            std::this_thread::yield();
+        }
+    });
+    std::thread getter([&] {
+        while (!stop.load()) {
+            const SoLoud::handle h = latest.load();
+            if (h != 0) {
+                (void)soloud.getFilterParameter(h, 0, 0);
+                reads.fetch_add(1);
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    stop.store(true);
+    getter.join();
+    player.join();
+    mixer.join();
+
+    std::printf("  %lu plays, %lu filter reads\n", plays.load(), reads.load());
+    EXPECT(plays.load() > 100, "too few voices were played to race: %lu",
+           plays.load());
+    EXPECT(reads.load() > 100, "too few filter reads: %lu", reads.load());
+
+    soloud.stopAll();
+    std::vector<float> out(kBuffer * kChannels);
+    soloud.mix(out.data(), kBuffer);
+    blip.setFilter(0, nullptr);
+    soloud.deinit();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -156,6 +225,8 @@ int main(int argc, char **argv) {
 
     if (wanted("eq"))
         testEqWindowChangeOnOneOfTwoVoices();
+    if (wanted("getter"))
+        testFilterGetterRacesVoiceEnd();
 
     if (gFailures == 0)
         std::printf("\nAll %d assertions passed.\n", gAssertions);

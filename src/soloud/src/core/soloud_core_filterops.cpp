@@ -76,12 +76,16 @@ namespace SoLoud
 			return ret;
 		}
 
+		// ###### flutter_soloud local patch (filter getter voice lifetime) ######
+		// Resolving the handle dereferences the voice too: protect lookup as
+		// well as access against mixer termination and slot reuse.
+		lockAudioMutex_internal();
 		int ch = getVoiceFromHandle_internal(aVoiceHandle);
 		if (ch == -1) 
 		{
+			unlockAudioMutex_internal();
 			return ret;
 		}
-		lockAudioMutex_internal();
 		if (mVoice[ch] &&
 			mVoice[ch]->mFilter[aFilterId])
 		{
