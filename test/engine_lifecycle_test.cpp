@@ -176,7 +176,9 @@ extern "C"
     int soloudTestRefusedPlayerPins();
     int soloudTestSoundIsLoaded(unsigned int hash);
     int soloudTestVoiceIsValid(unsigned int handle);
-
+    int soloudTestSoundHandleCount(unsigned int hash);
+    void soloudTestRunVoiceEndedBody(unsigned int handle, unsigned int generation);
+    unsigned int soloudTestEngineGeneration();
 }
 
 namespace SoLoud
@@ -904,7 +906,65 @@ void testZeroFilterParameterReadsBack()
     resetGlobalState();
 }
 
+/// On the web (AudioWorklet build) a voice-ended event is posted to the main
+/// thread tagged with the engine session generation of the voice, and its body
+/// runs there later. When the engine was disposed and initialized again in
+/// between, the new SoLoud starts its handle sequence over, so the late event
+/// can name a handle that now belongs to a voice of the new session. The late
+/// event must leave that voice registered.
+void testStaleVoiceEndedEventSparesTheNewSession()
+{
+    std::printf("a stale voice-ended event spares the new session's voice\n");
+    resetGlobalState();
 
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    unsigned int oldHash = 0;
+    unsigned int oldHandle = 0;
+    EXPECT(loadWaveform(0, false, 0.25f, 1.0f, &oldHash) == noError,
+           "the waveform should load");
+    EXPECT(play(oldHash, 0, 0.0f, 0.0f, false, true, 0.0, 0.0, 0, 0, 1.0f,
+                &oldHandle) == noError,
+           "the waveform should play");
+    const unsigned int oldGeneration = soloudTestEngineGeneration();
+
+    dispose();
+    if (!initEngineAs(kEngineA))
+    {
+        EXPECT(false, "the engine should initialize again");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    unsigned int newHash = 0;
+    unsigned int newHandle = 0;
+    EXPECT(loadWaveform(0, false, 0.25f, 1.0f, &newHash) == noError,
+           "the waveform should load in the new session");
+    EXPECT(play(newHash, 0, 0.0f, 0.0f, false, true, 0.0, 0.0, 0, 0, 1.0f,
+                &newHandle) == noError,
+           "the waveform should play in the new session");
+    EXPECT(soloudTestEngineGeneration() != oldGeneration,
+           "the new session should have a new generation");
+    EXPECT(newHandle == oldHandle,
+           "the new session should reuse the handle number (%u vs %u), or "
+           "this scenario tests nothing",
+           newHandle, oldHandle);
+    EXPECT(soloudTestSoundHandleCount(newHash) == 1,
+           "the new voice should be registered");
+
+    // The old session's voice-ended event arrives now.
+    soloudTestRunVoiceEndedBody(oldHandle, oldGeneration);
+
+    EXPECT(soloudTestSoundHandleCount(newHash) == 1,
+           "a stale voice-ended event unregistered the new session's voice");
+    EXPECT(soloudTestVoiceIsValid(newHandle) == 1,
+           "the new voice should still be playing");
+
+    resetGlobalState();
+}
 
 /// Retirement stops the visualizations, whose single worker thread invokes the
 /// Dart callable through the gate and holds its own lock across each pass over
@@ -2583,6 +2643,7 @@ int main()
     testStaleWorkerMixerCallbackCannotBeRevived();
     testTeardownDuringActiveMixerCapture();
     testZeroFilterParameterReadsBack();
+    testStaleVoiceEndedEventSparesTheNewSession();
     testRetirementWhileVisualizationsDispatch();
     testRetirementSparesWhatANewerRegistrationStarted();
     testVisualizationSendsOnePacketAtATime();

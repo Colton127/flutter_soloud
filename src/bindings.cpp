@@ -587,6 +587,11 @@ extern "C"
   /// on the thread that produced the event.
   static void voiceEndedBody(unsigned int *handle, unsigned int generation)
   {
+    // A worklet notification can outlive the engine that posted it. Handles
+    // restart with a new Player, so reject the old session before touching
+    // native bookkeeping, as well as before notifying Dart.
+    if (generation != engineGeneration.load(std::memory_order_acquire))
+      return;
     if (player != nullptr)
     {
       player->removeHandle(*handle);
@@ -2192,6 +2197,22 @@ extern "C"
     if (pin.get() == nullptr)
       return -1;
     return pin.get()->getSoundHandleCount(hash);
+  }
+
+  /// Run the voice-ended body for [handle], tagged with the engine session
+  /// [generation], the way the web AudioWorklet build runs it on the main
+  /// browser thread some time after the voice ended (voiceEndedForwardToMain).
+  FFI_PLUGIN_EXPORT void soloudTestRunVoiceEndedBody(unsigned int handle,
+                                                     unsigned int generation)
+  {
+    voiceEndedBody(&handle, generation);
+  }
+
+  /// The current engine session generation (getEngineGeneration() is only
+  /// exported on the web).
+  FFI_PLUGIN_EXPORT unsigned int soloudTestEngineGeneration()
+  {
+    return engineGeneration.load(std::memory_order_acquire);
   }
 #endif
 
