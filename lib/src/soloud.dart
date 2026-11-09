@@ -1668,7 +1668,10 @@ interface class SoLoud {
   /// [channels] must match the engine channel count. Use -1 to follow it.
   /// Capture does not remix channels; another count is rejected.
   ///
-  /// [bufferSizeBytes] total size of the circular capture buffer.
+  /// [bufferSizeBytes] total size of the circular capture buffer. For PCM,
+  /// it is rounded down to whole frames (sample bytes times engine channels).
+  /// The rounded size must hold at least one frame and the requested chunk,
+  /// or the notification threshold when fixed chunks are disabled.
   ///
   /// [notificationThresholdBytes] bytes that must be available before a chunk
   /// is emitted. Used for compressed formats and for PCM when

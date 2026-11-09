@@ -94,6 +94,14 @@ PlayerErrors MixerOutput::start(MixerOutputFormat format, int sampleRate,
     return audioFormatNotSupported;
   }
   const size_t bytesPerFrame = bps * channels;
+  if (!isCompressed) {
+    // Defaults need not divide evenly into surround frames. Drop only the
+    // unused tail bytes, keeping every wrap and overrun on a frame boundary.
+    bufferSizeBytes -= bufferSizeBytes % bytesPerFrame;
+    if (bufferSizeBytes < bytesPerFrame ||
+        (chunkPCMFrames <= 0 && notificationThresholdBytes > bufferSizeBytes))
+      return invalidParameter;
+  }
 
   if (isCompressed && chunkPCMFrames > 0) {
     return invalidParameter;
@@ -109,6 +117,7 @@ PlayerErrors MixerOutput::start(MixerOutputFormat format, int sampleRate,
       return invalidParameter;
     }
   }
+
 
   m_format = format;
   m_sampleRate = sampleRate;
@@ -290,87 +299,66 @@ void MixerOutput::onAudioData(const float *data, unsigned int frames) {
   }
 
   const size_t bytesToWrite = totalSamples * m_bytesPerSample;
-
-  // Make sure we do not overwrite unread data. If the user chose a buffer
-  // that is too small, drop the oldest data by advancing the read offset.
-  size_t writeOffset = m_writeOffset.load(std::memory_order_relaxed);
-  size_t readOffset = m_readOffset.load(std::memory_order_acquire);
-  size_t available = (writeOffset >= readOffset)
-                         ? writeOffset - readOffset
-                         : m_bufferSize - (readOffset - writeOffset);
-
-  size_t freeSpace = m_bufferSize - available;
-  if (bytesToWrite > freeSpace) {
-    const size_t drop = bytesToWrite - freeSpace;
-    readOffset = (readOffset + drop) % m_bufferSize;
-    m_readOffset.store(readOffset, std::memory_order_release);
+  {
+    std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
+    const uint64_t oldWrite = m_writeOffset.load(std::memory_order_relaxed);
+    const uint64_t newWrite = oldWrite + bytesToWrite;
+    const size_t kept = std::min(bytesToWrite, m_bufferSize);
+    const size_t skipped = bytesToWrite - kept;
+    const size_t offset = (oldWrite + skipped) % m_bufferSize;
+    const size_t first = std::min(kept, m_bufferSize - offset);
+    // A large device callback retains only its newest complete frames. Both
+    // copies are bounded by the allocation, even after an uneven wrap.
+    convertPcm(data + skipped / m_bytesPerSample, m_buffer.data() + offset,
+               first / m_bytesPerSample, m_format);
+    if (first < kept)
+      convertPcm(data + (skipped + first) / m_bytesPerSample, m_buffer.data(),
+                 (kept - first) / m_bytesPerSample, m_format);
+    const uint64_t read = m_readOffset.load(std::memory_order_relaxed);
+    m_readOffset.store(std::max(read, newWrite > m_bufferSize ? newWrite - m_bufferSize : 0),
+                       std::memory_order_release);
+    m_writeOffset.store(newWrite, std::memory_order_release);
   }
-
-  // Write the converted PCM data into the circular buffer, handling wrap.
-  size_t firstChunk = std::min(bytesToWrite, m_bufferSize - writeOffset);
-  convertPcm(data, m_buffer.data() + writeOffset, firstChunk / m_bytesPerSample,
-             m_format);
-
-  if (firstChunk < bytesToWrite) {
-    size_t secondChunk = bytesToWrite - firstChunk;
-    convertPcm(data + (firstChunk / m_bytesPerSample), m_buffer.data(),
-               secondChunk / m_bytesPerSample, m_format);
-  }
-
-  m_writeOffset.store((writeOffset + bytesToWrite) % m_bufferSize,
-                      std::memory_order_release);
 
 #ifdef __EMSCRIPTEN__
   processNotifications();
 #endif
 }
 
+bool MixerOutput::notifyOnePacket(size_t minimum, size_t fixedBytes) {
+  const auto callback = m_callback.load(std::memory_order_acquire);
+  if (callback == nullptr) return false;
+  uint8_t *data;
+  size_t length;
+  {
+    std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
+    const uint64_t read = m_readOffset.load(std::memory_order_relaxed);
+    const size_t available = m_writeOffset.load(std::memory_order_relaxed) - read;
+    if (available < minimum || (fixedBytes == 0 && m_notified.load())) return false;
+    const size_t offset = read % m_bufferSize;
+    length = fixedBytes > 0 ? fixedBytes : std::min(available, m_bufferSize - offset);
+    if (fixedBytes > 0) {
+      const size_t first = std::min(length, m_bufferSize - offset);
+      std::memcpy(m_chunkBuffer.data(), m_buffer.data() + offset, first);
+      if (first < length)
+        std::memcpy(m_chunkBuffer.data() + first, m_buffer.data(), length - first);
+      data = m_chunkBuffer.data();
+      m_readOffset.store(read + length, std::memory_order_release);
+    } else {
+      data = m_buffer.data() + offset;
+      m_notified.store(true, std::memory_order_release);
+    }
+  }
+  callback(data, length);
+  return true;
+}
+
 #ifdef __EMSCRIPTEN__
 void MixerOutput::processNotifications() {
-  const MixerOutputDataCallback callback =
-      m_callback.load(std::memory_order_acquire);
-  if (callback == nullptr) {
-    return;
-  }
-
-  // Fixed-size PCM chunk mode: emit every complete chunk. The data is copied
-  // into m_chunkBuffer, the read position is advanced immediately, and the
-  // callback is invoked. Dart must not advance the circular buffer again for
-  // these chunks.
   if (m_chunkBytes > 0) {
-    while (getAvailableBytes() >= m_chunkBytes) {
-      const size_t readOffset = m_readOffset.load(std::memory_order_relaxed);
-      const size_t firstPart =
-          std::min(m_chunkBytes, m_bufferSize - readOffset);
-      std::memcpy(m_chunkBuffer.data(), m_buffer.data() + readOffset,
-                  firstPart);
-
-      if (firstPart < m_chunkBytes) {
-        const size_t secondPart = m_chunkBytes - firstPart;
-        std::memcpy(m_chunkBuffer.data() + firstPart, m_buffer.data(),
-                    secondPart);
-      }
-
-      m_readOffset.store((readOffset + m_chunkBytes) % m_bufferSize,
-                         std::memory_order_release);
-      callback(m_chunkBuffer.data(), m_chunkBytes);
-    }
-    m_notified.store(false, std::memory_order_release);
-    return;
-  }
-
-  // Threshold-based mode (used by default and by compressed formats):
-  // notify when at least notificationThresholdBytes are available.
-  const size_t available = getAvailableBytes();
-  if (available >= m_notificationThreshold && !m_notified.load()) {
-    m_notified.store(true, std::memory_order_release);
-    const size_t readOffset = m_readOffset.load(std::memory_order_relaxed);
-    const size_t length = std::min(available, m_bufferSize - readOffset);
-    callback(m_buffer.data() + readOffset, length);
-  }
-
-  if (available < m_notificationThreshold) {
-    m_notified.store(false, std::memory_order_release);
+    while (notifyOnePacket(m_chunkBytes, m_chunkBytes)) {}
+  } else {
+    notifyOnePacket(m_notificationThreshold, 0);
   }
 }
 #endif
@@ -380,29 +368,20 @@ void MixerOutput::writeToBuffer(const uint8_t *data, size_t bytes) {
     return;
   }
 
-  size_t writeOffset = m_writeOffset.load(std::memory_order_relaxed);
-  size_t readOffset = m_readOffset.load(std::memory_order_acquire);
-  size_t available = (writeOffset >= readOffset)
-                         ? writeOffset - readOffset
-                         : m_bufferSize - (readOffset - writeOffset);
-
-  size_t freeSpace = m_bufferSize - available;
-  if (bytes > freeSpace) {
-    const size_t drop = bytes - freeSpace;
-    readOffset = (readOffset + drop) % m_bufferSize;
-    m_readOffset.store(readOffset, std::memory_order_release);
-  }
-
-  size_t firstChunk = std::min(bytes, m_bufferSize - writeOffset);
-  std::memcpy(m_buffer.data() + writeOffset, data, firstChunk);
-
-  if (firstChunk < bytes) {
-    size_t secondChunk = bytes - firstChunk;
-    std::memcpy(m_buffer.data(), data + firstChunk, secondChunk);
-  }
-
-  m_writeOffset.store((writeOffset + bytes) % m_bufferSize,
-                      std::memory_order_release);
+  std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
+  const uint64_t oldWrite = m_writeOffset.load(std::memory_order_relaxed);
+  const uint64_t newWrite = oldWrite + bytes;
+  const size_t kept = std::min(bytes, m_bufferSize);
+  const size_t skipped = bytes - kept;
+  const size_t offset = (oldWrite + skipped) % m_bufferSize;
+  const size_t first = std::min(kept, m_bufferSize - offset);
+  std::memcpy(m_buffer.data() + offset, data + skipped, first);
+  if (first < kept)
+    std::memcpy(m_buffer.data(), data + skipped + first, kept - first);
+  const uint64_t read = m_readOffset.load(std::memory_order_relaxed);
+  m_readOffset.store(std::max(read, newWrite > m_bufferSize ? newWrite - m_bufferSize : 0),
+                     std::memory_order_release);
+  m_writeOffset.store(newWrite, std::memory_order_release);
 }
 
 void MixerOutput::encoderThreadFunc() {
@@ -447,16 +426,13 @@ uint8_t *MixerOutput::getBufferPointer() {
 size_t MixerOutput::getBufferSize() const { return m_bufferSize; }
 
 size_t MixerOutput::getAvailableBytes() const {
-  const size_t writeOffset = m_writeOffset.load(std::memory_order_acquire);
-  const size_t readOffset = m_readOffset.load(std::memory_order_acquire);
-  if (writeOffset >= readOffset) {
-    return writeOffset - readOffset;
-  }
-  return m_bufferSize - (readOffset - writeOffset);
+  std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
+  return m_writeOffset.load(std::memory_order_relaxed) -
+         m_readOffset.load(std::memory_order_relaxed);
 }
 
 size_t MixerOutput::getReadOffset() const {
-  return m_readOffset.load(std::memory_order_acquire);
+  return m_bufferSize == 0 ? 0 : m_readOffset.load(std::memory_order_acquire) % m_bufferSize;
 }
 
 void MixerOutput::advanceReadPosition(size_t bytes) {
@@ -464,11 +440,11 @@ void MixerOutput::advanceReadPosition(size_t bytes) {
     return;
   }
 
-  const size_t available = getAvailableBytes();
+  std::lock_guard<MixerOutputMutex> lock(m_bufferMutex);
+  const uint64_t readOffset = m_readOffset.load(std::memory_order_relaxed);
+  const size_t available = m_writeOffset.load(std::memory_order_relaxed) - readOffset;
   const size_t toAdvance = std::min(bytes, available);
-  const size_t readOffset = m_readOffset.load(std::memory_order_relaxed);
-  m_readOffset.store((readOffset + toAdvance) % m_bufferSize,
-                     std::memory_order_release);
+  m_readOffset.store(readOffset + toAdvance, std::memory_order_release);
 
   if (toAdvance > 0) {
     m_notified.store(false, std::memory_order_release);
@@ -482,63 +458,14 @@ void MixerOutput::setDataCallback(MixerOutputDataCallback callback) {
 void MixerOutput::notificationThreadFunc() {
   while (!m_shouldStop.load()) {
     const size_t available = getAvailableBytes();
-
-    // Fixed-size PCM chunk mode: emit exactly m_chunkBytes at a time. The data
-    // is copied into a local contiguous buffer, the read position is advanced
-    // immediately, and the callback is invoked. Dart must not advance the
-    // circular buffer again for these chunks.
     if (m_chunkBytes > 0) {
-      if (available >= m_chunkBytes && !m_notified.load()) {
+      if (!m_notified.load() && notifyOnePacket(m_chunkBytes, m_chunkBytes))
         m_notified.store(true, std::memory_order_release);
-
-        size_t readOffset = m_readOffset.load(std::memory_order_relaxed);
-        size_t firstPart = std::min(m_chunkBytes, m_bufferSize - readOffset);
-        std::memcpy(m_chunkBuffer.data(), m_buffer.data() + readOffset,
-                    firstPart);
-
-        if (firstPart < m_chunkBytes) {
-          size_t secondPart = m_chunkBytes - firstPart;
-          std::memcpy(m_chunkBuffer.data() + firstPart, m_buffer.data(),
-                      secondPart);
-        }
-
-        const size_t newReadOffset =
-            (readOffset + m_chunkBytes) % m_bufferSize;
-        m_readOffset.store(newReadOffset, std::memory_order_release);
-
-        const MixerOutputDataCallback callback =
-            m_callback.load(std::memory_order_acquire);
-        if (callback != nullptr) {
-          callback(m_chunkBuffer.data(), m_chunkBytes);
-        }
-      }
-
-      if (available < m_chunkBytes) {
+      if (available < m_chunkBytes)
         m_notified.store(false, std::memory_order_release);
-      }
-
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
+    } else {
+      notifyOnePacket(m_notificationThreshold, 0);
     }
-
-    // Threshold-based mode (used by default and by compressed formats):
-    // notify when at least notificationThresholdBytes are available.
-    if (available >= m_notificationThreshold && !m_notified.load()) {
-      m_notified.store(true, std::memory_order_release);
-
-      const MixerOutputDataCallback callback =
-          m_callback.load(std::memory_order_acquire);
-      if (callback != nullptr) {
-        const size_t readOffset = m_readOffset.load(std::memory_order_relaxed);
-        const size_t length = std::min(available, m_bufferSize - readOffset);
-        callback(m_buffer.data() + readOffset, length);
-      }
-    }
-
-    if (available < m_notificationThreshold) {
-      m_notified.store(false, std::memory_order_release);
-    }
-
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
