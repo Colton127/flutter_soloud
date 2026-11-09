@@ -1600,7 +1600,7 @@ PlayerErrors Player::loadWaveform(
         sounds.push_back(std::make_unique<ActiveSound>());
         sounds.back().get()->completeFileName = "";
         sounds.back().get()->soundHash = hash;
-        auto basicWave = std::make_unique<Basicwave>((SoLoud::Soloud::WAVEFORM)waveform, superWave, detune, scale);
+        auto basicWave = std::make_unique<Basicwave>((SoLoud::Soloud::WAVEFORM)waveform, superWave, scale, detune);
         basicWave->setSamplerate(mSampleRate);
         sounds.back().get()->sound = std::move(basicWave);
         sounds.back().get()->soundType = TYPE_SYNTH;
