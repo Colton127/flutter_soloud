@@ -646,6 +646,7 @@ external int wasmGetFilterParamNames(
   int filterType,
   int paramsCountPtr,
   int namesPtr,
+  int capacity,
 );
 
 @JS('Module_soloud._addFilter')

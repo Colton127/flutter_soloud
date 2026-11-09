@@ -3901,21 +3901,33 @@ extern "C"
   /// Returns [PlayerErrors.noError] if no errors and the list of param names.
   FFI_PLUGIN_EXPORT enum PlayerErrors
   getFilterParamNames(enum FilterType filterType, int *paramsCount,
-                      char **names)
+                      char **names, int capacity)
   {
-    const PlayerPin pin(PlayerPinKind::operation);
+    if (paramsCount == nullptr || capacity < 0)
+      return invalidParameter;
     *paramsCount = 0;
+    const PlayerPin pin(PlayerPinKind::operation);
     if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    std::vector<std::string> pNames =
-        pin.get()->mFilters.getFilterParamNames(filterType);
+    const auto pNames = pin.get()->mFilters.getFilterParamNames(filterType);
     *paramsCount = static_cast<int>(pNames.size());
-    *names = (char *)malloc(sizeof(char *) * *paramsCount);
-    // printf("C  paramsCount: %p  **names: %p\n", paramsCount, names);
-    for (int i = 0; i < *paramsCount; i++)
+    // A null array queries the required capacity. Never write even the first
+    // pointer until the caller has provided space for the entire result.
+    if (names == nullptr)
+      return capacity == 0 ? noError : invalidParameter;
+    if (capacity < *paramsCount)
+      return invalidParameter;
+    for (int i = 0; i < *paramsCount; ++i)
     {
       names[i] = strdup(pNames[i].c_str());
-      printf("C  i: %d  names[i]: %s  names[i]: %p\n", i, names[i], names[i]);
+      if (names[i] == nullptr)
+      {
+        for (int j = 0; j < i; ++j) {
+          free(names[j]);
+          names[j] = nullptr;
+        }
+        return outOfMemory;
+      }
     }
     return noError;
   }

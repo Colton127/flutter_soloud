@@ -1123,10 +1123,13 @@ extern "C"
   /// Get parameters names of the given filter.
   ///
   /// [filterType] filter to get param names.
+  /// Pass names=nullptr and capacity=0 to query the required pointer count.
+  /// The caller supplies that many slots and frees each string with nativeFree.
+  /// Insufficient capacity returns invalidParameter without writing names.
   /// Returns [PlayerErrors.noError] if no errors and the list of param names.
   FFI_PLUGIN_EXPORT enum PlayerErrors
   getFilterParamNames(enum FilterType filterType, int *paramsCount,
-                      char **names);
+                      char **names, int capacity);
 
   /// Add the filter [filterType] to [soundHash]. If [soundHash]==0 the
   /// filter is added to global filters.

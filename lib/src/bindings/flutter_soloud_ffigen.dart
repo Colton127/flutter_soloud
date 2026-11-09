@@ -1758,20 +1758,23 @@ PlayerErrors isFilterActive(
     ffi.UnsignedInt,
     ffi.Pointer<ffi.Int>,
     ffi.Pointer<ffi.Pointer<ffi.Char>>,
+    ffi.Int,
   )
 >(symbol: 'getFilterParamNames')
 external int _getFilterParamNames(
   int filterType,
   ffi.Pointer<ffi.Int> paramsCount,
   ffi.Pointer<ffi.Pointer<ffi.Char>> names,
+  int capacity,
 );
 
 PlayerErrors getFilterParamNames(
   FilterType filterType,
   ffi.Pointer<ffi.Int> paramsCount,
   ffi.Pointer<ffi.Pointer<ffi.Char>> names,
+  int capacity,
 ) => PlayerErrors.fromValue(
-  _getFilterParamNames(filterType.value, paramsCount, names),
+  _getFilterParamNames(filterType.value, paramsCount, names, capacity),
 );
 
 /// Add the filter [filterType] to [soundHash]. If [soundHash]==0 the

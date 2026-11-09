@@ -1726,29 +1726,44 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   ({PlayerErrors error, List<String> names}) getFilterParamNames(
     FilterType filterType,
   ) {
-    final paramsCountPtr = wasmMalloc(4); // 4 bytes for an int32
-    final namesPtr = wasmMalloc(30 * 20); // list of 30 String with 20 chars
-    final e = wasmGetFilterParamNames(
-      filterType.index,
-      paramsCountPtr,
-      namesPtr,
-    );
-
-    final pNames = <String>[];
-    var offsetPtr = 0;
-    final paramsCount = wasmGetI32Value(paramsCountPtr, 'i32');
-    for (var i = 0; i < paramsCount; i++) {
-      final namePtr = wasmGetI32Value(namesPtr + offsetPtr, 'i32');
-      final name = wasmUtf8ToString(namePtr);
-      offsetPtr += name.length;
-
-      pNames.add(name);
+    final countPtr = wasmMalloc(4);
+    var namesPtr = 0;
+    var capacity = 0;
+    try {
+      var error = wasmGetFilterParamNames(filterType.index, countPtr, 0, 0);
+      if (error != PlayerErrors.noError.index) {
+        return (error: PlayerErrors.values[error], names: <String>[]);
+      }
+      capacity = wasmGetI32Value(countPtr, 'i32');
+      namesPtr = wasmMalloc(capacity * 4);
+      for (var i = 0; i < capacity; i++) {
+        wasmSetValue(namesPtr + i * 4, 0, 'i32');
+      }
+      error = wasmGetFilterParamNames(
+        filterType.index,
+        countPtr,
+        namesPtr,
+        capacity,
+      );
+      final result = <String>[];
+      if (error == PlayerErrors.noError.index) {
+        final count = wasmGetI32Value(countPtr, 'i32');
+        for (var i = 0; i < count; i++) {
+          result.add(
+            wasmUtf8ToString(wasmGetI32Value(namesPtr + i * 4, 'i32')),
+          );
+        }
+      }
+      return (error: PlayerErrors.values[error], names: result);
+    } finally {
+      if (namesPtr != 0) {
+        for (var i = 0; i < capacity; i++) {
+          wasmFree(wasmGetI32Value(namesPtr + i * 4, 'i32'));
+        }
+        wasmFree(namesPtr);
+      }
+      wasmFree(countPtr);
     }
-
-    final ret = (error: PlayerErrors.values[e], names: pNames);
-    wasmFree(namesPtr);
-    wasmFree(paramsCountPtr);
-    return ret;
   }
 
   @override

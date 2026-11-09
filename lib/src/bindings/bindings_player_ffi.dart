@@ -1661,38 +1661,33 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   ({PlayerErrors error, List<String> names}) getFilterParamNames(
     FilterType filterType,
   ) {
-    final ffi.Pointer<ffi.Int> paramsCount = calloc(ffi.sizeOf<ffi.Int>());
-    final ffi.Pointer<ffi.Pointer<ffi.Char>> names = calloc(
-      ffi.sizeOf<ffi.Char>() * 30,
-    );
-    _log.fine(
-      () =>
-          'PARAMS NAME paramsCount: ${paramsCount.address.toRadixString(16)}  '
-          'names: ${names.address.toRadixString(16)}',
-    );
-
-    final e = native.getFilterParamNames(
-      native.FilterType.fromValue(filterType.index),
-      paramsCount,
-      names,
-    );
-    final pNames = <String>[];
-    for (var i = 0; i < paramsCount.value; i++) {
-      _log.fine(
-        () =>
-            'PARAMS NAME $i ${names + i}   '
-            '${names[i].cast<Utf8>().toDartString()}    '
-            'names[i]: ${names[i].address.toRadixString(16)}',
-      );
-      pNames.add(names[i].cast<Utf8>().toDartString());
+    final count = calloc<ffi.Int>();
+    var names = ffi.nullptr.cast<ffi.Pointer<ffi.Char>>();
+    var capacity = 0;
+    try {
+      final type = native.FilterType.fromValue(filterType.index);
+      var error = native.getFilterParamNames(type, count, names, 0);
+      if (error != native.PlayerErrors.noError) {
+        return (error: PlayerErrors.values[error.value], names: <String>[]);
+      }
+      capacity = count.value;
+      names = calloc<ffi.Pointer<ffi.Char>>(capacity);
+      error = native.getFilterParamNames(type, count, names, capacity);
+      final result = <String>[];
+      if (error == native.PlayerErrors.noError) {
+        for (var i = 0; i < count.value; i++) {
+          result.add(names[i].cast<Utf8>().toDartString());
+        }
+      }
+      return (error: PlayerErrors.values[error.value], names: result);
+    } finally {
+      for (var i = 0; names != ffi.nullptr && i < capacity; i++) {
+        nativeFree(names[i].cast<ffi.Void>());
+      }
+      calloc
+        ..free(names)
+        ..free(count);
     }
-    final ret = (error: PlayerErrors.values[e.value], names: pNames);
-    calloc.free(paramsCount);
-    for (var i = 0; i < pNames.length; i++) {
-      calloc.free(names[i]);
-    }
-    calloc.free(names);
-    return ret;
   }
 
   @override
