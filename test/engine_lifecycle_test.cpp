@@ -57,6 +57,7 @@
 #include "audiobuffer/metadata_ffi.h"
 #include "device_lifecycle_test_hooks.h"
 #include "enums.h"
+#include "filters/parametric_eq_filter.h"
 #include "native_stream/native_stream_source.h"
 
 #include <atomic>
@@ -971,6 +972,35 @@ void testZeroFilterParameterReadsBack()
     EXPECT(error == filterNotFound,
            "a missing filter should be filterNotFound, got %d",
            static_cast<int>(error));
+
+    // Frequency values can legitimately equal the old missing-filter sentinel.
+    EXPECT(addFilter(hash, 0, ParametricEQFilter) == noError, "add voice EQ");
+    EXPECT(setFilterParams(handle, 0, ParametricEQFilter,
+                           ParametricEq::BAND_FREQ_OFFSET, 9999.0f) == noError,
+           "set voice EQ frequency");
+    error = getFilterParams(handle, 0, ParametricEQFilter,
+                            ParametricEq::BAND_FREQ_OFFSET, &value);
+    EXPECT(error == noError && value == 9999.0f,
+           "voice frequency 9999 must exist, error %d value %f", int(error), value);
+    EXPECT(addFilter(0, busId, ParametricEQFilter) == noError, "add bus EQ");
+    EXPECT(setFilterParams(0, busId, ParametricEQFilter,
+                           ParametricEq::BAND_FREQ_OFFSET, 9999.0f) == noError,
+           "set bus EQ frequency");
+    error = getFilterParams(0, busId, ParametricEQFilter,
+                            ParametricEq::BAND_FREQ_OFFSET, &value);
+    EXPECT(error == noError && value == 9999.0f,
+           "bus frequency 9999 must exist, error %d value %f", int(error), value);
+    error = getFilterParams(0, busId, LofiFilter, 0, &value);
+    EXPECT(error == filterNotFound, "missing bus filter status");
+    error = getFilterParams(0, 0, LofiFilter, 0, &value);
+    EXPECT(error == filterNotFound, "missing global filter status");
+    EXPECT(addFilter(0, 0, ParametricEQFilter) == noError, "add global EQ");
+    EXPECT(setFilterParams(0, 0, ParametricEQFilter,
+                           ParametricEq::BAND_FREQ_OFFSET, 9999.0f) == noError,
+           "set global EQ frequency");
+    error = getFilterParams(0, 0, ParametricEQFilter,
+                            ParametricEq::BAND_FREQ_OFFSET, &value);
+    EXPECT(error == noError && value == 9999.0f, "global frequency 9999 must exist");
 
     resetGlobalState();
 }

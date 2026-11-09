@@ -1877,8 +1877,8 @@ PlayerErrors setFilterParams(
 /// [busId] the bus to check the filter.
 /// If both [handle] and [busId] are =0 this function searches in the global
 /// filters.
-/// [filterType] filter to modify a param. Returns the value of param or
-/// 9999.0 if the filter is not found.
+/// [filterType] filter to read a param from. A missing filter is reported
+/// through filterNotFound, independently of its parameter values.
 @ffi.Native<
   ffi.UnsignedInt Function(
     ffi.UnsignedInt,

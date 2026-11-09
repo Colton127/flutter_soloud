@@ -276,14 +276,16 @@ void Filters::setFilterParams(SoLoud::handle handle, FilterType filterType,
   }
 }
 
-float Filters::getFilterParams(SoLoud::handle handle, FilterType filterType,
-                               int attributeId) {
-  int index = isFilterActive(filterType);
+bool Filters::getFilterParams(SoLoud::handle handle, FilterType filterType,
+                              int attributeId, float &value) {
+  const int index = isFilterActive(filterType);
   if (index < 0)
-    return 9999.0f;
+    return false;
 
-  float ret = mSoloud->getFilterParameter(handle, index, attributeId);
-  return ret;
+  // Parameter ranges can contain any previously used sentinel, including
+  // an EQ frequency of 9999 Hz. Keep presence separate from the scalar.
+  value = mSoloud->getFilterParameter(handle, index, attributeId);
+  return true;
 }
 
 void Filters::fadeFilterParameter(SoLoud::handle handle, FilterType filterType,

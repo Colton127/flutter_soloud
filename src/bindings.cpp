@@ -4111,8 +4111,8 @@ extern "C"
   /// filter.
   /// [busId] the bus to check the filter.
   /// If both [handle] and [busId] are =0 this function searches in the global filters.
-  /// [filterType] filter to modify a param. Returns the value of param or
-  /// 9999.0 if the filter is not found.
+  /// [filterType] filter to read a param from. A missing filter is reported
+  /// through filterNotFound, independently of its parameter values.
   FFI_PLUGIN_EXPORT enum PlayerErrors getFilterParams(unsigned int handle,
                                                       unsigned int busId,
                                                       enum FilterType filterType,
@@ -4123,46 +4123,25 @@ extern "C"
     *filterValue = 9999.0f;
     if (pin.get() == nullptr || !pin.get()->isInited())
       return backendNotInited;
-    /// If [handle] == 0 get the parameter from global filters else from
-    /// the sound which owns [handle].
+    const auto read = [&](Filters &filters, unsigned int voice) -> PlayerErrors
+    {
+      if (!filters.getFilterParams(voice, filterType, attributeId, *filterValue))
+        return filterNotFound;
+      return std::isfinite(*filterValue) ? noError : filterParameterGetError;
+    };
     if (handle == 0 && busId == 0)
+      return read(pin.get()->mFilters, 0);
+    if (busId > 0)
     {
-      *filterValue =
-          pin.get()->mFilters.getFilterParams(handle, filterType, attributeId);
-      return noError;
+      return pin.get()->useBusData(busId, [&](BusData &bus)
+      {
+        return read(bus.filters, handle > 0 ? handle : bus.handle);
+      });
     }
-    else
+    return pin.get()->useSoundByHandle(handle, [&](ActiveSound &sound)
     {
-      if (busId > 0)
-      {
-        return pin.get()->useBusData(busId, [&](BusData &bus)
-        {
-          *filterValue =
-              bus.filters.getFilterParams(handle > 0 ? handle : bus.handle, filterType, attributeId);
-          // Zero is a valid parameter value, including a completely dry filter.
-          if (!std::isfinite(*filterValue))
-            return filterParameterGetError;
-          if (*filterValue == 9999.0f)
-            return filterNotFound;
-          return noError;
-        });
-      }
-      else
-      {
-        return pin.get()->useSoundByHandle(
-            handle, [&](ActiveSound &s)
-            {
-              *filterValue =
-                  s.filters->getFilterParams(handle, filterType, attributeId);
-              if (!std::isfinite(*filterValue))
-                return filterParameterGetError;
-              if (*filterValue == 9999.0f)
-                return filterNotFound;
-              return noError;
-            });
-      }
-    }
-    return PlayerErrors::noError;
+      return read(*sound.filters, handle);
+    });
   }
 
   /// Fades a parameter of a filter.
