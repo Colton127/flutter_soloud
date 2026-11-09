@@ -3833,10 +3833,11 @@ extern "C"
       }
       else
       {
-        auto *busData = pin.get()->findBusData(busId);
-        if (busData == nullptr)
-          return busIdNotFound;
-        *index = busData->filters.isFilterActive(filterType);
+        return pin.get()->useBusData(busId, [&](BusData &bus)
+        {
+          *index = bus.filters.isFilterActive(filterType);
+          return noError;
+        });
       }
     }
 
@@ -3894,11 +3895,11 @@ extern "C"
     }
     else
     {
-      auto *busFilters = pin.get()->findBusData(busId);
-      if (busFilters == nullptr)
-        return busIdNotFound;
-      return busFilters->filters.addFilter(filterType);
-    }
+      return pin.get()->useBusData(busId, [&](BusData &bus)
+        {
+          return bus.filters.addFilter(filterType);
+        });
+      }
     return PlayerErrors::noError;
   }
 
@@ -3935,11 +3936,12 @@ extern "C"
       }
       else
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
-          return busIdNotFound;
-        if (!busFilters->filters.removeFilter(filterType))
-          return filterNotFound;
+        return pin.get()->useBusData(busId, [&](BusData &bus)
+        {
+          if (!bus.filters.removeFilter(filterType))
+            return filterNotFound;
+          return noError;
+        });
       }
     }
 
@@ -3976,15 +3978,11 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
-          return busIdNotFound;
-        }
-        else
-        {
-          busFilters->filters.setFilterParams(handle > 0 ? handle : busFilters->handle, filterType, attributeId, value);
-        }
+          bus.filters.setFilterParams(handle > 0 ? handle : bus.handle, filterType, attributeId, value);
+          return noError;
+        });
       }
       else if (handle > 0)
       {
@@ -4030,22 +4028,17 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
-        {
-          return busIdNotFound;
-        }
-        else
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
           *filterValue =
-              busFilters->filters.getFilterParams(handle > 0 ? handle : busFilters->handle, filterType, attributeId);
+              bus.filters.getFilterParams(handle > 0 ? handle : bus.handle, filterType, attributeId);
           // Zero is a valid parameter value, including a completely dry filter.
           if (!std::isfinite(*filterValue))
             return filterParameterGetError;
           if (*filterValue == 9999.0f)
             return filterNotFound;
           return noError;
-        }
+        });
       }
       else
       {
@@ -4092,17 +4085,13 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
-          return busIdNotFound;
-        }
-        else
-        {
-          busFilters->filters.fadeFilterParameter(handle > 0 ? handle : busFilters->handle,
-                                                  filterType, attributeId, to,
-                                                  time);
-        }
+          bus.filters.fadeFilterParameter(handle > 0 ? handle : bus.handle,
+              filterType, attributeId, to,
+              time);
+          return noError;
+        });
       }
       else
       {
@@ -4146,17 +4135,13 @@ extern "C"
     {
       if (busId > 0)
       {
-        auto *busFilters = pin.get()->findBusData(busId);
-        if (busFilters == nullptr)
+        return pin.get()->useBusData(busId, [&](BusData &bus)
         {
-          return busIdNotFound;
-        }
-        else
-        {
-          busFilters->filters.oscillateFilterParameter(handle > 0 ? handle : busFilters->handle,
-                                                       filterType, attributeId,
-                                                       from, to, time);
-        }
+          bus.filters.oscillateFilterParameter(handle > 0 ? handle : bus.handle,
+              filterType, attributeId,
+              from, to, time);
+          return noError;
+        });
       }
       else
       {

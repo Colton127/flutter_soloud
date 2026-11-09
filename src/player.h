@@ -1137,7 +1137,11 @@ public:
   float busGetApproximateVolume(unsigned int busId, unsigned int channel);
   void busAnnexSound(unsigned int busId, unsigned int voiceHandle);
   unsigned int busGetActiveVoiceCount(unsigned int busId);
+  /// Raw lookup requires sounds_mutex to remain held through use.
   BusData *findBusData(unsigned int busId);
+  /// Pin a bus for an export, including any filter or audio-mutex operations.
+  PlayerErrors useBusData(
+      unsigned int busId, const std::function<PlayerErrors(BusData &)> &use);
 
 public:
   /// The type of sounds_mutex: a recursive mutex that, whenever a thread

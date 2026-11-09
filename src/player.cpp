@@ -4491,6 +4491,10 @@ void Player::set3dSourceDopplerFactor(
 
 unsigned int Player::createBus()
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     unsigned int id = ++busIdCounter;
     busMap.try_emplace(id, id, &soloud);
     return id;
@@ -4498,6 +4502,10 @@ unsigned int Player::createBus()
 
 void Player::destroyBus(unsigned int busId)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     busMap.erase(busId);
     evaluateAudioDeviceIdle();
 }
@@ -4505,6 +4513,10 @@ void Player::destroyBus(unsigned int busId)
 PlayerErrors Player::busPlayOnEngine(unsigned int busId, float volume,
                                      bool paused, unsigned int &handle)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     handle = 0;
 
     if (!mInited.load(std::memory_order_acquire))
@@ -4539,6 +4551,10 @@ PlayerErrors Player::busPlayOnEngine(unsigned int busId, float volume,
 
 int Player::busSetChannels(unsigned int busId, unsigned int channels)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return -1; // bus not found
@@ -4565,6 +4581,10 @@ PlayerErrors Player::busSetVisualizationEnabled(unsigned int busId,
                                                 VisualizationKind kind,
                                                 int channel)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return busIdNotFound;
@@ -4594,6 +4614,10 @@ PlayerErrors Player::busSetVisualizationEnabled(unsigned int busId,
 
 bool Player::busIsVisualizationEnabled(unsigned int busId)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return false;
@@ -4604,6 +4628,10 @@ bool Player::busIsVisualizationEnabled(unsigned int busId)
 float Player::busGetApproximateVolume(unsigned int busId,
                                       unsigned int channel)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end() || !it->second.analyzer)
         return 0.0f;
@@ -4612,6 +4640,10 @@ float Player::busGetApproximateVolume(unsigned int busId,
 
 void Player::busAnnexSound(unsigned int busId, unsigned int voiceHandle)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return;
@@ -4620,6 +4652,10 @@ void Player::busAnnexSound(unsigned int busId, unsigned int voiceHandle)
 
 unsigned int Player::busGetActiveVoiceCount(unsigned int busId)
 {
+    // Bus entries share the sound lifetime lock; a play keeps the same lock
+    // from lookup through its last use of the bus. Lifecycle requests defer
+    // until the outermost SoundsLock releases it.
+    SoundsLock lock(sounds_mutex, *this);
     auto it = busMap.find(busId);
     if (it == busMap.end())
         return 0;
@@ -4633,4 +4669,13 @@ BusData *Player::findBusData(unsigned int busId)
     if (it == busMap.end())
         return nullptr;
     return &it->second;
+}
+
+PlayerErrors Player::useBusData(
+    unsigned int busId, const std::function<PlayerErrors(BusData &)> &use)
+{
+    SoundsLock lock(sounds_mutex, *this);
+    BusData *const bus = findBusData(busId);
+    if (bus == nullptr) return busIdNotFound;
+    return use(*bus);
 }
