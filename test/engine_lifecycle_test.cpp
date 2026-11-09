@@ -99,6 +99,8 @@ extern "C"
                                         int chunkPCMFrames);
     void stopMixerCapture();
     int isMixerCaptureRunning();
+    enum PlayerErrors isFilterActive(unsigned int, unsigned int,
+                                     enum FilterType, int *);
     enum PlayerErrors addFilter(unsigned int soundHash, unsigned int busId,
                                 enum FilterType filterType);
     enum PlayerErrors setFilterParams(unsigned int handle, unsigned int busId,
@@ -914,6 +916,29 @@ void testCaptureRefusesAFormatTheMixDoesNotProduce()
            "a capture following the engine's format (-1) should start");
     stopMixerCapture();
 
+    resetGlobalState();
+}
+
+/// disposeAllSound() detaches every global filter from the engine. The
+/// global filter list must forget them too: otherwise the filter is reported
+/// active while nothing applies it, and adding it again is refused.
+void testDisposeAllSoundsClearsGlobalFilters()
+{
+    resetGlobalState();
+    if (!initEngineAs(kEngineA)) {
+        EXPECT(false, "global dispose filter test init");
+        return;
+    }
+    registerCallbacksFor(kEngineA);
+    EXPECT(addFilter(0, 0, EchoFilter) == noError, "add global filter before dispose");
+    int index = -1;
+    EXPECT(isFilterActive(0, 0, EchoFilter, &index) == noError && index == 0,
+           "global filter active before dispose");
+    disposeAllSound();
+    EXPECT(isFilterActive(0, 0, EchoFilter, &index) == noError && index == -1,
+           "disposed global filter must be absent, index %d", index);
+    EXPECT(addFilter(0, 0, EchoFilter) == noError,
+           "global filter can be added after disposing all sounds");
     resetGlobalState();
 }
 
@@ -2743,6 +2768,7 @@ int main()
     testTeardownDuringActiveMixerCapture();
     testCaptureRefusesAFormatTheMixDoesNotProduce();
     testZeroFilterParameterReadsBack();
+    testDisposeAllSoundsClearsGlobalFilters();
     testStaleVoiceEndedEventSparesTheNewSession();
     testRetirementWhileVisualizationsDispatch();
     testRetirementSparesWhatANewerRegistrationStarted();

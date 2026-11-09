@@ -37,6 +37,9 @@ public:
 
   bool removeFilter(FilterType filterType);
 
+  /// Discard owners after every live instance has been detached by the caller.
+  void clearDetachedFilters() { filters.clear(); }
+
   std::vector<std::string> getFilterParamNames(FilterType filterType);
 
   /// If [handle]==0 the operation is done to global filters.

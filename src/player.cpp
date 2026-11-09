@@ -3560,6 +3560,10 @@ void Player::destroyAllSounds()
             soloud.setGlobalFilter(i, nullptr);
         }
 
+        // The engine slots no longer refer to these filters. Remove their
+        // owners too, so the public filter list agrees with the audible state.
+        mFilters.clearDetachedFilters();
+
         // Move all sounds out to destroy them after releasing the lock
         soundsToDestroy = std::move(sounds);
         sounds.clear();
