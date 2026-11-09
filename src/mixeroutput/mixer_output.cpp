@@ -457,12 +457,10 @@ void MixerOutput::setDataCallback(MixerOutputDataCallback callback) {
 
 void MixerOutput::notificationThreadFunc() {
   while (!m_shouldStop.load()) {
-    const size_t available = getAvailableBytes();
     if (m_chunkBytes > 0) {
-      if (!m_notified.load() && notifyOnePacket(m_chunkBytes, m_chunkBytes))
-        m_notified.store(true, std::memory_order_release);
-      if (available < m_chunkBytes)
-        m_notified.store(false, std::memory_order_release);
+      // A fixed chunk is consumed here, so it needs no Dart acknowledgement.
+      // Drain every complete chunk; a threshold latch would strand a backlog.
+      while (!m_shouldStop.load() && notifyOnePacket(m_chunkBytes, m_chunkBytes)) {}
     } else {
       notifyOnePacket(m_notificationThreshold, 0);
     }

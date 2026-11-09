@@ -173,6 +173,56 @@ void oversizedWriteStaysInsideTheRing()
     capture().stop();
 }
 
+std::mutex gChunkMutex;
+std::vector<std::vector<float>> gChunks; // copied when the callback runs
+
+void copyChunk(uint8_t *data, size_t length)
+{
+    std::vector<float> chunk(length / sizeof(float));
+    std::memcpy(chunk.data(), data, chunk.size() * sizeof(float));
+    std::lock_guard<std::mutex> lock(gChunkMutex);
+    gChunks.push_back(std::move(chunk));
+}
+
+size_t chunkCount()
+{
+    std::lock_guard<std::mutex> lock(gChunkMutex);
+    return gChunks.size();
+}
+
+void everyBufferedChunkIsDelivered()
+{
+    std::printf("fixed chunks: every buffered chunk is delivered, in order\n");
+    constexpr int kChunkFrames = 2048;
+    constexpr size_t kChunkFloats = kChunkFrames * kChannels;
+    {
+        std::lock_guard<std::mutex> lock(gChunkMutex);
+        gChunks.clear();
+    }
+    capture().setDataCallback(copyChunk);
+    EXPECT(startPcm(1 << 20, 4096, kChunkFrames) == noError, "chunks: start");
+    float next = 0;
+    // Three chunks in one callback: a device period of 6144 frames, or a
+    // notification thread that ran late. All three are buffered at once.
+    feed(3 * kChunkFrames, next);
+    EXPECT(waitFor([] { return chunkCount() >= 3; }, 2000),
+           "chunks: all 3 buffered chunks must be delivered, got %zu", chunkCount());
+    // And the stream keeps going afterwards.
+    feed(kChunkFrames, next);
+    EXPECT(waitFor([] { return chunkCount() >= 4; }, 2000),
+           "chunks: a 4th chunk must follow, got %zu", chunkCount());
+    capture().setDataCallback(nullptr);
+    capture().stop();
+    std::lock_guard<std::mutex> lock(gChunkMutex);
+    for (size_t c = 0; c < gChunks.size(); ++c)
+    {
+        bool inOrder = gChunks[c].size() == kChunkFloats;
+        for (size_t i = 0; inOrder && i < kChunkFloats; ++i)
+            inOrder = gChunks[c][i] == static_cast<float>(c * kChunkFloats + i);
+        EXPECT(inOrder, "chunks: chunk %zu must hold samples %zu.. in order", c, c * kChunkFloats);
+    }
+}
+
 void surroundDefaultKeepsWholeFrames()
 {
     constexpr int channels = 6;
@@ -235,6 +285,7 @@ int main(int argc, char **argv) {
     if (wanted("fill")) exactFillKeepsEveryByte();
     if (wanted("overrun")) overrunKeepsTheNewestBytes();
     if (wanted("oversized")) oversizedWriteStaysInsideTheRing();
+    if (wanted("chunks")) everyBufferedChunkIsDelivered();
     if (wanted("surround")) surroundDefaultKeepsWholeFrames();
     if (gFailures == 0)
         std::printf("All %d assertions passed.\n", gAssertions);
