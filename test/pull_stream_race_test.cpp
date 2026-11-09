@@ -539,6 +539,30 @@ void resetWaitsForTheMixerReading()
     (void)voice;
 }
 
+// Reading the range must not depend on which half of a mixer's read/count
+// update it observes. It must also return while the mixer is parked, without
+// taking the audio mutex merely to obtain a consistent range.
+void rangeStaysStableDuringAnUnaccountedRead()
+{
+    const char *what = "buffered range during an unaccounted read";
+    const auto hash = createStream(what, PCM_F32LE, pcmBytes(1), 64u << 20);
+    playStream(what, hash, false);
+    soloud_test::armBarrier(DeviceBarrier::pullSamplesRead);
+    const std::vector<float> pcm(kSampleRate * kChannels, 0.125f);
+    EXPECT(addPullBufferDataStream(hash,
+               reinterpret_cast<const unsigned char *>(pcm.data()),
+               pcm.size() * sizeof(float), 0) == noError, "range: feed PCM");
+    if (!waitBarrierReachedFor(DeviceBarrier::pullSamplesRead, kProgressMs))
+        endRun("mixer never reached the unaccounted circular read");
+    double start = -1, end = -1;
+    const auto result = getPullBufferTimeRange(hash, &start, &end);
+    EXPECT(result == noError && std::fabs(start) < 1e-9 && std::fabs(end - 1) < 1e-9,
+           "range: an unaccounted read must keep [0,1], got [%.9f,%.9f]", start, end);
+    soloud_test::releaseBarrier(DeviceBarrier::pullSamplesRead);
+    disposeSound(hash);
+    expectNothingLeft(what);
+}
+
 /// Set on the thread a test delivers from, so the callbacks below re-enter
 /// the stream only there (see callbacksCanReenterTheStream()).
 thread_local bool tReentrantDelivery = false;
@@ -858,7 +882,7 @@ int main(int argc, char **argv)
 
     const char *only = argc > 1 ? argv[1] : nullptr;
     const char *const kScenarios[] = {"seek", "rewind", "reset",
-                                       "callbacks", "stress", "read-reset"};
+                                       "callbacks", "stress", "read-reset", "range"};
     if (only != nullptr)
     {
         bool known = false;
@@ -868,7 +892,7 @@ int main(int argc, char **argv)
         {
             std::fprintf(stderr,
                          "Unknown scenario '%s': use seek, rewind, reset, "
-                         "callbacks, read-reset or stress.\n",
+                         "callbacks, read-reset, range or stress.\n",
                          only);
             return 2;
         }
@@ -890,6 +914,8 @@ int main(int argc, char **argv)
         return std::getenv("SOLOUD_LIFECYCLE_TEST_ALLOW_NO_DEVICE") ? 0 : 1;
     }
 
+    if (wanted("range"))
+        rangeStaysStableDuringAnUnaccountedRead();
     if (wanted("seek"))
         seekKeepsADeliveryOut(10.0);
     if (wanted("rewind"))
