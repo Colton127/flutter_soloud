@@ -644,8 +644,12 @@ double PullBufferStream::getBufferEndTimeLocked() const {
   const unsigned int sampleRate = mPCMformat.sampleRate;
   const unsigned int channels = mPCMformat.channels;
   if (sampleRate == 0 || channels == 0) return 0.0;
-  const double endTime = static_cast<double>(mDecodedSamplesRead +
-                                              mCircularBuffer.available()) /
+  // Consumption removes ring samples before publishing its read count, so
+  // summing those two independently sampled values can temporarily shrink
+  // the range. Both the written count and backlog are protected by the decode
+  // mutex held here; their difference is the stable decoded end in the ring.
+  const double endTime = static_cast<double>(mDecodedSamplesWritten -
+                                              mDecodedBacklog.size()) /
                          static_cast<double>(sampleRate * channels);
   const double totalLength = getLengthLocked();
   if (totalLength > 0.0) {

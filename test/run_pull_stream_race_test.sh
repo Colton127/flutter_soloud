@@ -18,7 +18,7 @@
 #
 # Pass --asan to build under AddressSanitizer, or --tsan to build under
 # ThreadSanitizer. A scenario name after it (seek, rewind, reset, read-reset,
-# replay, callbacks or stress) runs only that scenario.
+# replay, range, callbacks or stress) runs only that scenario.
 
 set -e
 
