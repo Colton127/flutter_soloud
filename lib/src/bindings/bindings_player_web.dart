@@ -265,11 +265,13 @@ class FlutterSoLoudWeb extends FlutterSoLoud {
   void stopMixerOutputCapture() {
     final id = _mixerCaptureId;
     _mixerCaptureId = null;
-    _stoppedMixerOutput = Uint8List(0);
     if (id == null) {
       wasmStopMixerCapture();
       return;
     }
+    // Only a stop that drains a capture of its own replaces the snapshot: a
+    // lifecycle stop may already have saved output for the stream manager.
+    _stoppedMixerOutput = Uint8List(0);
     final lengthPtr = wasmMalloc(4);
     var ptr = 0;
     try {

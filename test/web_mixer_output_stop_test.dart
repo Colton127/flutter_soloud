@@ -33,4 +33,30 @@ void main() {
     expect(received, orderedEquals([...chunk, ...tail]));
     await sub.cancel();
   });
+
+  test(
+    'a capture stopped by deinit still reaches the stream on its stop',
+    () async {
+      final module = WebCaptureModule();
+      final bindings = FlutterSoLoudWeb();
+      await bindings.setDartEventCallbacks();
+      final manager = MixerOutputStreamManager(
+        bindings: bindings,
+        isReady: () => true,
+      );
+      final received = <int>[];
+      final sub = manager.start(chunkPCMFrames: 2048).listen(received.addAll);
+      final chunk = Uint8List.fromList(List.generate(2048 * 8, (i) => i & 255));
+      module
+        ..queue(chunk)
+        ..setTail(Uint8List.fromList([9, 8, 7, 6, 5, 4, 3, 2]));
+      // SoLoud.deinit() stops the capture through the bindings, not through the
+      // stream manager; the stream stays open until the app stops it.
+      bindings.stopMixerOutputCapture();
+      manager.stop();
+      await Future<void>.delayed(Duration.zero);
+      expect(received, orderedEquals([...chunk, 9, 8, 7, 6, 5, 4, 3, 2]));
+      await sub.cancel();
+    },
+  );
 }

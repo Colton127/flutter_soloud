@@ -412,11 +412,13 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
   void stopMixerOutputCapture() {
     final id = _mixerCaptureId;
     _mixerCaptureId = null;
-    _stoppedMixerOutput = Uint8List(0);
     if (id == null) {
       native.stopMixerCapture();
       return;
     }
+    // Only a stop that drains a capture of its own replaces the snapshot: a
+    // lifecycle stop may already have saved output for the stream manager.
+    _stoppedMixerOutput = Uint8List(0);
     final length = calloc<ffi.Size>();
     var ptr = ffi.nullptr.cast<ffi.UnsignedChar>();
     try {
