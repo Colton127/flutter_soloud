@@ -457,7 +457,11 @@ void MP3DecoderWrapper::prepareForSeek(uint64_t targetSample, uint64_t byteOffse
 }
 
 bool MP3DecoderWrapper::canSeekToTime(double seconds) const {
-  return !mSeekPoints.empty() && m_seekTableSampleRate != 0 && seconds > 0.0;
+  if (mSeekPoints.empty() || m_seekTableSampleRate == 0 || !(seconds > 0.0))
+    return false;
+  const double frame = seconds * m_seekTableSampleRate;
+  return frame >= mSeekPoints.front().pcmFrameIndex &&
+         frame <= mSeekPoints.back().pcmFrameIndex;
 }
 
 uint64_t MP3DecoderWrapper::timeToByteOffset(double seconds) {
@@ -467,6 +471,11 @@ uint64_t MP3DecoderWrapper::timeToByteOffset(double seconds) {
   if (mSeekPoints.empty()) {
     return 0;
   }
+
+  // EOF cannot extend a table built from an earlier prefix. An uncovered
+  // target must use the pull stream's fallback instead of the prefix's last
+  // seek point, even when all encoded bytes have since been delivered.
+  if (!canSeekToTime(seconds)) return 0;
 
   const uint64_t targetFrame = static_cast<uint64_t>(
       std::floor(seconds * m_seekTableSampleRate));
@@ -482,11 +491,6 @@ uint64_t MP3DecoderWrapper::timeToByteOffset(double seconds) {
     return 0;
   }
   const drmp3_seek_point &best = *(it - 1);
-
-  // Block out-of-buffer seeks until the table covers the target.
-  if (targetFrame > mSeekPoints.back().pcmFrameIndex && !mDataEnded) {
-    return 0;
-  }
 
   return m_seekTableBaseOffset + best.seekPosInBytes;
 }
