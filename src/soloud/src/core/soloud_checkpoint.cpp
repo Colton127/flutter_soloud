@@ -357,15 +357,11 @@ namespace SoLoud
 		cp.mVoices.clear();
 		cp.mSerial = mCheckpointCounter;
 		cp.mTime = mStreamTime;
-		if (mSamplerate > 0)
-		{
-			long long framesMixed = (long long)floor(mStreamTime * (time)mSamplerate + 0.5);
-			cp.mRingWritePosition = (unsigned long long)(framesMixed >= 0 ? framesMixed : 0);
-		}
-		else
-		{
-			cp.mRingWritePosition = 0;
-		}
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		// The sample clock accumulates rounded durations. Reconstructing frame
+		// positions from it eventually shifts a boundary by a frame, causing
+		// rollback to render an extra quantum. Keep the exact counter instead.
+		cp.mRingWritePosition = mMixFramePosition;
 
 		// Engine-level POD state.
 		cp.mGlobalVolume = mGlobalVolume;
@@ -528,6 +524,8 @@ namespace SoLoud
 		// checkpoint must keep their ids, so restore takes the max instead of
 		// rolling the counter back (which would reissue existing handles).
 		mStreamTime = cp.mTime;
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		mMixFramePosition = cp.mRingWritePosition;
 		mGlobalVolume = cp.mGlobalVolume;
 		mGlobalVolumeFader = cp.mGlobalVolumeFader;
 		// Voices created after the checkpoint are left running (Phase 2

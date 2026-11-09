@@ -688,7 +688,11 @@ namespace SoLoud
 
 
 	void Soloud::postinit_internal(unsigned int aSamplerate, unsigned int aBufferSize, unsigned int aFlags, unsigned int aChannels)
-	{		
+	{
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		// Reset on every init, including reuse after deinit or a failed init.
+		// The new ring and its initial checkpoint must share the same origin.
+		mMixFramePosition = 0;
 		mGlobalVolume = 1;
 		mChannels = aChannels;
 		mSamplerate = aSamplerate;
@@ -882,8 +886,10 @@ namespace SoLoud
 		while (mRenderRing.availableToRead() < mRenderAheadFrames &&
 			mRenderRing.availableToWrite() >= mBufferSize)
 		{
-			mix(mRenderRingStaging.mData, mBufferSize);
-			mRenderRing.write(mRenderRingStaging.mData, mBufferSize);
+			// ###### flutter_soloud local patch (atomic render publication) ######
+			// The clock, output conversion and ring write are one transaction.
+			// A rollback must never see a clock ahead of the published audio.
+			mix_internal(mBufferSize, (mBufferSize + 15) & ~0xf, true);
 		}
 	}
 
@@ -2406,7 +2412,7 @@ namespace SoLoud
 			captureMixCheckpoint_internal();
 	}
 
-	void Soloud::mix_internal(unsigned int aSamples, unsigned int aStride)
+	void Soloud::mix_internal(unsigned int aSamples, unsigned int aStride, bool aPublishRing)
 	{
 #ifdef FLOATING_POINT_DEBUG
 		// This needs to be done in the audio thread as well..
@@ -2475,6 +2481,8 @@ namespace SoLoud
 		// applyQueuedSeeks_internal).
 		lockAudioMutex_internal(true);
 		mStreamTime += buffertime;
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		mMixFramePosition += aSamples;
 
 		globalVolume[0] = mGlobalVolume;
 		if (mGlobalVolumeFader.mActive)
@@ -2485,22 +2493,9 @@ namespace SoLoud
 
 		mixVoicesLocked_internal(aSamples, aStride);
 
-		const bool notifyVoiceInactive = mVoiceInactiveCallbackPending;
-		mVoiceInactiveCallbackPending = false;
-		unlockAudioMutex_internal();
-
-		// ###### flutter_soloud local patch (non-blocking idle request) ######
-		// A notification the callback could not act on after an earlier block
-		// is made again now (see _voiceInactiveCallback).
-		const bool retryVoiceInactive =
-			mVoiceInactiveCallbackRetry.load(std::memory_order_relaxed) &&
-			mVoiceInactiveCallbackRetry.exchange(false, std::memory_order_acq_rel);
-		auto voiceInactiveCallback =
-			_voiceInactiveCallback.load(std::memory_order_acquire);
-		if ((notifyVoiceInactive || retryVoiceInactive) &&
-			voiceInactiveCallback != nullptr && !voiceInactiveCallback())
-			mVoiceInactiveCallbackRetry.store(true, std::memory_order_release);
-		
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		// Retain the mutex through clipping: a rollback uses these same scratch
+		// buffers. Publishing a ring quantum below must precede the unlock too.
 		// Note: clipping channels*aStride, not channels*aSamples, so we're possibly clipping some unused data.
 		// The buffers should be large enough for it, we just may do a few bytes of unneccessary work.
 		clip_internal(mOutputScratch, mScratch, aStride, globalVolume[0], globalVolume[1]);
@@ -2549,6 +2544,30 @@ namespace SoLoud
 				}
 			}
 		}
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		if (aPublishRing)
+		{
+			interlace_samples_float(mScratch.mData, mRenderRingStaging.mData,
+				aSamples, mChannels, aStride);
+			mRenderRing.write(mRenderRingStaging.mData, aSamples);
+		}
+
+		const bool notifyVoiceInactive = mVoiceInactiveCallbackPending;
+		mVoiceInactiveCallbackPending = false;
+		unlockAudioMutex_internal();
+
+		// ###### flutter_soloud local patch (non-blocking idle request) ######
+		// A notification the callback could not act on after an earlier block
+		// is made again now (see _voiceInactiveCallback).
+		const bool retryVoiceInactive =
+			mVoiceInactiveCallbackRetry.load(std::memory_order_relaxed) &&
+			mVoiceInactiveCallbackRetry.exchange(false, std::memory_order_acq_rel);
+		auto voiceInactiveCallback =
+			_voiceInactiveCallback.load(std::memory_order_acquire);
+		if ((notifyVoiceInactive || retryVoiceInactive) &&
+			voiceInactiveCallback != nullptr && !voiceInactiveCallback())
+			mVoiceInactiveCallbackRetry.store(true, std::memory_order_release);
+
 	}
 
 	void Soloud::mix(float *aBuffer, unsigned int aSamples)
@@ -2571,8 +2590,7 @@ namespace SoLoud
 	// rollback (the native audio mutex is not recursive, so mix() cannot be
 	// used here), and the mRemixing flag suppresses visualization: the re-mix
 	// reproduces history, it does not create new events. Checkpoints ARE
-	// re-captured (captureMixCheckpoint_internal derives the ring position
-	// from the mix clock under mRemixing): the re-captured slots incorporate
+	// re-captured with the exact restored frame counter: these slots incorporate
 	// the retroactive event and the replayed journal, keeping the checkpoint
 	// chain consistent with the rewritten timeline for the next rollback.
 	// Ended voices stopVoice_internal() queues during the re-mix stay
@@ -2586,6 +2604,8 @@ namespace SoLoud
 		float buffertime = aSamples / (float)mSamplerate;
 		float globalVolume[2];
 		mStreamTime += buffertime;
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		mMixFramePosition += aSamples;
 
 		globalVolume[0] = mGlobalVolume;
 		if (mGlobalVolumeFader.mActive)

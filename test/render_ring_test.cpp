@@ -19,6 +19,7 @@
 #include "soloud.h"
 #include "soloud_audiosource.h"
 #include "soloud_render_ring.h"
+#include "soloud_checkpoint.h"
 
 #include <algorithm>
 #include <cmath>
@@ -287,6 +288,29 @@ void testEngineFeatureOn()
     engine.deinit();
 }
 
+void testEngineReinitializationResetsCheckpointFrames()
+{
+    SoLoud::Soloud engine;
+    engine.setRenderAheadConfig(kDevicePeriod, kRenderAhead);
+    for (int session = 0; session < 2; ++session) {
+        const auto result = engine.init(SoLoud::Soloud::CLIP_ROUNDOFF,
+                                        SoLoud::Soloud::NULLDRIVER,
+                                        kSampleRate, kQuantum, 2);
+        EXPECT(result == SoLoud::SO_NO_ERROR, "reinit: session %d init", session);
+        if (result != SoLoud::SO_NO_ERROR) return;
+        EXPECT(engine.mRenderRing.getWritePosition() == 0,
+               "reinit: new ring must start at zero");
+        EXPECT(!engine.mCheckpointPool.empty() &&
+                   engine.mCheckpointPool[0].mRingWritePosition ==
+                       engine.mRenderRing.getWritePosition(),
+               "reinit: first checkpoint must match the new ring write position");
+        engine.renderRingTopUp_internal();
+        EXPECT(engine.mRenderRing.getWritePosition() > 0,
+               "reinit: mix must advance the old frame clock before reuse");
+        engine.deinit();
+    }
+}
+
 } // namespace
 
 int main()
@@ -297,6 +321,7 @@ int main()
     testRingRewriteAndRewind();
     testEngineFeatureOff();
     testEngineFeatureOn();
+    testEngineReinitializationResetsCheckpointFrames();
 
     std::fprintf(stderr, "\n%d assertions, %d failures\n", gAssertions,
                  gFailures);

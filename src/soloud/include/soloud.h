@@ -781,7 +781,8 @@ namespace SoLoud
 		void mixSigned16(short *aBuffer, unsigned int aSamples);
 	public:
 		// Mix N samples * M channels. Called by other mix_ functions.
-		void mix_internal(unsigned int aSamples, unsigned int aStride);
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		void mix_internal(unsigned int aSamples, unsigned int aStride, bool aPublishRing = false);
 
 		// Handle rest of initialization (called from backend)
 		void postinit_internal(unsigned int aSamplerate, unsigned int aBufferSize, unsigned int aFlags, unsigned int aChannels);
@@ -888,7 +889,7 @@ namespace SoLoud
 		// mutex is not recursive, so mix()/mix_internal() cannot be called
 		// here), and visualization and death journaling are suppressed via
 		// mRemixing. Checkpoints ARE re-captured, with the ring position
-		// derived from the mix clock.
+		// taken from the exact restored frame counter.
 		void remixQuantum_internal(float *aBuffer, unsigned int aSamples);
 		// The locked section of mix_internal: voice faders, active voice
 		// recalculation, bus mixing, global filters, checkpoint capture.
@@ -1090,10 +1091,10 @@ namespace SoLoud
 		float mGlobalVolume;
 		// Post-clip scaler. Applied after clipping.
 		// ###### flutter_soloud local patch ######
-		// Atomic: clip_internal() runs on the audio thread *after*
-		// unlockAudioMutex_internal(), so the audio mutex does not order it
-		// against setPostClipScaler() -- which flutter_soloud calls from
-		// init(), by which point the device is already mixing.
+		// Atomic: clip_internal() runs with the audio mutex held, but
+		// setPostClipScaler() does not take that mutex. flutter_soloud calls
+		// the setter from init(), by which point the device is already mixing,
+		// so the audio mutex alone does not order these accesses.
 		// ThreadSanitizer reports the bare float as a data race in
 		// clip_internal(). Every reader snapshots it once into a local, which
 		// is also what the SSE paths need since they take its address.
@@ -1106,6 +1107,10 @@ namespace SoLoud
 		Fader mGlobalVolumeFader;
 		// Global stream time, for the global volume fader.
 		time mStreamTime;
+		// ###### flutter_soloud local patch (atomic render publication) ######
+		// Exact checkpoint frame positions must not be reconstructed from a
+		// repeatedly accumulated floating-point clock.
+		unsigned long long mMixFramePosition = 0;
 		// Anchor for the playClocked calls: maps the "physics time" given by
 		// the caller to the output sample timeline. A negative
 		// mClockedAnchorSample means the anchor has not been set yet.

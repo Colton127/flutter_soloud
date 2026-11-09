@@ -20,8 +20,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -267,6 +270,57 @@ void testChordJournalReplay()
     EXPECT(sumEarly > sumA / 10, "B missing at its onset (early %f, A %f)",
            sumEarly, sumA);
     EXPECT(sumA > 1.0, "A lost after B's rollback (sumA %f)", sumA);
+}
+
+// The device callback tops the ring up and copies its unread frames out, on its
+// own thread, while control threads start voices that land in that unread
+// window and re-mix it. The top-up's ring write, the device's ring read, and
+// the re-mix's staging writes and ring rewrite must not race: under
+// ThreadSanitizer (--tsan) any of them is reported. Without a sanitizer, a
+// top-up whose clock is published before its ring block can trip the re-mix's
+// mix-clock assertion.
+void testDeviceReadRacesRetroactivePlays()
+{
+    Rig rig;
+    PulseSource blip(256, 0.25f, /*finite=*/true);
+
+    rig.topUp();
+
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned long> reads{0};
+    std::atomic<unsigned long> plays{0};
+
+    std::thread device([&] {
+        std::vector<float> out(kDevicePeriod * 2);
+        while (!stop.load()) {
+            // What soloud_miniaudio_audiomixer() does per callback.
+            rig.topUp();
+            rig.engine.mRenderRing.read(out.data(), kDevicePeriod);
+            reads.fetch_add(1);
+        }
+    });
+    std::thread control([&] {
+        while (!stop.load()) {
+            if (rig.engine.play(blip) != 0)
+                plays.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    stop.store(true);
+    control.join();
+    device.join();
+
+    std::fprintf(stderr, "  %lu device reads, %lu retroactive plays\n",
+                 reads.load(), plays.load());
+    // These only show the threads overlapped. The device thread here is not
+    // paced like a real device callback, so it can keep winning the audio
+    // mutex and leave the control thread a few hundred plays a second, or
+    // fewer on a slow or loaded machine. The race itself is caught by the
+    // mix-clock assertion and, under --tsan, by ThreadSanitizer.
+    EXPECT(reads.load() > 100, "too few device reads: %lu", reads.load());
+    EXPECT(plays.load() > 20, "too few plays: %lu", plays.load());
 }
 
 // playScheduled inside the window lands at the exact frame; a time at/behind
@@ -637,24 +691,54 @@ void testScheduledFadeInWindow()
     EXPECT(allSilent(buf, 2100, 0.02f), "fade not finished in window");
 }
 
+// Rounded block durations eventually lose a frame when converted back to
+// positions. Keep the same real mix path for a long virtual playback and
+// check that its checkpoint boundary still agrees exactly with publication.
+void testLongClockKeepsExactFramePositions()
+{
+    Rig rig;
+    rig.topUp();
+    for (unsigned int i = 0; i < 65536; ++i) {
+        rig.discard(kQuantum);
+        rig.topUp();
+    }
+    const int cp = rig.engine.findCheckpointAtOrBefore_internal(
+        rig.engine.getEngineTime());
+    EXPECT(cp >= 0, "latest checkpoint missing");
+    if (cp >= 0)
+        EXPECT(rig.engine.mCheckpointPool[cp].mRingWritePosition ==
+                   rig.engine.mRenderRing.getWritePosition(),
+               "checkpoint drifted from the exact ring write position");
+}
+
+
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
-    testRetroactivePlayInsertion();
-    testChordJournalReplay();
-    testScheduledInWindow();
-    testFallbackNonRestorable();
-    testEndedReconciliation();
-    testEmptyRemixBitExact();
-    testFeatureOffUnchanged();
-    testWavRetroactive();
-    testRetroactiveStop();
-    testRetroactiveVolume();
-    testParamJournalReplay();
-    testRetroactivePause();
-    testScheduledStopInWindow();
-    testScheduledFadeInWindow();
+    // An optional test name runs only that test.
+    const char *only = argc > 1 ? argv[1] : nullptr;
+    auto run = [&](const char *name, void (*test)()) {
+        if (only == nullptr || std::strcmp(only, name) == 0)
+            test();
+    };
+
+    run("insertion", testRetroactivePlayInsertion);
+    run("chord", testChordJournalReplay);
+    run("scheduled", testScheduledInWindow);
+    run("fallback", testFallbackNonRestorable);
+    run("ended", testEndedReconciliation);
+    run("empty", testEmptyRemixBitExact);
+    run("off", testFeatureOffUnchanged);
+    run("wav", testWavRetroactive);
+    run("stop", testRetroactiveStop);
+    run("volume", testRetroactiveVolume);
+    run("params", testParamJournalReplay);
+    run("pause", testRetroactivePause);
+    run("scheduled-stop", testScheduledStopInWindow);
+    run("scheduled-fade", testScheduledFadeInWindow);
+    run("device-race", testDeviceReadRacesRetroactivePlays);
+    run("long-clock", testLongClockKeepsExactFramePositions);
 
     std::fprintf(stderr, "\n%d assertions, %d failures\n", gAssertions,
                  gFailures);

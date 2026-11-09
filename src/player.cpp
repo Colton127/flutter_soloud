@@ -469,8 +469,8 @@ PlayerErrors Player::init(unsigned int sampleRate, unsigned int bufferSize, unsi
     {
         // soloud.init() has already opened and started the device, so the
         // mixer is reading mPostClipScaler by the time this runs. The audio
-        // mutex does NOT order the two -- clip_internal() runs after
-        // unlockAudioMutex_internal() -- so the field is atomic instead; see
+        // mutex does not order the two: clipping holds it, but the setter
+        // does not acquire it. The field remains atomic instead; see
         // its declaration in soloud.h.
         soloud.setPostClipScaler(1.0f);
         mSampleRate = sampleRate;
