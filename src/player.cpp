@@ -930,7 +930,9 @@ Player::PendingSound Player::decodeMem(
     {
         newSound->sound = std::make_unique<SoLoud::WavStream>();
         newSound->soundType = TYPE_WAVSTREAM;
-        result = static_cast<SoLoud::WavStream *>(newSound->sound.get())->loadMem(mem, length, false, true);
+        result = static_cast<SoLoud::WavStream *>(newSound->sound.get())->loadMem(mem, length, true, true);
+        // The input belongs to the caller. The stream owns its encoded copy,
+        // including when parsing fails and a fallback still needs the input.
     }
 
     pending.error = fromSoLoudError(result);
