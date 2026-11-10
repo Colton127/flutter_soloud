@@ -13,7 +13,8 @@
 // is deleted:
 // - play(), playClocked(), playScheduled() and play3d() return a voice and do
 //   not crash;
-// - the voice ends at the first mix and frees its slot;
+// - the voice ends at the first mix it reads in (for playClocked() the one
+//   after its clock offset) and frees its slot;
 // - a voice already playing from memory plays on exactly as it would alone;
 // - the source plays again once the file is back.
 // It checks the same for a copy overwritten after loading with bytes no
@@ -150,6 +151,11 @@ std::vector<float> backgroundAlone(SoLoud::WavStream &backgroundSource)
 /// Plays [source], whose file has just been deleted or broken, next to the
 /// background voice and checks the voice ends at once and leaves the
 /// background voice alone.
+///
+/// A voice that does not loop is stopped only once a read after its end
+/// comes back empty (voice tail). A playClocked() voice reads first after its
+/// clock offset, which for the first clocked play leads by two output
+/// buffers, so it ends in the first mix past that offset.
 void checkVoiceEnds(SoLoud::WavStream &source, SoLoud::WavStream &backgroundSource,
 					const std::vector<float> &reference, Start how,
 					const std::string &what)
@@ -158,12 +164,22 @@ void checkVoiceEnds(SoLoud::WavStream &source, SoLoud::WavStream &backgroundSour
 	rig.mix();
 	const SoLoud::handle voice = start(rig.soloud, source, how);
 	check(voice != 0, what + ": " + name(how) + " returns a voice");
-	rig.mix();
+	const int allowed = how == Start::clocked ? 3 : 1;
+	int mixes = 1;
+	for (int after = 0; after < allowed; ++after)
+	{
+		rig.mix();
+		++mixes;
+		if (!rig.soloud.isValidVoiceHandle(voice))
+			break;
+	}
 	check(!rig.soloud.isValidVoiceHandle(voice),
-		  what + ": the " + name(how) + " voice ends at the first mix");
+		  what + ": the " + name(how) + " voice ends at " +
+			  (how == Start::clocked ? "the first mix past its clock offset"
+									 : "the first mix"));
 	check(rig.soloud.getActiveVoiceCount() == 1,
 		  what + ": only the background voice is left after " + name(how));
-	for (int i = 2; i < kBlocks; ++i)
+	for (int i = mixes; i < kBlocks; ++i)
 		rig.mix();
 	check(rig.soloud.isValidVoiceHandle(rig.background),
 		  what + ": the background voice plays on after " + name(how));
