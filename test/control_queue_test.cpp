@@ -560,9 +560,14 @@ void testHandleSemantics() {
     mixBlock(soloud);
     EXPECT(near(voiceOf(soloud, h2)->mSetVolume, 0.9), "stale command applied to the new voice");
 
-    // A command for a voice that ends in the very block that applies it.
+    // A command for a voice that ends in the very block that applies it. A
+    // voice that does not loop is stopped only once a read after its end
+    // comes back empty (voice tail): the first block reads all 100 frames
+    // and the voice ends in the next one, which also applies the command.
     TestSource shortSource(0.5f, false, 100);
     const SoLoud::handle s = playUnity(soloud, shortSource);
+    mixBlock(soloud);
+    EXPECT(soloud.isValidVoiceHandle(s), "voice playing out its last block");
     soloud.setVolume(s, 0.2f);
     EXPECT(near(soloud.getVolume(s), 0.2), "queued volume");
     static std::atomic<int> ended{0};
