@@ -167,6 +167,16 @@ namespace SoLoud
 		// (mChannelHandle still 0): stop() finds it by audio source id, while
 		// an orphaned instance would keep mixing the new instance's voices.
 		stop();
+		// ###### flutter_soloud local patch (bus at the engine's rate) ######
+		// A bus mixes its voices, and runs its filters, at its own rate, which
+		// AudioSource leaves at 44.1 kHz. In an engine at any other rate every
+		// voice through the bus would be resampled twice, into the bus and out
+		// of it, and a voice's delay, counted in the engine's samples
+		// (playScheduled, playClocked, setDelaySamples), would be counted out
+		// in the bus's. So it mixes at the engine's rate, which the voice's
+		// init copies.
+		if (mSoloud && mSoloud->mSamplerate > 0)
+			mBaseSamplerate = (float)mSoloud->mSamplerate;
 		BusInstance *instance = new BusInstance(this);
 		// mInstance is read under the audio mutex (and cleared there by
 		// ~BusInstance), so publish it there. play() sets mSoloud first.
